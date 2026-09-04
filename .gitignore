@@ -1,0 +1,7 @@
+# 依赖
+node_modules/
+
+# 调试产物
+*.log
+npm-debug.log*
+.DS_Store

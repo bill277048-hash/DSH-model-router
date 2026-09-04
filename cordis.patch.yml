@@ -1,0 +1,39 @@
+# @botton/dsh-model-router — Cordis 插入层
+# 由 `dsh plugin add` 注入 profile 的 cordis.patch.yml。
+#
+# 当前 active 配置只给最小安全默认（propose:false），插件装上即可运行（透传、不切换）。
+# 故障切换需要「路由规则」——下面给出推荐默认规则模板（已注释），把 provider/model
+# 换成你自己的即可。也可以不填，改在「设置 → 插件 → 插件配置」面板里热更新。
+#
+# ⚠️ 之前的复盘（§IX）指出：兜底规则曾误配到单个会话（match.sessionIds 只含一个
+# sessionId、default:false），导致其它会话没有任何候选链。请务必用全局 default 规则。
+#
+# 注释中的「默认参数」与代码 `lib/config.js` DEFAULT_CONFIG 对应一致；
+# 移除 mode 字段则使用 balanced（v0.7.0 默认）。
+
+- insert:
+    - id: model-router
+      name: '@botton/dsh-model-router'
+      config:
+        propose: false
+        # ===== 推荐默认规则模板（去掉井号启用，并替换成你自己的 provider/model）=====
+        # rules:
+        #   - match:
+        #       default: true            # 全局兜底：覆盖所有会话
+        #     route:
+        #       - { provider: <你的首选 provider>, model: <首选模型> }
+        #       - { provider: <备用 provider>,   model: <备用模型> }
+        # fallbackPolicy:
+        #   maxRetries: 4               # 默认 2；>=3 才能跨多个备用
+        #   failureThreshold: 3         # 默认 3
+        #   cooldownSec: 60             # 默认 60
+        #   quotaFailureThreshold: 1    # 默认 1（v0.6.1：QUOTA 1 次即 open）
+        #   quotaCooldownSec: 600       # 默认 600（10 分钟）
+        #   failoverSignals: [QUOTA, QUOTA_EXCEEDED, RATE_LIMIT, TRANSPORT, SERVER, UNKNOWN, INVALID_CREDENTIAL, MISSING_CREDENTIAL, EMPTY_RESPONSE, TIMEOUT]   # 默认 10 个错误码
+        #   allCooldownFallback: force-first   # 默认 force-first
+        #   switchAfterFirstChunk: false       # 默认 false（commit-on-first-chunk 硬约束）
+        # firstTokenTimeoutMs: 30000   # 默认 30000（30s 看门狗）
+        # failoverBudgetMs: 90000      # 默认 90000（v0.6.1 切换总预算）
+        # exhaustionWindowSec: 120     # 默认 120（链耗尽后单候选收敛窗）
+        # mode: balanced                # 默认 balanced；可选 stable / fast
+        # statusPath: /api/model-router/status   # 默认路径
