@@ -27,7 +27,7 @@ agent 发起流式调用
 
 ## 安装 / 卸载
 
-### 方式一：插件市场（推荐，一键安装）
+### 方式一：插件市场
 
 打开 dsh **设置 → 插件市场**，搜索 `dsh-model-router`，点安装。
 
@@ -37,7 +37,7 @@ agent 发起流式调用
 dsh plugin --profile web add @botton/dsh-model-router
 ```
 
-### 方式二：本仓库脚本（手动，适合未上架前自测）
+### 方式二：本仓库脚本
 
 ```bash
 # 安装（备份 patch → 拷包 → 幂等追加条目；不自动重启）
@@ -62,7 +62,7 @@ curl --noproxy '*' -s http://127.0.0.1:3080/api/model-router/status
 
 返回：规则与策略快照、cooldown 状态表、最近 50 次尝试（含每次 attemptIndex/TTFT/错误码/outcome）、按路由聚合统计、用量记账（滚动 5h/1w 窗口）、包装层计数器（wraps/failovers/timeouts/forced/exhaustions）。
 
-### 场景 A：真实故障切换（推荐先做）
+### 场景 A：真实故障切换
 
 把默认规则的首选改为一个**故意写错的 model id**，备用为真实可用路由：
 
@@ -119,8 +119,6 @@ route:
 ## v0.7 范围声明
 
 已实现：规则路由（四种扩展策略：explicit / same-model / same-provider / exclude-current，源自 dsh 模型注册表）、无感故障切换全语义（finish 分片驱动 + commit-on-first-chunk）、cooldown 三态熔断（含 v0.6.1 配额感知：QUOTA 单独阈值 1 次 + 600 秒冷却）、TTFT 看门狗（30s）+ 切换总预算（failoverBudgetMs 90s）、用量记账（可视，滚动 5h/1w 窗口）、状态接口、WebUI 面板（规则/配额/mode 热更新，store JSON 持久化免重启）、v0.7.0 模式预设（`stable` 60s/300s预算/120s冷却/900s配额冷却；`balanced` 30s/90s/60s/600s；`fast` 15s/45s/30s/300s）、v0.6.0 会话标题三级解析（live / snapshots / 持久化日志直读）、61 项单元测试。
-
-未实现（后续分期）：配额剩余预算参与路由排序/排除（P3）、SQLite 聚合与评分卡（P4）、多 key 池轮换（P5）、浏览器看板（P4 可选）。
 
 ## 许可证
 
