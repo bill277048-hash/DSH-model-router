@@ -57,10 +57,10 @@ launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh
 状态接口（只读，仅限本机回环访问）：
 
 ```bash
-curl --noproxy '*' -s http://127.0.0.1:3080/api/model-router/status
+curl --noproxy '*' -s http://127.0.0.1:3081/api/model-router/status
 ```
 
-返回：规则与策略快照、cooldown 状态表、最近 50 次尝试（含每次 attemptIndex/TTFT/错误码/outcome）、按路由聚合统计、用量记账（滚动 5h/1w 窗口）、包装层计数器（wraps/failovers/timeouts/forced/exhaustions）。
+返回：规则与策略快照、cooldown 状态表、最近 50 次尝试（含每次 attemptIndex/TTFT/e2eMs/outcome；失败项附错误码）、按路由聚合统计、用量记账（滚动 5h/1w 窗口）、包装层计数器（wraps/passthroughs/failovers/timeouts/forced/exhaustions/userAborts）。
 
 ### 场景 A：真实故障切换
 
