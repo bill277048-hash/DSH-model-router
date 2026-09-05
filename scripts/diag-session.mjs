@@ -8,6 +8,7 @@
 import zlib from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 const MAGIC = Buffer.from([0x28, 0xB5, 0x2F, 0xFD]);
 function decodeZstd(buf) {
@@ -27,14 +28,13 @@ function decodeZstd(buf) {
   return out.toString('utf8');
 }
 
-const ROOTS = [
-  '/Users/apple/.deepseek-harness/sessions/--Users-apple-.deepseek-harness--',
-  '/Users/apple/.deepseek-harness/sessions/--Volumes-Public-dsh-dsh~65E5~5E38~4EFB~52A1--',
-];
+const SESSIONS_DIR = path.join(os.homedir(), '.deepseek-harness', 'sessions');
 function listSessions() {
   const out = [];
-  for (const b of ROOTS) {
-    if (!fs.existsSync(b)) continue;
+  if (!fs.existsSync(SESSIONS_DIR)) return out;
+  for (const ent of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
+    if (!ent.isDirectory()) continue;
+    const b = path.join(SESSIONS_DIR, ent.name);
     for (const d of fs.readdirSync(b)) {
       if (!d.startsWith('session-')) continue;
       const p = path.join(b, d, 'session.jsonl.zstd');

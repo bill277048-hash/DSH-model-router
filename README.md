@@ -39,15 +39,19 @@ dsh plugin --profile web add @botton/dsh-model-router
 
 ### 方式二：本仓库脚本
 
+> Windows 推荐用方式一（`dsh plugin add`）；方式二为 bash 脚本，Windows 需 Git Bash 运行。
+
 ```bash
 # 安装（备份 patch → 拷包 → 幂等追加条目；不自动重启）
 scripts/deploy.sh
-# 重载生效（确认后手动执行）
-launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh
+# 重载生效（确认后手动执行）：
+#   macOS（launchd 守护）：
+#     launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh
+#   Windows（无 launchd，手动重启 dsh 进程）：停止 dsh 后重新运行 dsh
 
 # 卸载（先摘条目后删包，自动备份 patch）
 scripts/undeploy.sh
-launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh
+# 重载同上
 ```
 
 配置在 profile patch（`~/.deepseek-harness/home/profiles/web/cordis.patch.yml`）的 insert 条目 `config:` 块中，改完重载生效。
