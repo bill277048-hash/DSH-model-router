@@ -37,7 +37,7 @@ agent 发起流式调用
 dsh plugin --profile web add @botton/dsh-model-router
 ```
 
-### 方式二：本仓库脚本（手动，适合未上架前自测）
+### 方式二：本仓库脚本
 
 ```bash
 # macOS / Linux（bash）：
