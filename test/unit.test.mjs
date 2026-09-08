@@ -8,12 +8,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 
-import { normalizeConfig, DEFAULT_CONFIG, normalizeState } from '../lib/config.js';
+import { normalizeConfig, DEFAULT_CONFIG, normalizeState, quotaGroupCount, autoTuneMaxRetries } from '../lib/config.js';
 import { CooldownBoard, hopKeyOf } from '../lib/cooldown.js';
 import { Router } from '../lib/router.js';
+import { Registry } from '../lib/registry.js';
 import { createStreamWrapper } from '../lib/wrapper.js';
 import { ProbeBoard, computeTrmBound } from '../lib/probe.js';
 import { loadState, saveState } from '../lib/store.js';
+import { dayKeyOf, stabilityGrade, DailyLedger, DailyReporter, DailyScheduler } from '../lib/daily.js';
 
 // ---------- mock 工具 ----------
 
@@ -1244,3 +1246,787 @@ test('cooldown v0.7.0: applyPolicy 热更新阈值/冷却，open 态保留生效
   assert.equal(board.allow('k', 1_000_000 + 310_000), true, '新 open 采用 fast 档 300s 冷却');
   assert.equal(board.circuits.get('k').cooldownMs, 30_000);
 });
+
+// ---------- v0.8.0 批 2：C-2 元数据 / C-1 quotaGroup 去重 / A-3 自动调优 ----------
+
+/** Registry 最小 llm 桩（只依赖 adapters.keys()/listConfigurableProviders/listModels） */
+function makeRegistryLlm(providers) {
+  return {
+    adapters: new Map(providers.map((p) => [p.provider, {}])),
+    listConfigurableProviders: () =>
+      providers.map((p) => ({ provider: p.provider, displayName: p.displayName ?? null })),
+    listModels: async (provider) => providers.find((p) => p.provider === provider)?.models ?? [],
+  };
+}
+
+test('registry v0.8.0 C-2: registeredPairs 携带元数据（providerMeta 兜底 + route 内联优先）', async () => {
+  const cfg = normalizeConfig({
+    providerMeta: { 'p-a': { quotaGroup: 'g1', tier: 'free' } },
+    rules: [
+      {
+        match: { default: true },
+        route: [
+          { provider: 'p-a', model: 'm-1' }, // 无内联 → providerMeta 兜底
+          { provider: 'p-b', model: 'm-2', quotaGroup: 'g2', tier: 'paid-baseline' }, // 内联优先
+          { provider: 'p-c', model: 'm-3' }, // 无任何元数据
+        ],
+      },
+    ],
+  });
+  const llm = makeRegistryLlm([
+    { provider: 'p-a', models: [{ id: 'm-1' }] },
+    { provider: 'p-b', models: [{ id: 'm-2' }] },
+    { provider: 'p-c', models: [{ id: 'm-3' }] },
+  ]);
+  const reg = new Registry(llm, log, 300, cfg);
+  reg.refreshProviders();
+  await reg.refreshModels();
+  const pairs = reg.registeredPairs();
+  assert.deepEqual(
+    pairs.map((p) => ({ provider: p.provider, model: p.model, quotaGroup: p.quotaGroup, tier: p.tier })),
+    [
+      { provider: 'p-a', model: 'm-1', quotaGroup: 'g1', tier: 'free' },
+      { provider: 'p-b', model: 'm-2', quotaGroup: 'g2', tier: 'paid-baseline' },
+      { provider: 'p-c', model: 'm-3', quotaGroup: undefined, tier: undefined },
+    ],
+  );
+});
+
+test('registry v0.8.0 C-2: metaSnapshot——未声明元数据不列出，tier 缺省 unknown', async () => {
+  const cfg = normalizeConfig({
+    providerMeta: { 'p-a': { quotaGroup: 'g1' } }, // 无 tier → unknown
+    rules: [{ match: { default: true }, route: [{ provider: 'p-b', model: 'm-2', tier: 'free' }] }],
+  });
+  const llm = makeRegistryLlm([
+    { provider: 'p-a', models: [] },
+    { provider: 'p-b', models: [] },
+    { provider: 'p-c', models: [] }, // 未声明 → 不列出
+  ]);
+  const reg = new Registry(llm, log, 300, cfg);
+  reg.refreshProviders();
+  await reg.refreshModels();
+  const snap = reg.metaSnapshot();
+  assert.deepEqual(snap, {
+    'p-a': { quotaGroup: 'g1', tier: 'unknown' },
+    'p-b': { quotaGroup: null, tier: 'free' },
+  });
+  assert.equal(snap['p-c'], undefined);
+});
+
+test('router v0.8.0 C-1: quotaGroup 去重——同组保留链序第一个（explicit 内联 4 项 → 3 项）', () => {
+  const rule = {
+    match: { default: true },
+    route: [
+      { provider: 'p-a', model: 'm-1', quotaGroup: 'g1' },
+      { provider: 'p-b', model: 'm-2', quotaGroup: 'g2' },
+      { provider: 'p-c', model: 'm-3', quotaGroup: 'g1' }, // 与 p-a 同组 → 去重
+      { provider: 'p-d', model: 'm-4' }, // 无组 → 保留
+    ],
+  };
+  const chain = makeRouter([rule], null).candidates({ provider: 'p-x', model: 'm-x' });
+  assert.deepEqual(
+    chain.map((h) => `${h.provider}/${h.model}`),
+    ['p-a/m-1', 'p-b/m-2', 'p-d/m-4'],
+  );
+});
+
+test('router v0.8.0 C-1: 无 quotaGroup 保序不误删', () => {
+  const rule = {
+    match: { default: true },
+    route: [
+      { provider: 'p-a', model: 'm-1' },
+      { provider: 'p-b', model: 'm-2' },
+      { provider: 'p-c', model: 'm-3' },
+    ],
+  };
+  const chain = makeRouter([rule], null).candidates({ provider: 'p-x', model: 'm-x' });
+  assert.deepEqual(
+    chain.map((h) => `${h.provider}/${h.model}`),
+    ['p-a/m-1', 'p-b/m-2', 'p-c/m-3'],
+  );
+});
+
+test('router v0.8.0 C-1: same-provider 策略经注册表元数据去重', () => {
+  const reg = makeRegistry([
+    { provider: 'p-a', model: 'm-1', quotaGroup: 'g1' },
+    { provider: 'p-a', model: 'm-2', quotaGroup: 'g1' }, // 同组 → 去重
+    { provider: 'p-a', model: 'm-3' }, // 无组 → 保留
+  ]);
+  const rule = {
+    match: { default: true },
+    strategy: 'same-provider',
+    route: [{ provider: 'p-a', model: 'm-1' }],
+  };
+  const chain = makeRouter([rule], reg).candidates({ provider: 'p-a', model: 'm-1' });
+  assert.deepEqual(
+    chain.map((h) => `${h.provider}/${h.model}`),
+    ['p-a/m-2', 'p-a/m-3'],
+  );
+});
+
+test('config v0.8.0 A-3: quotaGroupCount——providerMeta 与 route 内联并集', () => {
+  const cfg = normalizeConfig({
+    providerMeta: { 'p-a': { quotaGroup: 'g1' }, 'p-b': { quotaGroup: 'g2' } },
+    rules: [
+      {
+        match: { default: true },
+        route: [
+          { provider: 'p-c', model: 'm-3', quotaGroup: 'g1' }, // 与 p-a 同组，不重复计数
+          { provider: 'p-d', model: 'm-4', quotaGroup: 'g3' },
+        ],
+      },
+    ],
+  });
+  assert.equal(quotaGroupCount(cfg), 3); // g1, g2, g3
+});
+
+test('config v0.8.0 A-3: auto-tune——未显式声明回填 max(2*count, 5)', () => {
+  const cfg = normalizeConfig({
+    providerMeta: { 'p-a': { quotaGroup: 'g1' }, 'p-b': { quotaGroup: 'g2' } },
+    rules: [
+      {
+        match: { default: true },
+        route: [
+          { provider: 'p-a', model: 'm-1' },
+          { provider: 'p-b', model: 'm-2' },
+        ],
+      },
+    ],
+  });
+  assert.equal(cfg.fallbackPolicy.maxRetries, 2, '默认值');
+  autoTuneMaxRetries(cfg);
+  assert.equal(cfg.fallbackPolicy.maxRetries, 5, 'quotaGroupCount=2 → max(4,5)=5');
+  // 单组时仍保底 5（quotaGroupCount=1 → max(2,5)=5，公式下限）
+  const cfg1 = normalizeConfig({
+    rules: [{ match: { default: true }, route: [{ provider: 'p-a', model: 'm-1' }] }],
+  });
+  autoTuneMaxRetries(cfg1);
+  assert.equal(cfg1.fallbackPolicy.maxRetries, 5);
+});
+
+test('config v0.8.0 A-3: 用户显式 maxRetries=2 不被自动调优覆盖（hasExplicitMaxRetries）', () => {
+  const cfg = normalizeConfig({
+    fallbackPolicy: { maxRetries: 2 },
+    providerMeta: { 'p-a': { quotaGroup: 'g1' }, 'p-b': { quotaGroup: 'g2' } },
+    rules: [{ match: { default: true }, route: [{ provider: 'p-a', model: 'm-1' }] }],
+  });
+  assert.equal(cfg._hasExplicitMaxRetries, true);
+  autoTuneMaxRetries(cfg);
+  assert.equal(cfg.fallbackPolicy.maxRetries, 2, '显式 2 保持');
+  // 未声明时标记为 false（raw 无 fallbackPolicy）
+  assert.equal(normalizeConfig({ rules: [] })._hasExplicitMaxRetries, false);
+  assert.equal(normalizeConfig({})._hasExplicitMaxRetries, false);
+});
+
+// ---------- v0.8.0 批 3：G1 每日报告数据层 ----------
+
+test('daily v0.8.0 G1: dayKeyOf 时区日界换算（跨时区跨日）', () => {
+  // UTC 2026-09-06T17:30:00Z → Asia/Shanghai 已是 09-07 01:30；America/Los_Angeles 仍是 09-06
+  const ts = Date.parse('2026-09-06T17:30:00Z');
+  assert.equal(dayKeyOf(ts, 'Asia/Shanghai'), '2026-09-07');
+  assert.equal(dayKeyOf(ts, 'UTC'), '2026-09-06');
+  assert.equal(dayKeyOf(ts, 'America/Los_Angeles'), '2026-09-06');
+  // 无 timeZone → 系统时区（不抛错即可）
+  assert.equal(typeof dayKeyOf(ts, null), 'string');
+});
+
+test('daily v0.8.0 G1: stabilityGrade 评级边界（S/A/B/C/D/N/A）', () => {
+  assert.equal(stabilityGrade({ calls: 0, failed: 0 }), 'N/A');
+  assert.equal(stabilityGrade({ calls: 2, failed: 0 }), 'N/A', '样本 <3 不足以评价');
+  assert.equal(stabilityGrade({ calls: 3, failed: 0 }), 'S');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 19 }), 'A', '1.9%');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 20 }), 'B', '2% 边界落入 B');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 49 }), 'B', '4.9%');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 50 }), 'C', '5% 边界落入 C');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 149 }), 'C', '14.9%');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 150 }), 'D', '15% 边界落入 D');
+  assert.equal(stabilityGrade({ calls: 1000, failed: 800 }), 'D', '80% 仍 D（最差档）');
+});
+
+test('daily v0.8.0 G1: aggregate 按 provider×model 聚合（含失败/切换/错误码/token/时延）', () => {
+  const reporter = new DailyReporter({ ledger: null, log });
+  const records = [
+    { provider: 'p-a', model: 'm-1', outcome: 'committed', inSequence: false, attempts: 1, switched: false, ttftMs: 200, e2eMs: 800, tokens: { inputTokens: 10, outputTokens: 5 }, ts: 1 },
+    { provider: 'p-a', model: 'm-1', outcome: 'committed', inSequence: true, attempts: 2, switched: true, ttftMs: 400, e2eMs: 1500, tokens: { inputTokens: 20, outputTokens: 10 }, ts: 2 },
+    { provider: 'p-a', model: 'm-1', outcome: 'failed', inSequence: true, attempts: 3, switched: true, errorCode: 'QUOTA', e2eMs: 3000, ts: 3 },
+    { provider: 'p-a', model: 'm-1', outcome: 'aborted', inSequence: false, attempts: 1, switched: false, e2eMs: 500, ts: 4 },
+    { provider: 'p-b', model: 'm-2', outcome: 'committed', inSequence: false, attempts: 1, switched: false, ttftMs: 100, e2eMs: 300, tokens: { inputTokens: 5, outputTokens: 2 }, ts: 5 },
+  ];
+  const { summary, byProviderModel, errors } = reporter.aggregate(records);
+  assert.deepEqual(summary, {
+    calls: 5,
+    succeeded: 3,
+    failed: 1,
+    aborted: 1,
+    inSequenceCalls: 2,
+    switchedCalls: 2,
+    switchCount: 3, // attempts 2+3 → (2-1)+(3-1)=3
+  });
+  assert.equal(byProviderModel.length, 2);
+  const g1 = byProviderModel.find((g) => g.provider === 'p-a' && g.model === 'm-1');
+  assert.equal(g1.calls, 4);
+  assert.equal(g1.failed, 1);
+  assert.equal(g1.aborted, 1);
+  assert.equal(g1.succeeded, 2);
+  assert.equal(g1.switchedCalls, 2);
+  assert.equal(g1.avgTtftMs, 300); // (200+400)/2
+  assert.equal(g1.inputTokens, 30);
+  assert.equal(g1.outputTokens, 15);
+  assert.equal(g1.grade, 'D'); // 4 calls 1 failed → failRate 0.25 ≥ 0.15 → D
+  assert.deepEqual(g1.topErrors, [{ code: 'QUOTA', count: 1 }]);
+  assert.deepEqual(errors, [{ code: 'QUOTA', count: 1 }]);
+});
+
+test('daily v0.8.0 G1: DailyLedger 追加写持久化 + 日切换 + todaySnapshot', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'mr-daily-'));
+  try {
+    const ledger = new DailyLedger({ storePath: join(dir, 'state.json'), timeZone: 'Asia/Shanghai', log });
+    const t1 = Date.parse('2026-09-06T12:00:00+08:00');
+    const t2 = Date.parse('2026-09-06T15:00:00+08:00');
+    const t3 = Date.parse('2026-09-07T09:00:00+08:00');
+    ledger.recordCall({ provider: 'p-a', model: 'm-1', outcome: 'committed', ts: t1 });
+    ledger.recordCall({ provider: 'p-a', model: 'm-1', outcome: 'committed', ts: t2 });
+    assert.equal(ledger.readDayRecords('2026-09-06').length, 2, 'NDJSON 可读回');
+    assert.equal(ledger.hasData('2026-09-06'), true);
+    ledger.recordCall({ provider: 'p-b', model: 'm-2', outcome: 'committed', ts: t3 });
+    assert.equal(ledger.currentDay, '2026-09-07', '跨日自动切换');
+    assert.equal(ledger.readDayRecords('2026-09-06').length, 2, '历史日从文件读');
+    assert.equal(ledger.readDayRecords('2026-09-07').length, 1);
+    const snap = ledger.todaySnapshot();
+    assert.equal(snap.day, '2026-09-07');
+    assert.equal(snap.calls, 1);
+    assert.equal(ledger.hasReport('2026-09-06'), false);
+    assert.equal(ledger.hasData('2026-09-05'), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('daily v0.8.0 G1: DailyReporter generate/readReport/l1Summary', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'mr-daily-'));
+  try {
+    const ledger = new DailyLedger({ storePath: join(dir, 'state.json'), timeZone: 'Asia/Shanghai', log });
+    const reporter = new DailyReporter({ ledger, log });
+    // 昨日 + 前日各若干记录
+    ledger.recordCall({ provider: 'p-a', model: 'm-1', outcome: 'committed', inSequence: false, attempts: 1, switched: false, ttftMs: 200, e2eMs: 800, tokens: { inputTokens: 10, outputTokens: 5 }, ts: Date.parse('2026-09-06T10:00:00+08:00') });
+    ledger.recordCall({ provider: 'p-a', model: 'm-1', outcome: 'failed', inSequence: true, attempts: 2, switched: true, errorCode: 'QUOTA', ttftMs: 300, e2eMs: 2000, ts: Date.parse('2026-09-06T11:00:00+08:00') });
+    ledger.recordCall({ provider: 'p-b', model: 'm-2', outcome: 'committed', inSequence: false, attempts: 1, switched: false, ttftMs: 100, e2eMs: 400, tokens: { inputTokens: 5, outputTokens: 2 }, ts: Date.parse('2026-09-05T10:00:00+08:00') });
+    // 当日
+    ledger.recordCall({ provider: 'p-c', model: 'm-3', outcome: 'committed', inSequence: false, attempts: 1, switched: false, tokens: { inputTokens: 7, outputTokens: 3 }, ts: Date.parse('2026-09-07T10:00:00+08:00') });
+
+    const report = reporter.generate('2026-09-06');
+    assert.equal(report.summary.calls, 2);
+    assert.equal(report.byProviderModel.length, 1);
+    assert.equal(report.byProviderModel[0].grade, 'N/A', '2 calls 样本不足 → N/A');
+    assert.equal(reporter.readReport('2026-09-06').day, '2026-09-06');
+    assert.equal(reporter.readReport('2026-09-05'), null, '未生成返回 null');
+
+    const l1 = reporter.l1Summary(3, Date.parse('2026-09-07T12:00:00+08:00'));
+    assert.equal(l1.today.day, '2026-09-07');
+    assert.equal(l1.today.calls, 1);
+    // days 含 09-05（报告缺失但原始数据在 → 实时聚合）与 09-06（报告）
+    const days = l1.days.map((d) => d.day);
+    assert.deepEqual(days, ['2026-09-05', '2026-09-06']);
+    assert.equal(l1.days.find((d) => d.day === '2026-09-05').summary.calls, 1);
+    assert.equal(l1.days.find((d) => d.day === '2026-09-06').summary.calls, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('daily v0.8.0 G1: DailyScheduler 凌晨 1 点后生成昨日报告 + 未到不生成 + 防重复', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'mr-daily-'));
+  try {
+    const ledger = new DailyLedger({ storePath: join(dir, 'state.json'), timeZone: 'Asia/Shanghai', log });
+    const reporter = new DailyReporter({ ledger, log });
+    ledger.recordCall({ provider: 'p-a', model: 'm-1', outcome: 'committed', ts: Date.parse('2026-09-06T12:00:00+08:00') });
+
+    // 未到 1 点：不生成
+    const early = new DailyScheduler({ ledger, reporter, timeZone: 'Asia/Shanghai', log, now: () => new Date('2026-09-07T00:59:00+08:00') });
+    early.tick();
+    assert.equal(ledger.hasReport('2026-09-06'), false, '00:59 未到生成时刻');
+
+    // 01:05：生成昨日报告
+    let genCount = 0;
+    const spyReporter = { ...reporter, generate: (day) => { genCount += 1; return reporter.generate(day); } };
+    const onTime = new DailyScheduler({ ledger, reporter: spyReporter, timeZone: 'Asia/Shanghai', log, now: () => new Date('2026-09-07T01:05:00+08:00') });
+    onTime.tick();
+    assert.equal(ledger.hasReport('2026-09-06'), true);
+    assert.equal(genCount, 1);
+    onTime.tick();
+    assert.equal(genCount, 1, 'lastGenerated 防重复生成');
+
+    // 昨日无数据：标记跳过不生成
+    const emptyLedger = new DailyLedger({ storePath: join(dir, 'empty.json'), timeZone: 'Asia/Shanghai', log });
+    const emptyRep = new DailyReporter({ ledger: emptyLedger, log });
+    let emptyGen = 0;
+    const emptySpy = { ...emptyRep, generate: (day) => { emptyGen += 1; return emptyRep.generate(day); } };
+    const emptySched = new DailyScheduler({ ledger: emptyLedger, reporter: emptySpy, timeZone: 'Asia/Shanghai', log, now: () => new Date('2026-09-07T01:05:00+08:00') });
+    emptySched.tick();
+    assert.equal(emptyGen, 0, '昨日无数据不生成');
+    emptySched.tick();
+    assert.equal(emptyGen, 0, '标记 lastGenerated 后不空扫');
+
+    onTime.dispose();
+    early.dispose();
+    emptySched.dispose();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ==================== v0.8.0 批 4：G1 接入 ====================
+
+test('config v0.8.0 G1: reports 域校验（enabled/hour 类型、默认值、非法拒绝）', () => {
+  const c = normalizeConfig(undefined);
+  assert.equal(c.reports.enabled, false, 'G1 默认关闭（零记账零调度）');
+  assert.equal(c.reports.hour, '01:00');
+  assert.equal(normalizeConfig({ rules: [], reports: { enabled: true } }).reports.enabled, true);
+  assert.equal(normalizeConfig({ rules: [], reports: { hour: '03:30' } }).reports.hour, '03:30');
+  assert.throws(() => normalizeConfig({ rules: [], reports: { enabled: 'yes' } }), /reports\.enabled/);
+  assert.throws(() => normalizeConfig({ rules: [], reports: { hour: '25:00' } }), /reports\.hour/);
+  assert.throws(() => normalizeConfig({ rules: [], reports: { hour: '1:00' } }), /reports\.hour/);
+});
+
+test('wrapper v0.8.0 G1: 纯透传路径记账 recordCall(inSequence:false) + usage 捕获 + 同步 quota.record（口径一致）', async () => {
+  const deps = makeDeps({
+    config: { rules: [{ match: { default: true }, route: [{ provider: 'p-a', model: 'm-1' }] }] }, // 唯一候选=首选 → 无重发 → 透传
+  });
+  const dailyCalls = [];
+  const quotaRecs = [];
+  deps.daily = { recordCall: (rec) => dailyCalls.push(rec) };
+  deps.quota = { record: (p, u) => quotaRecs.push([p, u]) };
+  const wrapper = createStreamWrapper(deps);
+  const primary = (async function* () {
+    yield { type: 'text-delta', index: 0, text: 'hi' };
+    yield usage;
+    yield finishStop;
+  })();
+  const out = await drain(wrapper.call({}, { provider: 'p-a', model: 'm-1', sessionId: 'sess-x' }, () => primary));
+  assert.deepEqual(out.map((c) => c.type), ['text-delta', 'usage', 'finish']);
+  assert.equal(dailyCalls.length, 1);
+  const rec = dailyCalls[0];
+  assert.equal(rec.provider, 'p-a');
+  assert.equal(rec.model, 'm-1');
+  assert.equal(rec.outcome, 'committed');
+  assert.equal(rec.inSequence, false, '透传不算切换序列');
+  assert.equal(rec.switched, false);
+  assert.equal(rec.sessionId, 'sess-x');
+  assert.equal(rec.attemptsTotal, 1);
+  assert.equal(rec.tokens.inputTokens, 10);
+  assert.equal(rec.tokens.outputTokens, 5);
+  assert.equal(quotaRecs.length, 1, '透传也同步 quota.record（口径与切换路径统一）');
+  assert.deepEqual(quotaRecs[0], ['p-a', { inputTokens: 10, outputTokens: 5 }]);
+});
+
+test('wrapper v0.8.0 G1: 透传路径内层 throw → try/finally 兜底记账 EMPTY_RESPONSE 后原样重抛（不丢账）', async () => {
+  const deps = makeDeps({
+    config: { rules: [{ match: { default: true }, route: [{ provider: 'p-a', model: 'm-1' }] }] },
+  });
+  const dailyCalls = [];
+  deps.daily = { recordCall: (rec) => dailyCalls.push(rec) };
+  const wrapper = createStreamWrapper(deps);
+  const throwing = (async function* () {
+    yield { type: 'text-delta', index: 0, text: 'partial' };
+    throw new Error('boom');
+  })();
+  await assert.rejects(
+    () => drain(wrapper.call({}, { provider: 'p-a', model: 'm-1' }, () => throwing)),
+    /boom/,
+  );
+  assert.equal(dailyCalls.length, 1, '异常路径不得跳过记账');
+  assert.equal(dailyCalls[0].outcome, 'failed');
+  assert.equal(dailyCalls[0].errorCode, 'EMPTY_RESPONSE');
+  assert.equal(dailyCalls[0].inSequence, false);
+  assert.equal(dailyCalls[0].attemptsTotal, 1);
+});
+
+test('wrapper v0.8.0 G1: sessionId 修复——runAttempt 记账/metrics.sample 收到真实 sessionId', async () => {
+  const deps = makeDeps();
+  const samples = [];
+  const dailyCalls = [];
+  deps.metrics = { sample: (s) => samples.push(s), snapshot: () => ({}) };
+  deps.daily = { recordCall: (rec) => dailyCalls.push(rec) };
+  const wrapper = createStreamWrapper(deps);
+  const llm = makeLlm({ streamWrapper: wrapper }, {
+    'm-2': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'ok' };
+      yield finishStop;
+    },
+  });
+  const primary = (async function* () {
+    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA' } } };
+  })();
+  const out = await drain(wrapper.call(llm, { provider: 'p-a', model: 'm-1', sessionId: 'sess-1' }, () => primary));
+  assert.deepEqual(out.map((c) => c.type), ['text-delta', 'finish']);
+  assert.equal(samples.length, 2, '首选失败采样 + 重发成功采样');
+  assert.ok(samples.every((s) => s.sessionId === 'sess-1'), `metrics.sample 须携带 sessionId：${JSON.stringify(samples)}`);
+  assert.equal(dailyCalls.length, 2);
+  assert.ok(dailyCalls.every((r) => r.sessionId === 'sess-1'));
+  assert.equal(dailyCalls[0].inSequence, true);
+  assert.equal(dailyCalls[0].attemptIndex, 0);
+  assert.equal(dailyCalls[1].attemptIndex, 1);
+  assert.equal(dailyCalls[1].switched, true, '第二跳 switched=true');
+});
+
+test('routes v0.8.0 G1: 报告接口——disabled 503 / day 非法 400 / 无数据 404 / l1=1 摘要 / 指定日报告 / generate', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'mr-reports-'));
+  const base = {
+    config: { statusPath: '/api/model-router/status', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '' },
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { snapshot() { return {}; } },
+    quota: { snapshot() { return {}; } },
+    registry: null,
+    probe: null,
+    llm: {},
+    wrapperStats: {},
+    startedAt: Date.now(),
+    resolveSessions: null,
+    saveStateFn: () => {},
+    log,
+  };
+  const mkReq = (method, url, remote = '127.0.0.1') => ({
+    method,
+    url,
+    socket: { remoteAddress: remote },
+    headers: { host: '127.0.0.1:3081' },
+  });
+  const call = async (routes, req, path = '/api/model-router/reports') => {
+    const route = routes.find((r) => r.path === path);
+    assert.ok(route, `route missing: ${path}`);
+    let body;
+    const res = { writeHead() {}, setHeader() {}, end(b) { body = JSON.parse(b); } };
+    await route.handler(req, res);
+    return body;
+  };
+  try {
+    // reports.enabled=false → 503 明确提示（接口存在性稳定）
+    let body = await call(makeStatusRoutes(base), mkReq('GET', '/api/model-router/reports'));
+    assert.equal(body.ok, false);
+    assert.match(body.error, /reports disabled/);
+    body = await call(makeStatusRoutes(base), mkReq('POST', '/api/model-router/reports/generate'), '/api/model-router/reports/generate');
+    assert.equal(body.ok, false);
+    assert.match(body.error, /reports disabled/);
+
+    const ledger = new DailyLedger({ storePath: join(dir, 'state.json'), timeZone: 'Asia/Shanghai', log });
+    const reporter = new DailyReporter({ ledger, log });
+    const routes = makeStatusRoutes({ ...base, daily: ledger, reporter });
+    const yesterdayTs = Date.now() - 86400_000;
+
+    // 回环围栏：非回环 remote → 403
+    body = await call(routes, mkReq('GET', '/api/model-router/reports', '10.0.0.1'));
+    assert.equal(body.ok, false);
+    assert.match(body.error, /forbidden/);
+
+    // l1=1 摘要：days 数组 + today 快照
+    body = await call(routes, mkReq('GET', '/api/model-router/reports?l1=1'));
+    assert.equal(body.ok, true);
+    assert.ok(Array.isArray(body.days));
+    assert.ok(body.today && typeof body.today === 'object');
+
+    // day 非法格式 → 400
+    body = await call(routes, mkReq('GET', '/api/model-router/reports?day=2026-9-6'));
+    assert.equal(body.ok, false);
+    assert.match(body.error, /YYYY-MM-DD/);
+
+    // 无数据 → 404
+    body = await call(routes, mkReq('GET', '/api/model-router/reports?day=2020-01-01'));
+    assert.equal(body.ok, false);
+    assert.match(body.error, /no data/);
+
+    // 记账一条昨日数据 → 指定日实时聚合 200
+    ledger.recordCall({
+      provider: 'p-a', model: 'm-1', outcome: 'committed', inSequence: false,
+      attempts: 1, switched: false, e2eMs: 100, ttftMs: 40,
+      tokens: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+      ts: yesterdayTs,
+    });
+    body = await call(routes, mkReq('GET', `/api/model-router/reports?day=${dayKeyOf(yesterdayTs, 'Asia/Shanghai')}`));
+    assert.equal(body.ok, true);
+    assert.equal(body.report.summary.calls, 1);
+    assert.equal(body.report.byProviderModel[0].provider, 'p-a');
+
+    // generate：昨日有数据 → 200 报告落盘；再次触发 → already:true 不重复写
+    body = await call(routes, mkReq('POST', '/api/model-router/reports/generate'), '/api/model-router/reports/generate');
+    assert.equal(body.ok, true);
+    assert.equal(body.report.summary.calls, 1);
+    assert.equal(body.day, dayKeyOf(yesterdayTs, 'Asia/Shanghai'));
+    const again = await call(routes, mkReq('POST', '/api/model-router/reports/generate'), '/api/model-router/reports/generate');
+    assert.equal(again.already, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('routes v0.8.0 G1: status version 去硬编码（读 package.json）', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const { readFileSync } = await import('node:fs');
+  const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  const routes = makeStatusRoutes({
+    config: { statusPath: '/api/model-router/status', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '' },
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { snapshot() { return { recent: [], byRoute: {}, sessions: [] }; } },
+    quota: { snapshot() { return {}; } },
+    registry: null,
+    probe: null,
+    llm: {},
+    wrapperStats: {},
+    startedAt: Date.now(),
+    saveStateFn: () => {},
+    log,
+  });
+  const statusRoute = routes.find((r) => r.path === '/api/model-router/status');
+  const req = { method: 'GET', socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:3081' } };
+  let body;
+  const res = { writeHead() {}, setHeader() {}, end(b) { body = JSON.parse(b); } };
+  await statusRoute.handler(req, res);
+  assert.equal(body.version, pkgVersion, 'version 须与 package.json 一致（不再硬编码）');
+});
+
+// ==================== v0.8.0 B-1/B-2 按需负载测试 ====================
+
+test('loadtest v0.8.0 B-1: probe phase——结构正确 + 默认只测 free + PROBE_MARK 透传', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const llm = probeLlm({
+    'm-free': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'pong' };
+      yield finishStop;
+    },
+    'm-bad': async function* () {
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT' } } };
+    },
+  });
+  const registry = {
+    registeredPairs: () => [
+      { provider: 'p-a', model: 'm-free', tier: 'free' },
+      { provider: 'p-b', model: 'm-bad', tier: 'free' },
+      { provider: 'p-paid', model: 'm-paid', tier: 'paid-baseline' },
+      { provider: 'p-unk', model: 'm-unk' }, // 未声明 tier → unknown，默认同样排除
+    ],
+  };
+  const runner = new LoadTestRunner({ llm, registry, log });
+  const result = await runner.run('probe');
+  assert.equal(result.phase, 'probe');
+  assert.equal(result.aborted, false);
+  assert.equal(result.targets.length, 2, '默认 tierFilter=free，paid/unknown 排除');
+  const ok = result.targets.find((t) => t.model === 'm-free');
+  assert.equal(ok.ok, true);
+  assert.equal(typeof ok.ttftMs, 'number');
+  const bad = result.targets.find((t) => t.model === 'm-bad');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.errorCode, 'RATE_LIMIT');
+  // 请求经 singleRaw → 必带 PROBE_MARK → wrapper 直透不记账（生产状态零污染）
+  assert.equal(llm.calls.length, 2);
+  for (const c of llm.calls) assert.ok(c.__mr_probe, '探针请求必须带 PROBE_MARK');
+  // snapshot 反映最近结果
+  const snap = runner.snapshot();
+  assert.equal(snap.running, false);
+  assert.equal(snap.last.phase, 'probe');
+});
+
+test('loadtest v0.8.0 B-1: rpm phase——429 检测 lastOkRpm/first429Rpm + 自动等待恢复（S-3）', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  let n = 0;
+  const llm = probeLlm({
+    'm-rpm': async function* () {
+      n += 1;
+      if (n > 3) {
+        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT' } } };
+      } else {
+        yield { type: 'text-delta', index: 0, text: 'pong' };
+        yield finishStop;
+      }
+    },
+  });
+  const registry = { registeredPairs: () => [{ provider: 'p-a', model: 'm-rpm', tier: 'free' }] };
+  const runner = new LoadTestRunner({ llm, registry, log });
+  const started = Date.now();
+  // 阶梯 [100, 200] × 2 样本：100 档 2 发全过（n=1,2）；200 档 n=3 过、n=4 429 → 越界即停
+  const result = await runner.run('rpm', { qpsLadder: [100, 200], samplesPerStep: 2, recoveryMs: 60 });
+  const t = result.targets[0];
+  assert.equal(t.lastOkRpm, 100, '最后干净档 = 边界');
+  assert.equal(t.first429Rpm, 200, '首个 429 所在档');
+  assert.equal(t.ladder.length, 2);
+  assert.deepEqual(t.ladder[1], { qps: 200, success: 1, total: 2 });
+  assert.ok(Date.now() - started >= 40, '触发限流后自动等待恢复再交还控制权');
+});
+
+test('loadtest v0.8.0 B-1: context phase——多尺寸上下文探测结构', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const llm = probeLlm({
+    'm-ctx': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'ok' };
+      yield finishStop;
+    },
+  });
+  const registry = { registeredPairs: () => [{ provider: 'p-a', model: 'm-ctx', tier: 'free' }] };
+  const runner = new LoadTestRunner({ llm, registry, log });
+  const result = await runner.run('context', { sizes: [16, 32] });
+  assert.equal(result.phase, 'context');
+  assert.equal(result.targets.length, 1);
+  const sizes = result.targets[0].sizes;
+  assert.deepEqual(sizes.map((s) => s.tokens), [16, 32]);
+  assert.ok(sizes.every((s) => s.ok === true));
+  // 请求体按 tokens×4 字符粗估（触达超长上下文拒绝/接受判定）
+  assert.ok(JSON.stringify(llm.calls[0].messages).includes('x'.repeat(64)));
+});
+
+test('loadtest v0.8.0 B-1: quota-group phase——同组分组成员 + 并发保护 + abortAll', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const llm = probeLlm({
+    'm-g1': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'pong' };
+      yield finishStop;
+    },
+    'm-g2': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'pong' };
+      yield finishStop;
+    },
+  });
+  const registry = {
+    registeredPairs: () => [
+      { provider: 'p-a', model: 'm-g1', tier: 'free', quotaGroup: 'g1' },
+      { provider: 'p-b', model: 'm-g2', tier: 'free', quotaGroup: 'g1' },
+      { provider: 'p-c', model: 'm-1', tier: 'free' },
+    ],
+  };
+  const runner = new LoadTestRunner({ llm, registry, log });
+  const result = await runner.run('quota-group');
+  assert.equal(result.groups.length, 2);
+  const g1 = result.groups.find((g) => g.quotaGroup === 'g1');
+  assert.equal(g1.members.length, 2);
+  assert.ok(g1.members.every((m) => m.ok === true));
+  const none = result.groups.find((g) => g.quotaGroup === null);
+  assert.equal(none.members.length, 1);
+  // 并发保护：running 时二次 run 拒绝
+  runner.running = true;
+  await assert.rejects(runner.run('probe'), /already running/);
+  runner.running = false;
+  // abortAll：运行中置标志 → 当前请求完成后停止调度
+  const slowLlm = probeLlm({
+    default: async function* () {
+      await sleep(80);
+      yield { type: 'text-delta', index: 0, text: 'x' };
+      yield finishStop;
+    },
+  });
+  const slowRegistry = {
+    registeredPairs: () => [0, 1, 2, 3].map((i) => ({ provider: 'p-s', model: `m-slow-${i}`, tier: 'free' })),
+  };
+  const slowRunner = new LoadTestRunner({ llm: slowLlm, registry: slowRegistry, log });
+  const runPromise = slowRunner.run('probe');
+  await sleep(5);
+  slowRunner.abortAll();
+  const aborted = await runPromise;
+  assert.equal(aborted.aborted, true);
+  assert.ok(aborted.targets.length < 4, '中止后不再调度全部目标');
+});
+
+test('routes v0.8.0 B-2: loadtest 端点——GET 快照 / POST 202 / DELETE 200 / 405 / 400 / 409 / 403 / 503', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const base = {
+    config: { statusPath: '/api/model-router/status', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '' },
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { snapshot() { return {}; } },
+    quota: { snapshot() { return {}; } },
+    registry: null,
+    probe: null,
+    llm: {},
+    wrapperStats: {},
+    startedAt: Date.now(),
+    saveStateFn: () => {},
+    log,
+  };
+  const runs = [];
+  const loadtest = {
+    running: false,
+    snapshot() {
+      return { running: this.running, last: null, results: {} };
+    },
+    async run(phase, opts) {
+      runs.push({ phase, opts });
+      return { phase, targets: [] };
+    },
+    abortAll() {
+      this.abortedCalls = (this.abortedCalls ?? 0) + 1;
+    },
+  };
+  const routes = makeStatusRoutes({ ...base, loadtest });
+  const mkReq = (method, url, remote = '127.0.0.1', bodyStr = '') => ({
+    method,
+    url,
+    socket: { remoteAddress: remote },
+    headers: { host: '127.0.0.1:3081' },
+    [Symbol.asyncIterator]: async function* () {
+      if (bodyStr) yield Buffer.from(bodyStr);
+    },
+  });
+  const call = async (routeList, req) => {
+    const route = routeList.find((r) => r.path === '/api/model-router/loadtest');
+    let body;
+    const res = {
+      writeHead(code) {
+        res.status = code;
+      },
+      setHeader() {},
+      end(b) {
+        body = JSON.parse(b);
+      },
+    };
+    await route.handler(req, res);
+    return { status: res.status, body };
+  };
+  const LT = '/api/model-router/loadtest';
+  // GET → 快照
+  let r = await call(routes, mkReq('GET', LT));
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.running, false);
+  // POST probe → 202 + 默认只测 free（opts 空）
+  r = await call(routes, mkReq('POST', LT, '127.0.0.1', JSON.stringify({ phase: 'probe' })));
+  assert.equal(r.status, 202);
+  assert.equal(r.body.phase, 'probe');
+  assert.deepEqual(runs[0], { phase: 'probe', opts: {} });
+  // POST 显式参数 → opts 透传
+  await call(routes, mkReq('POST', LT, '127.0.0.1', JSON.stringify({ phase: 'rpm', tiers: ['paid-baseline'], qpsLadder: [0.1], samplesPerStep: 3 })));
+  assert.deepEqual(runs[1].opts, { tiers: ['paid-baseline'], qpsLadder: [0.1], samplesPerStep: 3 });
+  // 非法 phase → 400
+  r = await call(routes, mkReq('POST', LT, '127.0.0.1', JSON.stringify({ phase: 'nope' })));
+  assert.equal(r.status, 400);
+  // 已在跑 → 409
+  loadtest.running = true;
+  r = await call(routes, mkReq('POST', LT, '127.0.0.1', JSON.stringify({ phase: 'probe' })));
+  assert.equal(r.status, 409);
+  loadtest.running = false;
+  // 非 POST/GET/DELETE → 405
+  r = await call(routes, mkReq('PUT', LT));
+  assert.equal(r.status, 405);
+  // DELETE → 200 + abortAll 被调用
+  r = await call(routes, mkReq('DELETE', LT));
+  assert.equal(r.status, 200);
+  assert.equal(loadtest.abortedCalls, 1);
+  // 非回环 → 403
+  r = await call(routes, mkReq('GET', LT, '10.0.0.1'));
+  assert.equal(r.status, 403);
+  // 未装配 → 503
+  r = await call(makeStatusRoutes(base), mkReq('GET', LT));
+  assert.equal(r.status, 503);
+});
+
+

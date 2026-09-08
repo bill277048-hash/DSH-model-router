@@ -1,6 +1,6 @@
 # @botton/dsh-model-router
 
-DSH 多供应商模型路由插件（v0.7.0）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + 状态接口 + WebUI 面板。
+DSH 多供应商模型路由插件（v0.8.0）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板。
 
 - 兼容：dsh ≥ 0.1.1-rc.1，Node ≥ 22.19，零第三方运行时依赖
 - 许可证：Apache-2.0
@@ -39,19 +39,24 @@ dsh plugin --profile web add @botton/dsh-model-router
 
 ### 方式二：本仓库脚本（手动，适合未上架前自测）
 
-> Windows 推荐用方式一（`dsh plugin add`）；方式二为 bash 脚本，Windows 需 Git Bash 运行。
-
 ```bash
+# macOS / Linux（bash）：
 # 安装（备份 patch → 拷包 → 幂等追加条目；不自动重启）
 scripts/deploy.sh
+# 卸载（先摘条目后删包，自动备份 patch）
+scripts/undeploy.sh
 # 重载生效（确认后手动执行）：
 #   macOS（launchd 守护）：
 #     launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh
-#   Windows（无 launchd，手动重启 dsh 进程）：停止 dsh 后重新运行 dsh
+```
 
+```powershell
+# Windows 10+（PowerShell 5.1+，无需 Git Bash）：
+# 安装（逻辑与 deploy.sh 一致：备份 patch → 拷包 → 幂等追加条目；不自动重启）
+scripts\deploy.ps1
 # 卸载（先摘条目后删包，自动备份 patch）
-scripts/undeploy.sh
-# 重载同上
+scripts\undeploy.ps1
+# 重载生效：Windows 无 launchd——停止 dsh 进程后重新运行 dsh 即可
 ```
 
 配置在 profile patch（`~/.deepseek-harness/home/profiles/web/cordis.patch.yml`）的 insert 条目 `config:` 块中，改完重载生效。
@@ -65,6 +70,29 @@ curl --noproxy '*' -s http://127.0.0.1:3080/api/model-router/status
 ```
 
 返回：规则与策略快照、cooldown 状态表、最近 50 次尝试（含每次 attemptIndex/TTFT/错误码/outcome）、按路由聚合统计、用量记账（滚动 5h/1w 窗口）、包装层计数器（wraps/failovers/timeouts/forced/exhaustions）。
+
+### v0.8.0 新增接口（回环围栏，仅本机）
+
+**每日报告**（`reports.enabled=true` 后启用；未启用时接口存在但返回 503 明确提示）：
+
+```bash
+curl --noproxy '*' -s 'http://127.0.0.1:3081/api/model-router/reports'          # 最近摘要 + 今日实时快照
+curl --noproxy '*' -s 'http://127.0.0.1:3081/api/model-router/reports?l1=1'    # 轻量摘要（面板概览卡 5s 轮询）
+curl --noproxy '*' -s 'http://127.0.0.1:3081/api/model-router/reports?day=2026-09-06'  # 指定日报告
+curl --noproxy '*' -s -X POST 'http://127.0.0.1:3081/api/model-router/reports/generate' # 立即生成昨日报告
+```
+
+**按需负载测试**（手动触发，复用 probe 原语；默认只测 free tier，不烧付费 token）：
+
+```bash
+curl --noproxy '*' -s 'http://127.0.0.1:3081/api/model-router/loadtest'                                  # 运行快照
+curl --noproxy '*' -s -X POST 'http://127.0.0.1:3081/api/model-router/loadtest' -H 'content-type: application/json' -d '{"phase":"probe"}'
+curl --noproxy '*' -s -X POST 'http://127.0.0.1:3081/api/model-router/loadtest' -H 'content-type: application/json' -d '{"phase":"rpm","tiers":["free"]}'
+curl --noproxy '*' -s -X DELETE 'http://127.0.0.1:3081/api/model-router/loadtest'                        # 中止
+```
+
+- phase：`probe`（存活/延迟）/ `rpm`（QPS 阶梯找 RPM 边界，触发限流自动等待恢复）/ `context`（多尺寸上下文接受度）/ `quota-group`（同组共享速率池联动）
+- 已在跑时重复 POST 返回 409；探针请求带 PROBE_MARK 直透——跑完 cooldown/metrics/quota/daily 零污染
 
 ### 场景 A：真实故障切换（推荐先做）
 
@@ -104,12 +132,13 @@ route:
 |---|---|---|
 | `propose` | `false` | `true` 时经 `agent/request` 提议会话级 (provider, model) |
 | `rules[]` | `[]` | 自上而下首个 match 生效；match 支持 `provider`/`model`/`default` |
-| `fallbackPolicy.maxRetries` | `2` | 首选之后最多切换次数（首分片前） |
+| `providerMeta` | `{}` | v0.8.0 A-2：provider → `{quotaGroup?, tier?}` 元数据（自家配置域，不跨插件读 settings）；route hop 可内联覆盖（单条特例优先） |
+| `fallbackPolicy.maxRetries` | `2` | 首选之后最多切换次数（首分片前）；v0.8.0 A-3：未显式声明时自动调优为 `max(quotaGroupCount×2, 5)`，显式声明（含显式 2）一律尊重 |
 | `fallbackPolicy.failureThreshold` | `3` | 连续失败进 open 的阈值 |
 | `fallbackPolicy.cooldownSec` | `60` | open → half-open 冷却秒数 |
 | `fallbackPolicy.quotaFailureThreshold` | `1` | QUOTA（workspace 配额耗尽）触发阈值；v0.6.1 起配额型错误单独阈值 |
 | `fallbackPolicy.quotaCooldownSec` | `600` | QUOTA 冷却秒数（10 分钟）；half-open 放行试探后自动回归 |
-| `fallbackPolicy.failoverSignals` | 10 个错误码 | 可触发切换的 `failure.code`：`QUOTA` `QUOTA_EXCEEDED` `RATE_LIMIT` `TRANSPORT` `SERVER` `UNKNOWN` `INVALID_CREDENTIAL` `MISSING_CREDENTIAL` `EMPTY_RESPONSE` `TIMEOUT` |
+| `fallbackPolicy.failoverSignals` | 11 个错误码 | 可触发切换的 `failure.code`：`QUOTA` `QUOTA_EXCEEDED` `RATE_LIMIT` `TRANSPORT` `SERVER` `UNKNOWN` `INVALID_CREDENTIAL` `MISSING_CREDENTIAL` `EMPTY_RESPONSE` `TIMEOUT` + v0.8.0 追加 `INVALID_REQUEST`（DSH httpErrorCode(400, 非 quota/context) 归此类） |
 | `fallbackPolicy.allCooldownFallback` | `force-first` | 候选全冷却时：`force-first` 强制重试首选候选 / `fail` 回退透传 |
 | `fallbackPolicy.switchAfterFirstChunk` | `false` | **硬约束**：首分片之后绝不切换（commit-on-first-chunk，防内容拼接错乱） |
 | `firstTokenTimeoutMs` | `30000` | 首分片看门狗毫秒（≥1000，30s） |
@@ -118,13 +147,23 @@ route:
 | `mode` | `balanced` | v0.7.0 模式预设：`stable` / `balanced` / `fast`，覆盖 watchdog/budget/cooldown/quotaCooldown；不动规则链与 maxRetries |
 | `registryRefreshSec` | `300` | 注册表（provider/模型目录）刷新周期秒数 |
 | `probe.enabled` | `false` | v0.4.0 健康探测开关；默认关闭避免无授权打真实 API |
+| `reports` | `{enabled:false, hour:'01:00'}` | v0.8.0 G1 每日报告开关；`enabled:true` 后日账本记账 + 每日 `hour` 生成昨日报告 |
 | `statusPath` | `/api/model-router/status` | 状态接口路径 |
 
-## v0.7 范围声明
+## v0.8 范围声明
 
-已实现：规则路由（四种扩展策略：explicit / same-model / same-provider / exclude-current，源自 dsh 模型注册表）、无感故障切换全语义（finish 分片驱动 + commit-on-first-chunk）、cooldown 三态熔断（含 v0.6.1 配额感知：QUOTA 单独阈值 1 次 + 600 秒冷却）、TTFT 看门狗（30s）+ 切换总预算（failoverBudgetMs 90s）、用量记账（可视，滚动 5h/1w 窗口）、状态接口、WebUI 面板（规则/配额/mode 热更新，store JSON 持久化免重启）、v0.7.0 模式预设（`stable` 60s/300s预算/120s冷却/900s配额冷却；`balanced` 30s/90s/60s/600s；`fast` 15s/45s/30s/300s）、v0.6.0 会话标题三级解析（live / snapshots / 持久化日志直读）、61 项单元测试。
+已实现：v0.7 全部能力 + v0.8.0 调改（详见 [CHANGELOG.md](CHANGELOG.md)）：
 
-未实现（后续分期）：配额剩余预算参与路由排序/排除（P3）、SQLite 聚合与评分卡（P4）、多 key 池轮换（P5）、浏览器看板（P4 可选）。
+- **G1 每日 API 报告**：日账本 NDJSON 按天追加、稳定性评级 S/A/B/C/D/N/A、按供应商×模型聚合、每日凌晨 1 点调度、三渠道交付（文件 + 面板 + API）
+- **G2 面板信息分级**：五页签三级结构（概览摘要卡 → 明细页签 → 工具折叠区）+ 轮询分级（概览 5s 轮 `?l1=1`）
+- **G3 Windows 适配**：`deploy.ps1`/`undeploy.ps1`（PS5.1 兼容、幂等）+ CI 三平台（Ubuntu/macOS/Windows × Node 22/24）
+- **A-1** `INVALID_REQUEST` 加入 failoverSignals（11 项）；**A-2** `providerMeta` 配置域；**A-3** `maxRetries` 自动调优
+- **B-1/B-2** 按需负载测试（4-phase 编排层复用 probe 原语，PROBE_MARK 直透零污染，默认只测 free）
+- **C-1** quotaGroup 去重；**C-2** registry 元数据（quotaGroup/tier）
+- 附带修复：sessionId 未赋值 bug、透传路径兜底记账、status `version` 去硬编码
+- **86 项单元测试全过**（基线 61 + 新增 25）
+
+未实现（后续分期）：配额剩余预算参与路由排序/排除（P3）、SQLite 聚合与评分卡（P4）、多 key 池轮换（P5）、浏览器看板（P4 可选）、F 段（自命名规则 / mode 单一体系 / 注册新 adapter / 选包路由 UI 集成，计划 v0.9.0）。
 
 ## 许可证
 

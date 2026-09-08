@@ -62,7 +62,7 @@ else
           maxRetries: 4
           failureThreshold: 3
           cooldownSec: 60
-          failoverSignals: [QUOTA, QUOTA_EXCEEDED, RATE_LIMIT, TRANSPORT, SERVER, UNKNOWN, INVALID_CREDENTIAL, MISSING_CREDENTIAL, EMPTY_RESPONSE, TIMEOUT]
+          failoverSignals: [QUOTA, QUOTA_EXCEEDED, RATE_LIMIT, TRANSPORT, SERVER, UNKNOWN, INVALID_CREDENTIAL, MISSING_CREDENTIAL, EMPTY_RESPONSE, TIMEOUT, INVALID_REQUEST]
           allCooldownFallback: force-first
           switchAfterFirstChunk: false
         firstTokenTimeoutMs: 30000

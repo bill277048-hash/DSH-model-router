@@ -1,16 +1,17 @@
 /**
- * @botton/dsh-model-router 插件浏览器半（client）v0.3。
+ * @botton/dsh-model-router 插件浏览器半（client）v0.8.0。
  *
  * 手写 ModuleLoader 包装格式（无构建链、无 JSX，与 @botton/dsh-guardian 同款）：
  * 注册到 "web-ui.plugin.item" slot（WebUI 插件管理页卡片列表）。
  *
- * v0.3（面板重构）：
- * - 四页签：接入现状 / 切换规则 / 切换日志 / 可切换模型
- * - 作用域结构化编辑：全部会话 / 指定模型 / 指定供应商 / 指定会话（下拉 + 点选，
- *   不再依赖大段说明文字）。会话 ID 来自插件记录的最近活跃会话。
- * - match 多条件为 AND（可组合「某模型 × 某会话」）；带会话限定的规则不参与
- *   会话级提议（dsh agent/request 载荷不含 sessionId，平台事实）。
- * - 追加候选下拉限宽；保存成功清 dirty。
+ * v0.8.0（G2 面板信息分级）：
+ * - 五页签三级结构：概览摘要卡（L1）→ 明细页签（L2：切换规则/切换日志/
+ *   可切换模型/每日报告）→ 工具折叠区（L3：健康探测/TRM 压测/用量窗口）。
+ * - 概览默认页 5 张摘要卡：健康总览 / 今日运行 / 昨日报告 / 熔断速览 / 规则速览；
+ *   概览态 5s 轮询 `?l1=1` 轻量摘要接口，明细页签才拉全量 status。
+ * - 每日报告页签：近 30 天日期下拉 + 报告渲染（评级徽章/总览/按模型表）+ 立即生成。
+ * - 用量窗口标题注明口径「全部调用（含透传）」（与每日报告一致）。
+ * - 保留原功能：规则编辑/保存/模式/时区/探测/日志/模型全部可达。
  */
 window.__ModuleLoader__.load({
   id: "@botton/dsh-model-router",
@@ -28,9 +29,13 @@ window.__ModuleLoader__.load({
     var API = {
       status: "/api/model-router/status",
       state: "/api/model-router/state",
-      probe: "/api/model-router/probe"
+      probe: "/api/model-router/probe",
+      benchmark: "/api/model-router/benchmark",
+      reports: "/api/model-router/reports",
+      reportsGenerate: "/api/model-router/reports/generate"
     };
     var POLL_INTERVAL_MS = 5000;
+    var REPORT_DAYS_RANGE = 30;
 
     var STRATEGY_LABELS = {
       explicit: "手工列表（按下方顺序）",
@@ -39,11 +44,13 @@ window.__ModuleLoader__.load({
       "exclude-current": "排除当前·注册表全部（自动）"
     };
 
+    // v0.8.0 G2：五页签（原 4 页签 + 每日报告）
     var TABS = [
-      { key: "overview", label: "接入现状" },
+      { key: "overview", label: "概览" },
       { key: "rules", label: "切换规则" },
       { key: "logs", label: "切换日志" },
-      { key: "models", label: "可切换模型" }
+      { key: "models", label: "可切换模型" },
+      { key: "reports", label: "每日报告" }
     ];
 
     var styles = {
@@ -51,7 +58,7 @@ window.__ModuleLoader__.load({
         border: "1px solid #d0d7de",
         borderRadius: "8px",
         padding: "16px",
-        maxWidth: "760px",
+        maxWidth: "900px",
         fontFamily: "-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Segoe UI', sans-serif",
         fontSize: "13px",
         color: "#1f2328",
@@ -66,7 +73,7 @@ window.__ModuleLoader__.load({
         fontSize: "12px",
         fontWeight: 600
       },
-      tabbar: { display: "flex", gap: "2px", borderBottom: "1px solid #d0d7de", margin: "4px 0 12px" },
+      tabbar: { display: "flex", gap: "2px", borderBottom: "1px solid #d0d7de", margin: "4px 0 12px", flexWrap: "wrap" },
       tab: {
         padding: "6px 12px",
         border: "none",
@@ -156,7 +163,43 @@ window.__ModuleLoader__.load({
         marginBottom: "10px"
       },
       hint: { color: "#57606a", fontSize: "11px", marginTop: "6px" },
-      divider: { borderTop: "1px solid #eaeef2", margin: "10px 0" }
+      divider: { borderTop: "1px solid #eaeef2", margin: "10px 0" },
+      // v0.8.0 G2：摘要卡
+      summaryGrid: {
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))",
+        gap: "10px",
+        marginBottom: "14px"
+      },
+      summaryCard: {
+        border: "1px solid #d0d7de",
+        borderRadius: "8px",
+        padding: "10px 12px",
+        background: "#ffffff",
+        cursor: "pointer"
+      },
+      summaryTitle: { fontSize: "12px", color: "#57606a", fontWeight: 600, marginBottom: "6px" },
+      summaryValue: { fontSize: "20px", fontWeight: 700, lineHeight: 1.2 },
+      summarySub: { fontSize: "11px", color: "#57606a", marginTop: "4px", lineHeight: 1.5 },
+      // 折叠区（L3 工具下沉）
+      fold: {
+        border: "1px solid #eaeef2",
+        borderRadius: "6px",
+        marginBottom: "8px",
+        background: "#f6f8fa"
+      },
+      foldSummary: {
+        padding: "8px 10px",
+        cursor: "pointer",
+        fontWeight: 600,
+        fontSize: "12px",
+        color: "#1f2328",
+        listStyle: "none"
+      },
+      foldBody: { padding: "0 10px 10px" },
+      table: { borderCollapse: "collapse", width: "100%", fontSize: "12px" },
+      th: { textAlign: "left", padding: "4px 8px", borderBottom: "1px solid #d0d7de", color: "#57606a", fontWeight: 600 },
+      td: { padding: "4px 8px", borderBottom: "1px solid #eaeef2" }
     };
 
     function routeBadge(converged) {
@@ -201,6 +244,20 @@ window.__ModuleLoader__.load({
       return { text: "健康", color: "#1a7f37", bg: "#dafbe1" };
     }
 
+    /** v0.8.0 G2：稳定性评级徽章（S/A/B/C/D/N/A） */
+    function gradeBadge(grade) {
+      var map = {
+        S: { color: "#1a7f37", bg: "#dafbe1" },
+        A: { color: "#0969da", bg: "#ddf4ff" },
+        B: { color: "#9a6700", bg: "#fff8c5" },
+        C: { color: "#bf8700", bg: "#fff1e5" },
+        D: { color: "#cf222e", bg: "#ffebe9" },
+        "N/A": { color: "#57606a", bg: "#eaeef2" }
+      };
+      var s = map[grade] || map["N/A"];
+      return h("span", { style: Object.assign({}, styles.badge, { color: s.color, background: s.bg }) }, grade);
+    }
+
     /** 指定时区当前时刻（Intl/ICU 确定性换算，不依赖 IP 地理位置——VPN 不影响） */
     function fmtNowInTz(tz) {
       try {
@@ -212,6 +269,13 @@ window.__ModuleLoader__.load({
 
     function fmtInt(n) {
       return typeof n === "number" ? String(n) : "0";
+    }
+
+    function fmtTokens(n) {
+      if (typeof n !== "number" || !isFinite(n)) return "0";
+      if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
+      if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+      return String(n);
     }
 
     function providerLabel(p) {
@@ -259,6 +323,25 @@ window.__ModuleLoader__.load({
       custom: "生效范围：自定义组合"
     };
 
+    /** 本地日期 YYYY-MM-DD（报告下拉选项用） */
+    function dayStr(offset) {
+      var d = new Date(Date.now() - offset * 86400000);
+      var p2 = function (n) { return (n < 10 ? "0" : "") + n; };
+      return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate());
+    }
+
+    /** v0.8.0 G2：摘要卡小组件 */
+    function SummaryCard(props) {
+      return h("div", {
+        style: styles.summaryCard,
+        title: props.title || "",
+        onClick: props.onClick || undefined
+      },
+        h("div", { style: styles.summaryTitle }, props.label),
+        h("div", { style: styles.summaryValue }, props.value),
+        props.sub ? h("div", { style: styles.summarySub }, props.sub) : null);
+    }
+
     function ModelRouterPanel() {
       var s1 = useState(null);
       var status = s1[0];
@@ -278,8 +361,25 @@ window.__ModuleLoader__.load({
       var s6 = useState("overview");
       var activeTab = s6[0];
       var setActiveTab = s6[1];
+      // v0.8.0 G2：l1 轻量摘要（概览轮询）+ 报告页签数据
+      var s7 = useState(null);
+      var l1 = s7[0];
+      var setL1 = s7[1];
+      var s8 = useState(null);
+      var report = s8[0];
+      var setReport = s8[1];
+      var s9 = useState(null);
+      var reportError = s9[0];
+      var setReportError = s9[1];
+      var s10 = useState(false);
+      var generating = s10[0];
+      var setGenerating = s10[1];
+      var s11 = useState(null);
+      var bench = s11[0];
+      var setBench = s11[1];
       var mountedRef = useRef(true);
 
+      // 全量 status（明细页签 / 概览初始化 / 保存后刷新）
       var refresh = useCallback(function () {
         return fetch(API.status)
           .then(function (res) { return res.json(); })
@@ -311,15 +411,77 @@ window.__ModuleLoader__.load({
           });
       }, []);
 
+      // v0.8.0 G2：轻量摘要轮询（概览态专用；daily 未启用时返回 503 → l1 置 null）
+      var refreshL1 = useCallback(function () {
+        return fetch(API.reports + "?l1=1")
+          .then(function (res) { return res.json(); })
+          .then(function (body) {
+            if (!mountedRef.current) return;
+            if (body && body.ok) setL1(body);
+            else setL1(null);
+          })
+          .catch(function () {
+            if (!mountedRef.current) return;
+            setL1(null);
+          });
+      }, []);
+
+      // 报告页签：按日加载报告
+      var loadReport = useCallback(function (day) {
+        if (!day) return;
+        setReportError(null);
+        fetch(API.reports + "?day=" + encodeURIComponent(day))
+          .then(function (res) { return res.json(); })
+          .then(function (body) {
+            if (!mountedRef.current) return;
+            if (body && body.ok) {
+              setReport(body.report);
+              setReportError(null);
+            } else {
+              setReport(null);
+              setReportError((body && body.error) || "报告不可用");
+            }
+          })
+          .catch(function (error) {
+            if (!mountedRef.current) return;
+            setReport(null);
+            setReportError("请求失败：" + (error && error.message ? error.message : String(error)));
+          });
+      }, []);
+
+      // v0.8.0 G2 轮询分级：概览态轮 l1 轻量；明细页签轮全量；报告页签只拉一次
       useEffect(function () {
         mountedRef.current = true;
-        refresh();
-        var timer = setInterval(refresh, POLL_INTERVAL_MS);
+        if (activeTab === "reports") {
+          refresh();
+          return function () {
+            mountedRef.current = false;
+            // 无定时器（报告页按需拉取，不轮询）
+          };
+        }
+        var isOverview = activeTab === "overview";
+        if (isOverview) {
+          refresh();
+          refreshL1();
+        } else {
+          refresh();
+        }
+        var timer = setInterval(function () {
+          if (isOverview) refreshL1();
+          else refresh();
+        }, POLL_INTERVAL_MS);
         return function () {
           mountedRef.current = false;
           clearInterval(timer);
         };
-      }, [refresh]);
+      }, [refresh, refreshL1, activeTab]);
+
+      // 首次挂载 + 切到报告页：默认选「昨天」
+      useEffect(function () {
+        if (activeTab === "reports") {
+          loadReport(dayStr(1));
+        }
+      }, [activeTab, loadReport]);
 
       var save = useCallback(function () {
         if (!edit) return;
@@ -410,6 +572,60 @@ window.__ModuleLoader__.load({
             setFeedback({ ok: false, message: "探测请求失败：" + (error && error.message ? error.message : String(error)) });
           });
       }, [refresh]);
+
+      // v0.8.0 G2：TRM 压测（工具 L3）
+      var runBenchmark = useCallback(function () {
+        if (!bench || !bench.provider || !bench.model) {
+          setFeedback({ ok: false, message: "压测须选择 provider 与 model" });
+          return;
+        }
+        setBench(Object.assign({}, bench, { running: true, result: null, error: null }));
+        fetch(API.benchmark, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ provider: bench.provider, model: bench.model })
+        })
+          .then(function (res) { return res.json(); })
+          .then(function (body) {
+            if (!mountedRef.current) return;
+            if (body && body.ok) setBench(Object.assign({}, bench, { running: false, result: body.report }));
+            else setBench(Object.assign({}, bench, { running: false, error: (body && body.error) || "压测失败" }));
+          })
+          .catch(function (error) {
+            if (!mountedRef.current) return;
+            setBench(Object.assign({}, bench, { running: false, error: "压测请求失败：" + (error && error.message ? error.message : String(error)) }));
+          });
+      }, [bench]);
+
+      // v0.8.0 G2：立即生成昨日报告
+      var generateReport = useCallback(function () {
+        setGenerating(true);
+        setReportError(null);
+        fetch(API.reportsGenerate, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}"
+        })
+          .then(function (res) { return res.json(); })
+          .then(function (body) {
+            if (!mountedRef.current) return;
+            if (body && body.ok) {
+              setReport(body.report);
+              setReportError(null);
+              if (body.day) loadReport(body.day);
+            } else {
+              setReportError((body && body.error) || "生成失败");
+            }
+            refreshL1();
+          })
+          .catch(function (error) {
+            if (!mountedRef.current) return;
+            setReportError("生成请求失败：" + (error && error.message ? error.message : String(error)));
+          })
+          .finally(function () {
+            if (mountedRef.current) setGenerating(false);
+          });
+      }, [loadReport, refreshL1]);
 
       // ---------- 编辑态操作 ----------
       function mutate(fn) {
@@ -571,49 +787,111 @@ window.__ModuleLoader__.load({
       }
 
       if (status && edit) {
-        // ============ 页签 1：接入现状 ============
+        // ============ L1：概览（默认页）5 张摘要卡 ============
         if (activeTab === "overview") {
+          // 卡 1：健康总览（provider 总数 + 探测状态计数）
+          var provAll = registry.providers;
+          var activeCount = activeProviders.length;
+          var probeEntriesMap = (status.probe && status.probe.entries) || {};
+          var upCount = 0, degradedCount = 0, downCount = 0, probeTotal = 0;
+          Object.keys(probeEntriesMap).forEach(function (k) {
+            var hh = probeEntriesMap[k];
+            probeTotal += 1;
+            if (hh.status === "down") downCount += 1;
+            else if (hh.status === "degraded") degradedCount += 1;
+            else upCount += 1;
+          });
+          var healthSub = probeTotal > 0
+            ? "健康 " + upCount + " · 降级 " + degradedCount + " · 不可用 " + downCount + "（探测 " + probeTotal + "）"
+            : (status.probe && status.probe.enabled
+                ? "探测已开启，暂无结果"
+                : "探测未开启——点「立即探测」可手动跑一轮");
           children.push(
-            h("div", { key: "ov", style: styles.section },
-              h("div", { style: styles.sectionTitle }, "已接入的模型供应商"),
-              activeProviders.length === 0
-                ? h("div", { style: styles.meta }, "尚未取到——等待目录刷新（默认 5 分钟周期）")
-                : activeProviders.map(function (p) {
-                    return h("div", { key: p.provider, style: styles.row },
-                      h("span", { style: styles.mono }, providerLabel(p)),
-                      h("span", { style: styles.meta },
-                        p.models.length > 0
-                          ? p.models.map(function (mo) { return mo.id; }).join("、")
-                          : "模型目录未就绪"));
-                  }))
-          );
-          children.push(
-            h("div", { key: "ov-chain", style: styles.section },
-              h("div", { style: styles.sectionTitle }, "当前生效的切换规则"),
-              (edit.rules || []).length === 0
-                ? h("div", { style: styles.meta }, "未配置规则——纯透传模式（不改任何行为）")
-                : edit.rules.map(function (rule, ri) {
-                    var chain = (rule.route || []).map(function (hop) {
-                      var p = registry.providers.find(function (x) { return x.provider === hop.provider; });
-                      return hop.provider +
-                        (p && p.displayName && p.displayName !== hop.provider ? "（" + p.displayName + "）" : "") +
-                        "/" + hop.model;
-                    }).join("  →  ");
-                    return h("div", { key: "c" + ri, style: { marginBottom: "6px" } },
-                      h("div", { style: styles.meta },
-                        "规则 " + (ri + 1) + " · " + matchText(rule.match) + " · " + (STRATEGY_LABELS[rule.strategy || "explicit"])),
-                      h("div", { style: styles.mono }, chain || "（无候选）"));
-                  }),
-              h("div", { style: styles.hint }, "详细编辑见「切换规则」页签"))
-          );
-          var w0 = status.wrapper || {};
-          children.push(
-            h("div", { key: "ov-stats", style: styles.section },
-              h("div", { style: styles.sectionTitle }, "运行统计"),
-              h("div", { style: styles.meta },
-                "包装调用 " + fmtInt(w0.wraps) + " · 透传 " + fmtInt(w0.passthroughs) +
-                " · 故障切换 " + fmtInt(w0.failovers) + " · 看门狗超时 " + fmtInt(w0.timeouts) +
-                " · 链耗尽 " + fmtInt(w0.exhaustions) + " · 用户取消 " + fmtInt(w0.userAborts)))
+            h("div", { key: "ov-cards", style: styles.summaryGrid },
+              h(SummaryCard, {
+                key: "c1", label: "健康总览",
+                value: String(activeCount) + " 家",
+                sub: healthSub,
+                title: "已接入的非休眠供应商数；探测状态来自健康探测板",
+                onClick: function () { setActiveTab("models"); }
+              }),
+
+              // 卡 2：今日运行（wrapper 计数 + 今日 token 小计）
+              (function () {
+                var w = status.wrapper || {};
+                var today = (l1 && l1.today) || null;
+                var tokenTotal = today && today.tokens ? today.tokens.total : null;
+                var subParts = [
+                  "透传 " + fmtInt(w.passthroughs) + " · 切换 " + fmtInt(w.failovers) +
+                  " · 超时 " + fmtInt(w.timeouts) + " · 链耗尽 " + fmtInt(w.exhaustions)
+                ];
+                if (tokenTotal !== null) subParts.push("今日 token " + fmtTokens(tokenTotal));
+                else subParts.push("（未启用每日报告，无 token 统计）");
+                return h(SummaryCard, {
+                  key: "c2", label: "今日运行",
+                  value: fmtInt(w.wraps) + " 次",
+                  sub: subParts.join(" · "),
+                  title: "包装调用次数（含透传与切换）；今日 token 来自每日报告账本（reports.enabled=true 时）",
+                  onClick: function () { setActiveTab("logs"); }
+                });
+              })(),
+
+              // 卡 3：昨日报告（l1.days 最近一日）
+              (function () {
+                var days = (l1 && l1.days) || [];
+                var last = days.length > 0 ? days[days.length - 1] : null;
+                if (!last) {
+                  return h(SummaryCard, {
+                    key: "c3", label: "昨日报告",
+                    value: "暂无",
+                    sub: l1 ? "昨日无调用记录" : "未启用每日报告（reports.enabled=false）",
+                    title: "每日凌晨 1 点生成前一日报告",
+                    onClick: function () { setActiveTab("reports"); }
+                  });
+                }
+                var sm = last.summary || {};
+                var total = sm.calls || 0;
+                var rate = total > 0 ? Math.round(((total - (sm.failed || 0) - (sm.aborted || 0)) / total) * 100) + "%" : "—";
+                return h(SummaryCard, {
+                  key: "c3", label: "昨日报告",
+                  value: last.day,
+                  sub: "成功率 " + rate + " · 切换 " + fmtInt(sm.switchedCalls) + " 次 · 调用 " + fmtInt(total),
+                  title: "点击查看每日报告明细",
+                  onClick: function () { setActiveTab("reports"); }
+                });
+              })(),
+
+              // 卡 4：熔断速览（cooldown 熔断中条目数）
+              (function () {
+                var cdEntries = Object.entries(status.cooldown || {});
+                var openCount = cdEntries.filter(function (p) { return p[1] && p[1].state === "open"; }).length;
+                var halfCount = cdEntries.filter(function (p) { return p[1] && p[1].state === "half-open"; }).length;
+                var sub = openCount + halfCount > 0
+                  ? "熔断中 " + openCount + " · 试探 " + halfCount
+                  : "无熔断——全部正常";
+                return h(SummaryCard, {
+                  key: "c4", label: "熔断速览",
+                  value: String(openCount),
+                  sub: sub,
+                  title: "点击查看 Cooldown 明细",
+                  onClick: function () { setActiveTab("logs"); }
+                });
+              })(),
+
+              // 卡 5：规则速览（规则数 + 范围摘要）
+              (function () {
+                var rules = (edit && edit.rules) || [];
+                var scopeText = rules.length === 0
+                  ? "纯透传模式（不改任何行为）"
+                  : rules.map(function (r, ri) { return "规则" + (ri + 1) + "：" + matchText(r.match); }).join("；");
+                return h(SummaryCard, {
+                  key: "c5", label: "切换规则",
+                  value: String(rules.length) + " 条",
+                  sub: scopeText.length > 60 ? scopeText.slice(0, 60) + "…" : scopeText,
+                  title: "点击进入切换规则编辑",
+                  onClick: function () { setActiveTab("rules"); }
+                });
+              })())
           );
         }
 
@@ -703,7 +981,7 @@ window.__ModuleLoader__.load({
                                           }));
                                         }
                                       }, "✕"));
-                                })),
+                                  })),
                             h("div", { style: styles.row },
                               recentSessions.length > 0
                                 ? h("select", {
@@ -943,7 +1221,7 @@ window.__ModuleLoader__.load({
           );
         }
 
-        // ============ 页签 3：切换日志 ============
+        // ============ 页签 3：切换日志（统计 + Cooldown + L3 工具折叠区） ============
         if (activeTab === "logs") {
           var w = status.wrapper || {};
           children.push(
@@ -970,27 +1248,116 @@ window.__ModuleLoader__.load({
                         "连续失败 " + pair[1].failures + " 次" + (pair[1].lastErrorCode ? " · 末次 " + pair[1].lastErrorCode : "")));
                   }))
           );
+
+          // —— L3 工具折叠区（探测 / 压测 / 用量窗口）——
           var probeEntries = status.probe ? Object.entries(status.probe.entries || {}) : [];
           children.push(
-            h("div", { key: "probe", style: styles.section },
-              h("div", { style: styles.sectionTitle },
-                "健康探测" + (status.probe && status.probe.enabled ? "" : "（周期未开启，点「立即探测」可手动跑一轮）")),
-              probeEntries.length === 0
-                ? h("div", { style: styles.meta }, "暂无探测记录")
-                : probeEntries.map(function (pair) {
-                    var hb = probeBadge(pair[1]);
-                    return h("div", { key: pair[0], style: styles.row },
-                      h("span", { style: styles.mono }, pair[0]),
-                      h("span", { style: Object.assign({}, styles.badge, { color: hb.color, background: hb.bg }) }, hb.text),
-                      h("span", { style: styles.meta },
-                        (typeof pair[1].p95TtftMs === "number" ? "P95 " + pair[1].p95TtftMs + "ms" : "") +
-                        (pair[1].lastError ? " · 末次 " + pair[1].lastError : "") +
-                        (pair[1].lastProbeAt ? " · " + fmtLogTime(pair[1].lastProbeAt) : "")));
-                  }),
-              h("div", { style: styles.row },
-                h("button", { style: styles.button, onClick: probeAll }, "立即探测全部"),
-                h("span", { style: styles.meta }, "探测结果作为候选排序的健康度参考（down 排末、延迟低优先）"))),
+            h("div", { key: "tool-fold", style: styles.section },
+              h("div", { style: styles.sectionTitle }, "工具"),
+              h("details", { key: "fold-probe", style: styles.fold },
+                h("summary", { style: styles.foldSummary },
+                  "健康探测" + (probeEntries.length > 0 ? "（" + probeEntries.length + "）" : "") +
+                  (status.probe && status.probe.enabled ? "" : " · 周期未开启")),
+                h("div", { style: styles.foldBody },
+                  probeEntries.length === 0
+                    ? h("div", { style: styles.meta }, "暂无探测记录——点「立即探测」跑一轮")
+                    : probeEntries.map(function (pair) {
+                        var hb = probeBadge(pair[1]);
+                        return h("div", { key: pair[0], style: styles.row },
+                          h("span", { style: styles.mono }, pair[0]),
+                          h("span", { style: Object.assign({}, styles.badge, { color: hb.color, background: hb.bg }) }, hb.text),
+                          h("span", { style: styles.meta },
+                            (typeof pair[1].p95TtftMs === "number" ? "P95 " + pair[1].p95TtftMs + "ms" : "") +
+                            (pair[1].lastError ? " · 末次 " + pair[1].lastError : "") +
+                            (pair[1].lastProbeAt ? " · " + fmtLogTime(pair[1].lastProbeAt) : "")));
+                      }),
+                  h("div", { style: styles.row },
+                    h("button", { style: styles.button, onClick: probeAll }, "立即探测全部"),
+                    h("span", { style: styles.meta }, "探测结果作为候选排序的健康度参考（down 排末、延迟低优先）")))),
+
+              h("details", { key: "fold-bench", style: styles.fold },
+                h("summary", { style: styles.foldSummary }, "TRM 压测（QPS 阶梯找 RPM 边界）"),
+                h("div", { style: styles.foldBody },
+                  h("div", { style: styles.row },
+                    h("span", { style: styles.meta }, "目标："),
+                    h("select", {
+                      style: styles.narrowSelect,
+                      value: (bench && bench.provider) || "",
+                      onChange: function (ev) {
+                        var v = ev.target.value;
+                        var opts = bench ? Object.assign({}, bench) : {};
+                        opts.provider = v;
+                        opts.model = "";
+                        opts.result = null;
+                        opts.error = null;
+                        setBench(opts);
+                      }
+                    }, [h("option", { key: "ph", value: "" }, "选择供应商…")].concat(
+                      activeProviders.map(function (p) {
+                        return h("option", { key: p.provider, value: p.provider }, providerLabel(p));
+                      }))),
+                    h("select", {
+                      style: styles.narrowSelect,
+                      value: (bench && bench.model) || "",
+                      onChange: function (ev) {
+                        var opts = bench ? Object.assign({}, bench) : {};
+                        opts.model = ev.target.value;
+                        opts.result = null;
+                        opts.error = null;
+                        setBench(opts);
+                      }
+                    }, [h("option", { key: "ph", value: "" }, "选择模型…")].concat(
+                      activeProviders
+                        .filter(function (p) { return !bench || !bench.provider || p.provider === bench.provider; })
+                        .flatMap(function (p) {
+                          return p.models.map(function (mo) {
+                            return h("option", { key: p.provider + "/" + mo.id, value: mo.id },
+                              p.provider + (p.displayName ? "（" + p.displayName + "）" : "") + " / " + mo.id);
+                          });
+                        }))),
+                    h("button", {
+                      style: styles.button,
+                      disabled: !bench || !bench.provider || !bench.model || bench.running,
+                      onClick: runBenchmark
+                    }, bench && bench.running ? "压测中…" : "开始压测")),
+                  bench && bench.error
+                    ? h("div", { style: { color: "#cf222e", marginTop: "6px", fontSize: "12px" } }, bench.error)
+                    : null,
+                  bench && bench.result
+                    ? h("pre", { style: Object.assign({}, styles.box, { maxHeight: "260px", marginTop: "6px" }) },
+                        JSON.stringify(bench.result, null, 2))
+                    : null,
+                  h("div", { style: styles.hint }, "压测会真实消耗目标模型的 token 配额（安全系数 0.6 起步）。结果写入探测板的 benchmark 条目，可回看。"))),
+
+              h("details", { key: "fold-quota", style: styles.fold },
+                h("summary", { style: styles.foldSummary }, "用量窗口（5h / 1w）· 口径：全部调用（含透传）"),
+                h("div", { style: styles.foldBody },
+                  (function () {
+                    var q = status.quota || {};
+                    var qKeys = Object.keys(q);
+                    if (qKeys.length === 0) return h("div", { style: styles.meta }, "暂无用量记录");
+                    return h("table", { style: styles.table },
+                      h("thead", null,
+                        h("tr", null,
+                          h("th", { style: styles.th }, "供应商"),
+                          h("th", { style: styles.th }, "5h token"),
+                          h("th", { style: styles.th }, "5h 调用"),
+                          h("th", { style: styles.th }, "1w token"),
+                          h("th", { style: styles.th }, "1w 调用"))),
+                      h("tbody", null, qKeys.map(function (k) {
+                        var e = q[k] || {};
+                        var w5 = e.window5h || {}, w1 = e.window1w || {};
+                        return h("tr", { key: k },
+                          h("td", { style: styles.td }, h("span", { style: styles.mono }, k)),
+                          h("td", { style: styles.td }, fmtTokens(w5.tokens)),
+                          h("td", { style: styles.td }, fmtInt(w5.calls)),
+                          h("td", { style: styles.td }, fmtTokens(w1.tokens)),
+                          h("td", { style: styles.td }, fmtInt(w1.calls)));
+                      })));
+                  })(),
+                  h("div", { style: styles.hint }, "滚动窗口按 provider 粒度记账；口径与每日报告一致（含纯透传调用）。"))))
           );
+
           var recent = (status.metrics && status.metrics.recent) || [];
           children.push(
             h("div", { key: "recent", style: styles.section },
@@ -1059,6 +1426,97 @@ window.__ModuleLoader__.load({
                   }),
               h("div", { style: styles.hint }, "✓已入链 = 已在「切换规则」某条候选链中。加入候选链请到「切换规则」页签。"))
           );
+        }
+
+        // ============ 页签 5：每日报告（G1 消费端） ============
+        if (activeTab === "reports") {
+          var dayOptions = [];
+          for (var di = 1; di <= REPORT_DAYS_RANGE; di++) dayOptions.push(dayStr(di));
+          var selectedDay = (report && report.day) || dayStr(1);
+          children.push(
+            h("div", { key: "rp-toolbar", style: styles.row },
+              h("span", { style: styles.meta }, "选择日期："),
+              h("select", {
+                style: styles.narrowSelect,
+                value: selectedDay,
+                onChange: function (ev) { loadReport(ev.target.value); }
+              }, dayOptions.map(function (d) {
+                return h("option", { key: d, value: d }, d);
+              })),
+              h("button", {
+                style: styles.button,
+                disabled: generating,
+                onClick: generateReport
+              }, generating ? "生成中…" : "立即生成昨日报告"),
+              h("span", { style: styles.meta }, "每日凌晨 1 点自动生成前一日报告"))
+          );
+          if (reportError) {
+            children.push(
+              h("div", { key: "rp-err", style: styles.section },
+                h("div", { style: styles.meta }, reportError),
+                h("div", { style: styles.hint },
+                  "提示：每日报告默认关闭——需在插件配置中启用 reports.enabled=true（开启后透传与切换调用都会被记账）。" +
+                  "也可点上方「立即生成昨日报告」手动补生成。")));
+          }
+          if (report) {
+            var sm = report.summary || {};
+            var total = sm.calls || 0;
+            var successRate = total > 0 ? Math.round(((total - (sm.failed || 0) - (sm.aborted || 0)) / total) * 100) : 0;
+            var byPM = report.byProviderModel || [];
+            children.push(
+              h("div", { key: "rp-summary", style: styles.section },
+                h("div", { style: styles.sectionTitle }, "报告总览 · " + report.day + "（0:00–23:59" + (report.generatedAt ? "）" : "，实时聚合）")),
+                h("div", { style: styles.meta },
+                  "调用 " + fmtInt(total) + " · 成功 " + fmtInt(sm.succeeded) +
+                  " · 失败 " + fmtInt(sm.failed) + " · 取消 " + fmtInt(sm.aborted) +
+                  " · 成功率 " + successRate + "%" +
+                  " · 切换调用 " + fmtInt(sm.switchedCalls) + " 次（序列内切换 " + fmtInt(sm.switchCount) + " 次）" +
+                  " · 序列内调用 " + fmtInt(sm.inSequenceCalls))),
+              h("div", { key: "rp-table", style: styles.section },
+                h("div", { style: styles.sectionTitle }, "按供应商 × 模型"),
+                byPM.length === 0
+                  ? h("div", { style: styles.meta }, "该日无调用记录")
+                  : h("table", { style: styles.table },
+                      h("thead", null,
+                        h("tr", null,
+                          h("th", { style: styles.th }, "供应商/模型"),
+                          h("th", { style: styles.th }, "评级"),
+                          h("th", { style: styles.th }, "调用"),
+                          h("th", { style: styles.th }, "失败"),
+                          h("th", { style: styles.th }, "成功率"),
+                          h("th", { style: styles.th }, "TTFT 均值"),
+                          h("th", { style: styles.th }, "P95 TTFT"),
+                          h("th", { style: styles.th }, "token (入/出)"),
+                          h("th", { style: styles.th }, "切换调用"),
+                          h("th", { style: styles.th }, "主要错误"))),
+                      h("tbody", null, byPM.map(function (g) {
+                        return h("tr", { key: g.provider + "/" + g.model },
+                          h("td", { style: styles.td }, h("span", { style: styles.mono }, g.provider + " / " + g.model)),
+                          h("td", { style: styles.td }, gradeBadge(g.grade)),
+                          h("td", { style: styles.td }, fmtInt(g.calls)),
+                          h("td", { style: styles.td }, fmtInt(g.failed)),
+                          h("td", { style: styles.td }, (typeof g.failRate === "number" ? Math.round((1 - g.failRate) * 100) : "—") + "%"),
+                          h("td", { style: styles.td }, g.avgTtftMs !== null ? g.avgTtftMs + "ms" : "—"),
+                          h("td", { style: styles.td }, g.p95TtftMs !== null ? g.p95TtftMs + "ms" : "—"),
+                          h("td", { style: styles.td }, fmtTokens(g.inputTokens) + " / " + fmtTokens(g.outputTokens)),
+                          h("td", { style: styles.td }, fmtInt(g.switchedCalls)),
+                          h("td", { style: styles.td },
+                            (g.topErrors && g.topErrors.length > 0
+                              ? g.topErrors.map(function (e) { return e.code + "×" + e.count; }).join("、")
+                              : "—")));
+                      }))),
+              h("div", { key: "rp-errs", style: styles.section },
+                h("div", { style: styles.sectionTitle }, "错误码分布"),
+                (report.errors || []).length === 0
+                  ? h("div", { style: styles.meta }, "无错误")
+                  : report.errors.map(function (e) {
+                      return h("div", { key: e.code, style: styles.row },
+                        h("span", { style: styles.mono }, e.code),
+                        h("span", { style: styles.meta }, "×" + e.count));
+                    }))),
+              h("div", { style: styles.hint },
+                "评级规则：样本 <3 为 N/A；失败率 0% = S、<2% = A、<5% = B、<15% = C、其余 = D。失败 = 报错结尾；用户取消（aborted）不计失败。"));
+          }
         }
       }
 
