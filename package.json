@@ -1,7 +1,7 @@
 {
   "name": "@botton/dsh-model-router",
   "description": "DSH multi-provider model routing plugin: rule-based routing + pre-first-token failover (finish-chunk driven) + cooldown circuit-breaking + usage accounting + a status API. Zero third-party runtime dependencies.",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "private": false,
   "type": "module",
   "engines": {

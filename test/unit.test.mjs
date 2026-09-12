@@ -2029,4 +2029,151 @@ test('routes v0.8.0 B-2: loadtest 端点——GET 快照 / POST 202 / DELETE 200
   assert.equal(r.status, 503);
 });
 
+// ==================== v0.8.0 部署发现修复：providerMeta 持久化链路 ====================
+
+test('config v0.8.0 修复: normalizeState 接受并清洗 providerMeta（未提交时不重置）', async () => {
+  const { normalizeState } = await import('../lib/config.js');
+  // 合法：清洗 + 返回
+  const s1 = normalizeState({
+    propose: true,
+    rules: [],
+    providerMeta: { 'p-a': { tier: 'free', quotaGroup: 'g1' }, 'p-b': { quotaGroup: 'g2' } },
+  });
+  assert.deepEqual(s1.providerMeta, {
+    'p-a': { tier: 'free', quotaGroup: 'g1' },
+    'p-b': { quotaGroup: 'g2' },
+  });
+  // 未提交 → undefined（热生效/持久化跳过，保留 patch 值）
+  const s2 = normalizeState({ propose: true, rules: [] });
+  assert.equal(s2.providerMeta, undefined);
+  // 非法 tier → 抛错（handler 映射 400）
+  assert.throws(() => normalizeState({ rules: [], providerMeta: { 'p-a': { tier: 'gold' } } }), /tier/);
+  // providerMeta 非对象 → 抛错
+  assert.throws(() => normalizeState({ rules: [], providerMeta: 'x' }), /providerMeta 须为对象/);
+});
+
+test('store v0.8.0 修复: loadState 读回 providerMeta（round-trip + 旧文件向后兼容）', async () => {
+  const { loadState } = await import('../lib/store.js');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'mr-store-'));
+  try {
+    const p = join(dir, 'state.json');
+    writeFileSync(p, JSON.stringify({ version: 1, propose: true, rules: [], providerMeta: { 'p-a': { tier: 'free' } } }));
+    const state = loadState(p, { warn() {} });
+    assert.deepEqual(state.providerMeta, { 'p-a': { tier: 'free' } });
+    // 旧 store 无 providerMeta 键 → undefined（向后兼容，index 跳过覆盖）
+    writeFileSync(p, JSON.stringify({ version: 1, propose: false, rules: [] }));
+    const old = loadState(p, { warn() {} });
+    assert.equal(old.providerMeta, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('routes v0.8.0 修复: POST /state 带 providerMeta → 热生效 + 持久化 payload 含 providerMeta', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const config = {
+    statusPath: '/api/model-router/status',
+    rules: [],
+    fallbackPolicy: {},
+    probe: {},
+    timeZone: null,
+    storePath: '',
+    providerMeta: { 'p-patch': { tier: 'free' } },
+  };
+  let saved;
+  const routes = makeStatusRoutes({
+    config,
+    router: { snapshot() { return {}; }, recordExhausted() {}, applyRuntime() {} },
+    cooldown: { snapshot() { return {}; }, applyPolicy() {} },
+    metrics: { snapshot() { return {}; } },
+    quota: { snapshot() { return {}; } },
+    registry: null,
+    probe: null,
+    llm: {},
+    wrapperStats: {},
+    startedAt: Date.now(),
+    saveStateFn: (s) => {
+      saved = s;
+      return true;
+    },
+    log,
+  });
+  const route = routes.find((r) => r.path === '/api/model-router/state');
+  const req = {
+    method: 'POST',
+    url: '/api/model-router/state',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3081' },
+    [Symbol.asyncIterator]: async function* () {
+      yield Buffer.from(JSON.stringify({ propose: true, rules: [], providerMeta: { 'p-a': { tier: 'free', quotaGroup: 'g1' } } }));
+    },
+  };
+  let body;
+  const res = {
+    writeHead() {},
+    setHeader() {},
+    end(b) {
+      body = JSON.parse(b);
+    },
+  };
+  await route.handler(req, res);
+  assert.deepEqual(config.providerMeta, { 'p-a': { tier: 'free', quotaGroup: 'g1' } }, '热生效：config.providerMeta 被替换');
+  assert.deepEqual(saved.providerMeta, { 'p-a': { tier: 'free', quotaGroup: 'g1' } }, '持久化 payload 含 providerMeta');
+  // 未提交 providerMeta 的 state 不得重置 patch 值
+  const req2 = {
+    method: 'POST',
+    url: '/api/model-router/state',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3081' },
+    [Symbol.asyncIterator]: async function* () {
+      yield Buffer.from(JSON.stringify({ propose: false, rules: [] }));
+    },
+  };
+  await route.handler(req2, res);
+  assert.deepEqual(config.providerMeta, { 'p-a': { tier: 'free', quotaGroup: 'g1' } }, '未提交 → 保留既有 providerMeta');
+});
+
+test('routes v0.8.0 修复: status GET 响应 config.providerMeta 回显', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const config = {
+    statusPath: '/api/model-router/status',
+    rules: [],
+    fallbackPolicy: {},
+    probe: {},
+    timeZone: null,
+    storePath: '',
+    mode: 'balanced',
+    providerMeta: { 'test-p': { tier: 'free', quotaGroup: 'g1' } },
+  };
+  const routes = makeStatusRoutes({
+    config,
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { snapshot() { return { recent: [], byRoute: {}, sessions: [] }; } },
+    quota: { snapshot() { return {}; } },
+    registry: null,
+    probe: null,
+    llm: {},
+    wrapperStats: {},
+    startedAt: Date.now(),
+    saveStateFn: () => {},
+    log,
+  });
+  const statusRoute = routes.find((r) => r.path === '/api/model-router/status');
+  const req = { method: 'GET', socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:3081' } };
+  let body;
+  const res = {
+    writeHead() {},
+    setHeader() {},
+    end(b) {
+      body = JSON.parse(b);
+    },
+  };
+  await statusRoute.handler(req, res);
+  assert.deepEqual(body.config.providerMeta, { 'test-p': { tier: 'free', quotaGroup: 'g1' } }, 'status 须回显 providerMeta（此前漏列）');
+});
+
 
