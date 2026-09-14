@@ -989,45 +989,53 @@ window.__ModuleLoader__.load({
                     // 模型选择器驱动（选模型包即生效、选普通直连模型即直连）。故此处
                     // 不再保留「作用域下拉 / model / provider / session / 自定义组合」
                     // 编辑器，仅展示规则名 + 模式 + 候选链。
-                    // v0.9.5：策略折叠——默认显示 explicit，3 个场景预设直接覆盖当前 rule；高级选项折叠
+                    // v0.9.5：策略折叠 + 3 个场景预设直接覆盖当前 rule
+                    // v0.9.6 修复：此前 advancedForRule 只用于按钮文案、不 gate 任何渲染，
+                    // 是死控件（点了只换文字，select 一直可见）。现按 §5 原意做真折叠：
+                    // 默认只显示当前 strategy 名，展开才给 4 档下拉。
                      var strat = rule.strategy || "explicit";
                      var advancedForRule = showAdvancedSet && showAdvancedSet.has(ri);
+                     // v0.9.6（§14 #17）：预设按钮的 tooltip 补警示——避免用户误以为会自动保存
+                     var presetWarn = "\n\n⚠ 仅写入编辑区（不自动保存）；将覆盖 strategy + mode，route 不会被自动调整，保存前请预览。";
                      var presetTips = {
                        'long-stable': '长任务·稳定同模型：保留同模型跨供应商为备用，单次自动跑满首选。推荐长会话、长文档。',
                        'short-fast': '短问·快切免费：首选 free-tier，备用自动同供应商换模型 + 同模型跨供应商。',
                        'cold-start': '冷启动·全注册表：自动排除当前已选模型，把注册表全跑一遍（去重）。',
                      };
                     return h("div", { key: "r" + ri, style: styles.ruleCard },
-                      // 行 1：策略（默认显示 explicit 一行；场景预设按钮 + 高级切换）
+                      // 行 1：策略（默认显示当前值；场景预设按钮 + 高级切换）
                       h("div", { style: styles.row, key: "strat" + ri },
                         h("span", { style: styles.meta }, "候选链规则："),
-                        h("select", {
-                          style: styles.narrowSelect,
-                          value: strat,
-                          onChange: function (ev) { setStrategy(ri, ev.target.value); }
-                        }, Object.keys(STRATEGY_LABELS).map(function (k) {
-                          return h("option", { key: k, value: k }, STRATEGY_LABELS[k]);
-                        })),
-                        // 场景预设（覆盖当前 rule.strategy；不触碰其它规则）
+                        advancedForRule
+                          ? h("select", {
+                              style: styles.narrowSelect,
+                              value: strat,
+                              onChange: function (ev) { setStrategy(ri, ev.target.value); }
+                            }, Object.keys(STRATEGY_LABELS).map(function (k) {
+                              return h("option", { key: k, value: k }, STRATEGY_LABELS[k]);
+                            }))
+                          : h("span", { style: styles.mono }, STRATEGY_LABELS[strat] || strat),
+                        // 场景预设（覆盖当前 rule.strategy + mode；不触碰其它规则）
                         h("button", {
                           style: styles.button,
-                          title: presetTips['long-stable'],
+                          title: presetTips['long-stable'] + presetWarn,
                           onClick: function () { applyPreset(ri, 'long-stable'); }
                         }, "场景预设：长任务·稳定同模型"),
                         h("button", {
                           style: styles.button,
-                          title: presetTips['short-fast'],
+                          title: presetTips['short-fast'] + presetWarn,
                           onClick: function () { applyPreset(ri, 'short-fast'); }
                         }, "短问·快切免费"),
                         h("button", {
                           style: styles.button,
-                          title: presetTips['cold-start'],
+                          title: presetTips['cold-start'] + presetWarn,
                           onClick: function () { applyPreset(ri, 'cold-start'); }
                         }, "冷启动·全注册表"),
                         h("button", {
                           style: Object.assign({}, styles.button, { fontSize: "11px" }),
+                          title: "候选链规则决定「切换时往哪找下一个」（拓扑）：手动列出 / 同模型跨供应商 / 同供应商换模型 / 排除当前用其它。",
                           onClick: function () { toggleAdvanced(ri); }
-                        }, advancedForRule ? "收起高级" : "高级选项（mode / 时序参数）")),
+                        }, advancedForRule ? "收起高级" : "高级选项（候选链规则）")),
                       // 行 4：候选链
                       h("div", { key: "hops" + ri },
                         (rule.route || []).map(function (hop, hi) {
@@ -1100,6 +1108,9 @@ window.__ModuleLoader__.load({
           var modeDesc = (MODE_DEFS.filter(function (m) { return m.key === curMode; })[0] || MODE_DEFS[1]).desc;
           children.push(
             h("div", { key: "mode", style: styles.section },
+              // v0.9.6（§5 改动点 2）：补 mode 与「候选链规则」的关系说明，消除两者混淆
+              h("div", { style: styles.hint },
+                "模式 = 多快决定切换（时间预算）；候选链规则 = 切换时往哪找下一个（拓扑）。两者各自独立，可自由组合。"),
               h("div", { style: styles.row },
                 h("span", { style: styles.meta }, "优先模式："),
                 MODE_DEFS.map(function (m) {
