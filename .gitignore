@@ -10,3 +10,6 @@ npm-debug.log*
 *.bak
 *.bak.*
 .bak-*
+
+# 构建产物（可由源码重新打包；发布包存 NAS 归档）
+DSH-model-router-v*.zip
