@@ -1,0 +1,55 @@
+# @botton/dsh-model-router — Cordis 插入层
+# 由 `dsh plugin add` 注入 profile 的 cordis.patch.yml。
+#
+# v0.9.4：纯选择驱动（规则 = 命名「规则包」）。插件装上即可运行（不选包即透传直连，插件不介入）。
+# 启用路由只需在面板「切换规则」页创建命名规则包；或按下方模板在 patch 里预置规则。
+# 规则名同对话框模型选择器「插件模型包」的显示名；选中某个包 = 该包完整接管
+# （发送按链首选改派 + 报错/超时沿链切换 + 应用该包优先模式/自定义参数）；不选 = 直连。
+#
+# 注意：v0.9.1 已移除「生效范围」(match) 与「开场改派」(propose) 语义；v0.9.4 起
+# 旧配置残留的 match 字段默认**剥离并告警**（allowLegacyMatch=false，不再参与自动匹配），
+# 可安全删除。确需保留旧 v0.8 语义时，顶层设 `allowLegacyMatch: true`。
+# free-tier 规则另受跨请求节流约束（requestIntervalMs=2s，成功后推进账本）。
+
+- insert:
+    - id: model-router
+      name: '@botton/dsh-model-router'
+      config:
+        # 每日 API 报告：enabled=true 后 wrapper 透传/切换调用都会记账，每日 hour 自动生成
+        # 昨日 Markdown 报告至 ~/Documents/dsh-model-router-reports/<day>.report.md（访达即可达）。
+        # 面板「每日报告」页签可一键查看 md。关闭则零记账零调度。
+        reports:
+          enabled: true
+          hour: '01:00'
+        # ===== 推荐规则模板（去掉井号启用，并替换成你自己的 provider/model）=====
+        # rules:
+        #   - name: my-fast-pack          # 规则名即「插件模型包」显示名
+        #     mode: fast                  # 每规则优先模式：stable/balanced/fast/free-tier/custom
+        #     # custom 模式可选自定义参数（不填则沿全局默认）：
+        #     # custom: { firstTokenTimeoutMs: 30000, failoverBudgetMs: 90000, cooldownSec: 60, quotaCooldownSec: 600 }
+        #     route:
+        #       - { provider: <首选 provider>, model: <首选模型> }
+        #       - { provider: <备用 provider>,   model: <备用模型> }
+        # fallbackPolicy:
+        #   maxRetries: 4               # 默认 2；>=3 才能跨多个备用
+        #   failureThreshold: 3         # 默认 3
+        #   cooldownSec: 60             # 默认 60
+        #   quotaFailureThreshold: 1    # 默认 1（v0.6.1：QUOTA 1 次即 open）
+        #   quotaCooldownSec: 600       # 默认 600（10 分钟）
+        #   failoverSignals: [QUOTA, QUOTA_EXCEEDED, RATE_LIMIT, TRANSPORT, SERVER, UNKNOWN, INVALID_CREDENTIAL, MISSING_CREDENTIAL, EMPTY_RESPONSE, TIMEOUT]   # 默认 10 个错误码
+        #   allCooldownFallback: force-first   # 默认 force-first
+        #   switchAfterFirstChunk: false       # 默认 false（commit-on-first-chunk 硬约束）
+        # firstTokenTimeoutMs: 30000   # 默认 30000（30s 看门狗）
+        # failoverBudgetMs: 90000      # 默认 90000（v0.6.1 切换总预算）
+        # exhaustionWindowSec: 120     # 默认 120（链耗尽后单候选收敛窗）
+        # statusPath: /api/model-router/status   # 默认路径
+        # ===== 每日报告（v0.9.4 起可面板一键开启，无需手改此文件）=====
+        # 面板：设置 → 模型路由 → 「每日报告」页签 → 「一键启用每日报告」
+        # 或在此开启（reports.hour 为每日自动生成昨日报告的时刻）：
+        # reports:
+        #   enabled: true               # 默认 false（关闭）
+        #   hour: '01:00'               # 默认 01:00
+        # 启用后：透传与切换调用都会被日账本记账；每日 hour 自动生成昨日报告，
+        # 落盘 ~/.deepseek-harness/home/reports/<day>.report.json（/status 回显 reportDir）。
+        # 注意：daily 实例在 dsh 启动期装配，改 enabled 后需重启 dsh 生效
+        # （macOS：launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh）。

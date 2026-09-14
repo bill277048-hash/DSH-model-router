@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+
+# 调试产物
+*.log
+npm-debug.log*
+.DS_Store
+
+# 本地备份（v0.9.6：不进版本库）
+*.bak
+*.bak.*
+.bak-*
