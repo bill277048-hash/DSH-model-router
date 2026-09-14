@@ -19,7 +19,7 @@ import { createStreamWrapper } from '../lib/wrapper.js';
 import { ProbeBoard, computeTrmBound } from '../lib/probe.js';
 import { loadState, saveState } from '../lib/store.js';
 import { dayKeyOf, stabilityGrade, DailyLedger, DailyReporter, DailyScheduler, formatReportMarkdown } from '../lib/daily.js';
-import { WindowLedger, deriveWindowId } from '../lib/quota.js';
+import { WindowLedger, QuotaLedger, deriveWindowId } from '../lib/quota.js';
 import { validateModelTestTargets, validateManualInput, verdictOf, formatReportMarkdown as formatModelTestMd, manualWarnings } from '../lib/model-test.js';
 
 // ---------- mock 工具 ----------
@@ -2904,6 +2904,119 @@ test('quota §11: deriveWindowId——错误码 → 窗口判定映射', () => {
   assert.equal(deriveWindowId('429'), 'five-hour');
   assert.equal(deriveWindowId('WEEKLY_QUOTA'), 'weekly');
   assert.equal(deriveWindowId('MONTHLY_LIMIT'), 'weekly');
+});
+
+// ---------- v0.9.6：上限仓「声明对齐 + 运行态一次性播种」（根因 A / D） ----------
+//
+// 注意：上方 winMeta 刻意不含 used 字段 —— 这正是根因 A 未被既有测试捕获的原因。
+// 以下用例一律自建**带 used 声明**的 meta。
+
+const futureIso = () => new Date(Date.now() + W5H).toISOString();
+
+test('v0.9.6: markReset——meta 声明 used 时重置不被 _assure 抹掉（根因 A）', () => {
+  const wl = new WindowLedger({ log: quietLog });
+  // meta 声明「已用满」——修复前 _assure 每次调用都会把 used 恢复成 100
+  const exhausted = { quotaWindows: { fiveHour: { limit: 100, used: 100, resetAt: futureIso() } } };
+  assert.equal(wl.consumeAttempt('p-a', exhausted).allowed, false, '声明已用满 → 拦截');
+
+  const r = wl.markReset('p-a', 'five-hour', exhausted);
+  assert.equal(r.ok, true);
+  assert.equal(r.used, 0);
+
+  assert.equal(wl.consumeAttempt('p-a', exhausted).allowed, true, '重置后下一次必须放行');
+  assert.equal(wl.quotaSnapshot('p-a').fiveHour.used, 0, '快照 used 应为 0');
+});
+
+test('v0.9.6: markBurnedOut——meta 声明 used 时置满不被抹掉（根因 A）', () => {
+  const wl = new WindowLedger({ log: quietLog });
+  const zero = { quotaWindows: { fiveHour: { limit: 100, used: 0, resetAt: futureIso() } } };
+  assert.equal(wl.consumeAttempt('p-a', zero).allowed, true, '初始 used=0 → 放行');
+
+  const r = wl.markBurnedOut('p-a', 'five-hour', zero);
+  assert.equal(r.ok, true);
+  assert.equal(r.used, 100);
+
+  assert.equal(wl.consumeAttempt('p-a', zero).allowed, false, '上游 429 置满后下一次必须拦截');
+});
+
+test('v0.9.6: 声明消失——删除 fiveHour 后不再误拦且快照不残留（根因 A）', () => {
+  const wl = new WindowLedger({ log: quietLog });
+  const both = { quotaWindows: { fiveHour: { limit: 100, used: 100, resetAt: futureIso() }, weekly: { limit: 500 } } };
+  wl.syncWindows('p-a', both.quotaWindows);
+  assert.equal(wl.consumeAttempt('p-a', both).allowed, false, 'fiveHour 已满 → 拦截');
+
+  // 只删 fiveHour、保留 weekly
+  wl.syncWindows('p-a', { fiveHour: undefined, weekly: { limit: 500 } });
+  assert.equal(wl.quotaSnapshot('p-a').fiveHour, null, '删除声明后快照不应残留 fiveHour');
+
+  const weeklyOnly = { quotaWindows: { weekly: { limit: 500 } } };
+  assert.equal(wl.consumeAttempt('p-a', weeklyOnly).allowed, true, 'fiveHour 已删 → 不应再被它拦截');
+});
+
+test('v0.9.6: addUsage——窗口用量按 tokens 累加并触发拦截（根因 D）', () => {
+  const wl = new WindowLedger({ log: quietLog });
+  const meta = { quotaWindows: { fiveHour: { limit: 100, resetAt: futureIso() } } };
+  assert.equal(wl.consumeAttempt('p-a', meta).allowed, true, '初始 used=0 → 放行');
+
+  wl.addUsage('p-a', 60);
+  assert.equal(wl.quotaSnapshot('p-a').fiveHour.used, 60, '累加 60');
+  assert.equal(wl.consumeAttempt('p-a', meta).allowed, true, '60 < 100 仍放行');
+
+  wl.addUsage('p-a', 60);
+  assert.equal(wl.quotaSnapshot('p-a').fiveHour.used, 120, '累计 120');
+  assert.equal(wl.consumeAttempt('p-a', meta).allowed, false, '120 >= 100 → 主动拦截（不靠上游 429）');
+
+  // 未声明 limit 的窗口不参与累加（未声明 = 不限制）
+  const noLimit = { quotaWindows: { fiveHour: { resetAt: futureIso() } } };
+  const wl2 = new WindowLedger({ log: quietLog });
+  wl2.addUsage('p-b', 999);
+  assert.equal(wl2.consumeAttempt('p-b', noLimit).allowed, true, '未声明 limit 不应拦截');
+  assert.equal(wl2.quotaSnapshot('p-b').fiveHour.limit, null, '未声明 limit → 快照 limit 为 null');
+  assert.equal(wl2.quotaSnapshot('p-b').fiveHour.used, null, '未声明 limit → used 不参与统计（null）');
+
+  // 非正数 / 未触碰 provider 不炸
+  wl.addUsage('p-a', 0);
+  wl.addUsage('p-never', 100);
+  assert.equal(wl.quotaSnapshot('p-a').fiveHour.used, 120, 'addUsage(0) 不应改变用量');
+});
+
+test('v0.9.6: QuotaLedger.record → addUsage——声明 limit 后按 tokens 累加（根因 D 端到端）', () => {
+  const ql = new QuotaLedger({ log: quietLog });
+  const meta = { quotaWindows: { fiveHour: { limit: 100, resetAt: futureIso() } } };
+  ql.consumeAttempt('p-a', meta);
+
+  ql.record('p-a', { inputTokens: 40, outputTokens: 20 });
+  assert.equal(ql.quotaSnapshot('p-a').fiveHour.used, 60, 'record 应累加 60 tokens');
+  assert.equal(ql.consumeAttempt('p-a', meta).allowed, true, '60 < 100 仍放行');
+
+  ql.record('p-a', { inputTokens: 50 });
+  assert.equal(ql.consumeAttempt('p-a', meta).allowed, false, '累计 110 >= 100 → 主动拦截');
+});
+
+test('v0.9.6: loaded 一次性——应用后按槽位消费，槽位重建不复活旧 used（根因 A）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mr-quota-v096-'));
+  const qState = join(dir, 'quota-state.json');
+  // 造出「上次运行已耗尽」的持久态
+  const seed = new WindowLedger({ storePath: qState, log: quietLog });
+  seed.syncWindows('p-a', { fiveHour: { limit: 100, used: 100, resetAt: futureIso() } });
+  assert.equal(seed.saveToDisk(), true);
+
+  const wl = new WindowLedger({ storePath: qState, log: quietLog });
+  assert.equal(wl.loadFromDisk(), true);
+  const meta = { quotaWindows: { fiveHour: { limit: 100, resetAt: futureIso() } } };
+
+  assert.equal(wl.consumeAttempt('p-a', meta).allowed, false, '首次触碰应恢复 loaded 的 used=100');
+  assert.equal(wl.loaded.has('p-a'), false, 'loaded 应在首次物化后被按槽位删除');
+
+  wl.markReset('p-a', 'five-hour', meta);
+  assert.equal(wl.consumeAttempt('p-a', meta).allowed, true, '重置后应放行（loaded 已消费，不再抹回）');
+
+  wl.syncWindows('p-a', { fiveHour: undefined });
+  assert.equal(wl.quotaSnapshot('p-a'), null, '删声明后快照应为 null');
+  wl.syncWindows('p-a', { fiveHour: { limit: 100, resetAt: futureIso() } });
+  assert.equal(wl.consumeAttempt('p-a', meta).allowed, true, '槽位重建不应复活旧 used');
+
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // ---------- v0.9.5 §9：model-test 纯函数 ----------
