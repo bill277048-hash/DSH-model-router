@@ -1331,6 +1331,86 @@ test('registry v0.8.0 C-2: metaSnapshot——未声明元数据不列出，tier 
   assert.equal(snap['p-c'], undefined);
 });
 
+test('v0.9.6: exclude 裁剪注册表自动展开候选池（same-model / same-provider / exclude-current 三策略）', async () => {
+  const llm = makeRegistryLlm([
+    { provider: 'p-a', models: [{ id: 'm-1' }, { id: 'm-2' }] },
+    { provider: 'p-b', models: [{ id: 'm-1' }, { id: 'm-2' }] },
+  ]);
+
+  // 对照组（未 exclude）：p-b 应在池中 —— 证明「过滤」确实起作用，而非测试本身写空
+  const cfgNoEx = normalizeConfig({ allowLegacyMatch: true, providerMeta: {}, rules: [] });
+  const regNoEx = new Registry(llm, log, 300, cfgNoEx);
+  regNoEx.refreshProviders();
+  await regNoEx.refreshModels();
+  assert.equal(
+    regNoEx.registeredPairs().some((p) => p.provider === 'p-b'),
+    true,
+    '对照组：未 exclude 时 p-b 应在候选池中',
+  );
+
+  // 实验组（p-b exclude）
+  const cfg = normalizeConfig({
+    allowLegacyMatch: true,
+    providerMeta: { 'p-b': { exclude: true } },
+    rules: [],
+  });
+  const reg = new Registry(llm, log, 300, cfg);
+  reg.refreshProviders();
+  await reg.refreshModels();
+
+  assert.equal(reg.isExcluded('p-b'), true, 'isExcluded(p-b) 应为 true');
+  assert.equal(reg.isExcluded('p-a'), false, 'isExcluded(p-a) 应为 false');
+  const pairs = reg.registeredPairs();
+  assert.equal(pairs.some((p) => p.provider === 'p-b'), false, 'exclude 的 provider 不应进候选池');
+  assert.equal(pairs.some((p) => p.provider === 'p-a'), true, '其它 provider 不受影响');
+
+  // 三策略均不得展开出 p-b
+  for (const strategy of ['same-model', 'same-provider', 'exclude-current']) {
+    const router = new Router(cfg, reg, null);
+    const chain = router.candidatesForRule(
+      { name: 'r1', strategy, route: [] },
+      { provider: 'p-a', model: 'm-1' },
+    );
+    assert.equal(
+      chain.some((h) => h.provider === 'p-b'),
+      false,
+      `${strategy} 不应展开出被 exclude 的 p-b`,
+    );
+  }
+});
+
+test('v0.9.6: exclude 不否决显式 route（只裁剪自动展开，不改用户手工列表）', async () => {
+  const cfg = normalizeConfig({
+    allowLegacyMatch: true,
+    providerMeta: { 'p-b': { exclude: true } },
+    rules: [{
+      name: 'r1',
+      strategy: 'explicit',
+      route: [
+        { provider: 'p-a', model: 'm-1' },
+        { provider: 'p-b', model: 'm-2' }, // 被 exclude，但用户显式写了 → 必须保留
+      ],
+    }],
+  });
+  const llm = makeRegistryLlm([
+    { provider: 'p-a', models: [] },
+    { provider: 'p-b', models: [] },
+  ]);
+  const reg = new Registry(llm, log, 300, cfg);
+  reg.refreshProviders();
+  await reg.refreshModels();
+
+  const chain = new Router(cfg, reg, null).candidatesForRule(
+    cfg.rules[0],
+    { provider: 'p-x', model: 'm-x' },
+  );
+  assert.deepEqual(
+    chain.map((h) => `${h.provider}/${h.model}`),
+    ['p-a/m-1', 'p-b/m-2'],
+    'explicit 手工列表不受 exclude 影响',
+  );
+});
+
 test('router v0.8.0 C-1: quotaGroup 去重——同组保留链序第一个（explicit 内联 4 项 → 3 项）', () => {
   const rule = {
     match: { default: true },
@@ -1443,6 +1523,30 @@ test('config v0.9.5: providerMeta quotaWindows / customWindows 静态校验', ()
     providerMeta: { 'p-a': { customWindows: [{ id: '中文 id', windowMs: 60000 }] } },
     rules: [],
   }), /id 须为/);
+});
+
+test('v0.9.6: providerMeta.exclude 须为布尔且被透传（此前被白名单静默丢弃）', () => {
+  // 合法：true 透传（v0.9.6 前此处会被白名单丢弃 → providerMeta['p-a'] 无 exclude 键）
+  const cfg = normalizeConfig({
+    providerMeta: { 'p-a': { exclude: true }, 'p-b': { quotaGroup: 'g1' } },
+    rules: [{ route: [{ provider: 'p-a', model: 'm-1' }] }],
+  });
+  assert.equal(cfg.providerMeta['p-a'].exclude, true, 'exclude:true 须透传');
+  assert.equal(cfg.providerMeta['p-b'].exclude, undefined, '未声明 exclude 不补键');
+  assert.equal(cfg.providerMeta['p-b'].quotaGroup, 'g1', '同段其它字段不受影响');
+
+  // 显式 false 亦保留（语义明确：声明了但未排除）
+  const cfg2 = normalizeConfig({ providerMeta: { 'p-a': { exclude: false } }, rules: [] });
+  assert.equal(cfg2.providerMeta['p-a'].exclude, false);
+
+  // 非法：非布尔 → fail-fast（字符串 / 数字 / null）
+  for (const bad of ['yes', 1, null]) {
+    assert.throws(
+      () => normalizeConfig({ providerMeta: { 'p-a': { exclude: bad } }, rules: [] }),
+      /exclude 须为布尔值/,
+      `exclude=${JSON.stringify(bad)} 应抛错`,
+    );
+  }
 });
 
 test('config v0.8.0 A-3: auto-tune——未显式声明回填 max(2*count, 5)', () => {
@@ -2841,6 +2945,32 @@ test('model-test §9: verdictOf——probe 失败但 rpm 可用 → backup（§1
   });
   assert.equal(v.recommend, 'backup');
   assert.ok(v.reasons.some((r) => r.includes('rpm 仍可用')));
+});
+
+test('v0.9.6: verdictOf——probe 失败但 rpm 可用且加成不足时，仍应 backup（forced 锁定）', () => {
+  // v0.9.6 前的漏检带：score=0.35，而 rpm 加成需要 lastOkRpm>=0.2 或 first429Rpm===null。
+  // 当 lastOkRpm=0.1 且观测到限流（first429Rpm 非 null）时加成全无 → 0.35 < backup 阈值 0.4
+  // → 误判 exclude，与 §14 #4「避免直接 exclude」的意图相悖。
+  const v = verdictOf({
+    probe: { ok: false, errorCode: 'E_TIMEOUT' },
+    rpm: { lastOkRpm: 0.1, first429Rpm: 0.05 },
+  });
+  assert.equal(v.recommend, 'backup', 'probe 失败但 rpm 仍可用，不应直接 exclude');
+  assert.equal(v.score, 0.35, 'forced 只锁 recommend，不改 score');
+  assert.ok(v.reasons.some((r) => r.includes('rpm 仍可用')));
+
+  // 反例：rpm 完全不可用（lastOkRpm=0）→ forced 不应被触发，仍判 exclude
+  const v2 = verdictOf({ probe: { ok: false }, rpm: { lastOkRpm: 0, first429Rpm: 0.05 } });
+  assert.equal(v2.recommend, 'exclude', 'rpm 不可用时仍应 exclude');
+
+  // 反例：probe 存活时 forced 不应干扰（不得把 primary 压成 backup）
+  const v3 = verdictOf({
+    probe: { ok: true, ttftMs: 800 },
+    rpm: { lastOkRpm: 1.2, first429Rpm: null },
+    context: { maxAccepted: 16384 },
+    quotaGroup: { members: [{ ok: true }, { ok: true }] },
+  });
+  assert.equal(v3.recommend, 'primary', 'probe 存活路径不受 forced 影响');
 });
 
 test('model-test §9: verdictOf——probe 失败且 rpm 不可用 → exclude', () => {

@@ -1682,9 +1682,14 @@ window.__ModuleLoader__.load({
 
       function bridge(tr, action) {
         setBusy(true);
-        fetch(API.state).then(function (r) { return r.json(); }).then(function (s) {
+        // v0.9.6 修复：原为 fetch(API.state)（GET），但 /state 端点只接受 POST
+        // → 恒返 405 {"error":"method not allowed: use POST"}，三个按钮全部失效。
+        // 改读 GET /status 的 config 块（routes.js 已回显 rules/providerMeta/timeZone/mode）。
+        // 刻意不用 props.status：本组件保存后只调自己的 load()（仅刷新 model-test 数据），
+        // 不刷新父组件 status → 连点「加入首选」+「加入备用」时第二次会读到旧 rules 造成丢更新。
+        fetch(API.status).then(function (r) { return r.json(); }).then(function (s) {
           if (!s || !s.ok) { setErr("读取状态失败"); setBusy(false); return; }
-          var st = s.state || {};
+          var st = s.config || {};
           var rules = (Array.isArray(st.rules) ? st.rules : []).map(function (r) {
             var c = Object.assign({}, r); delete c.match; delete c.scope; return c;
           });
