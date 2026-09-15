@@ -3189,24 +3189,90 @@ test('v0.9.8: probe——透传 errorMessage（error finish + catch 分支）', 
   assert.equal(thrown.errorMessage, 'connection reset by peer');
 });
 
-test('v0.9.8: model-test——_singleWithRetry 仅 probe 用（rpm 不退避）', () => {
+test('v0.9.8: model-test——_singleWithRetry 只对 RETRYABLE 重试（含真实退避）', async () => {
+  const makeRunner = (responses) => {
+    const calls = [];
+    const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+    runner._single = async () => {
+      const r = responses[Math.min(calls.length, responses.length - 1)];
+      calls.push(r.errorCode ?? 'ok');
+      return r;
+    };
+    return { runner, calls };
+  };
+  const T = { provider: 'p', model: 'm' };
+
+  // 1) 首次成功 → 不重试
+  const okRun = makeRunner([{ ok: true, ttftMs: 1 }]);
+  const okRes = await okRun.runner._singleWithRetry(T, 'hi');
+  assert.equal(okRun.calls.length, 1, '成功不重试');
+  assert.equal(okRes.retries, 0, 'retries=0');
+
+  // 2) 确定性错误（INVALID_CREDENTIAL 不在 RETRYABLE）→ 不重试
+  const fatalRun = makeRunner([{ ok: false, errorCode: 'INVALID_CREDENTIAL' }]);
+  const fatalRes = await fatalRun.runner._singleWithRetry(T, 'hi');
+  assert.equal(fatalRun.calls.length, 1, '确定性错误不重试（避免拖长跑批）');
+  assert.equal(fatalRes.retries, 0, 'retries=0');
+
+  // 3) 可重试错误（TRANSPORT 在 RETRYABLE）→ 最多 3 次尝试；本用例真实等待 800+1600ms 退避
+  const retryRun = makeRunner([{ ok: false, errorCode: 'TRANSPORT', errorMessage: 'reset' }]);
+  const t0 = Date.now();
+  const retryRes = await retryRun.runner._singleWithRetry(T, 'hi');
+  const waited = Date.now() - t0;
+  assert.equal(retryRun.calls.length, 3, 'TRANSPORT 重试到 3 次上限');
+  assert.equal(retryRes.retries, 2, 'retries=2');
+  assert.equal(retryRes.errorCode, 'TRANSPORT', '最终返回最后一次结果');
+  assert.ok(waited >= 2400, `实际退避 ≥ 800+1600ms（实测 ${waited}ms）`);
+
+  // 4) 中途成功即停（第 2 次成功 → 共 2 次调用）
+  const midRun = makeRunner([{ ok: false, errorCode: 'TIMEOUT' }, { ok: true, ttftMs: 9 }]);
+  const midRes = await midRun.runner._singleWithRetry(T, 'hi');
+  assert.equal(midRun.calls.length, 2, '中途成功即停');
+  assert.equal(midRes.ok, true);
+  assert.equal(midRes.retries, 1, 'retries=1');
+
+  // 5) 结构性检查：rpm/context/quota-group 三相不调用 _singleWithRetry
   const src = readFileSync(new URL('../lib/model-test.js', import.meta.url), 'utf8');
-  // _phaseProbe 调 _singleWithRetry；_phaseRpm/_phaseContext 仍调 _single
-  assert.ok(src.includes('_singleWithRetry'), '_singleWithRetry 已实现');
-  // 简单结构性断言：_phaseProbe 体里出现 _singleWithRetry，_phaseRpm 体里出现 _single 而非 _singleWithRetry
-  const probePhase = src.match(/async _phaseProbe[\s\S]*?^  }/m);
-  const rpmPhase = src.match(/async _phaseRpm[\s\S]*?^  }/m);
-  assert.ok(probePhase && /_singleWithRetry/.test(probePhase[0]), '_phaseProbe 用 _singleWithRetry');
-  assert.ok(rpmPhase && !/_singleWithRetry/.test(rpmPhase[0]), '_phaseRpm 不用 _singleWithRetry');
+  for (const fn of ['_phaseRpm', '_phaseContext', '_phaseQuotaGroup']) {
+    const body = src.match(new RegExp(`async ${fn}[\\s\\S]*?\\n  }`));
+    assert.ok(body && !/_singleWithRetry/.test(body[0]), `${fn} 不使用退避（保持测量密度）`);
+  }
+  const probeBody = src.match(/async _phaseProbe[\s\S]*?\n  }/);
+  assert.ok(probeBody && /_singleWithRetry/.test(probeBody[0]), '_phaseProbe 使用退避');
 });
 
-test('v0.9.8: model-test——短路表（INVALID_CREDENTIAL 后跳过 rpm/context/quota-group）', () => {
-  const src = readFileSync(new URL('../lib/model-test.js', import.meta.url), 'utf8');
-  // shouldShortCircuit 集中短路表
-  const expectInTable = ['INVALID_CREDENTIAL', 'AUTH', 'QUOTA', 'INVALID_REQUEST', 'CONTEXT_LENGTH'];
-  for (const code of expectInTable) {
-    assert.ok(src.includes(code), `短路表含 ${code}`);
-  }
+test('v0.9.8: model-test——短路表行为（凭据类全停 / RATE_LIMIT 不短路 / 正常全跑）', async () => {
+  // 行为断言（替代早先的 src.includes 源码断言——那种写法把注释里的字符串也算通过，
+  // 无法证明短路逻辑正确）。
+  const runWithProbe = async (probeResult) => {
+    const called = [];
+    const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+    runner._phaseProbe = async () => { called.push('probe'); return probeResult; };
+    runner._phaseRpm = async () => { called.push('rpm'); return { lastOkRpm: 0.1, first429Rpm: null, firstError: null, ladder: [] }; };
+    runner._phaseContext = async () => { called.push('context'); return { sizes: [], maxAccepted: 0, firstError: null }; };
+    runner._phaseQuotaGroup = async () => { called.push('quota-group'); return { quotaGroup: null, members: [], firstError: null }; };
+    const report = await runner.run([{ provider: 'p', model: 'm', tier: 'free' }], { recoveryMs: 0 });
+    return { called, target: report.targets[0] };
+  };
+
+  // 1) 凭据类 → 后续三相全跳
+  const cred = await runWithProbe({ ok: false, errorCode: 'INVALID_CREDENTIAL', errorMessage: 'bad key', retries: 0 });
+  assert.deepEqual(cred.called, ['probe'], 'INVALID_CREDENTIAL 后不再调用后续相');
+  assert.deepEqual(cred.target.skipped, ['rpm', 'context', 'quota-group'], '三相记入 skipped');
+  assert.ok(cred.target.skipReasons.rpm.includes('INVALID_CREDENTIAL'), 'skipReasons 带错误码');
+  assert.equal(cred.target.phaseErrors.probe.errorCode, 'INVALID_CREDENTIAL', 'phaseErrors 落错误码');
+
+  // 2) RATE_LIMIT 不在短路表 → 继续跑满
+  const rate = await runWithProbe({ ok: false, errorCode: 'RATE_LIMIT', errorMessage: '429 too many', retries: 0 });
+  assert.deepEqual(rate.called, ['probe', 'rpm', 'context', 'quota-group'], 'RATE_LIMIT 不短路');
+  assert.deepEqual(rate.target.skipped, [], 'skipped 为空');
+  assert.equal(rate.target.phaseErrors.probe.errorCode, 'RATE_LIMIT', '仍记录错误码');
+
+  // 3) probe 正常 → 全跑、无 skipped
+  const ok = await runWithProbe({ ok: true, errorCode: null, errorMessage: null, retries: 0 });
+  assert.deepEqual(ok.called, ['probe', 'rpm', 'context', 'quota-group'], '正常全跑');
+  assert.deepEqual(ok.target.skipped, [], 'skipped 为空');
+  assert.deepEqual(ok.target.phaseErrors, {}, 'phaseErrors 为空');
 });
 
 test('v0.9.8: model-test——报告落 errorMessage（formatReportMarkdown / _finalize）', () => {
@@ -3227,13 +3293,31 @@ test('v0.9.8: model-test——报告落 errorMessage（formatReportMarkdown / _f
   assert.ok(md.includes('model not found upstream'), 'MD 含真实错误消息');
 });
 
-test('v0.9.8: model-test——outcome.elapsedMs 用 target 起点', () => {
-  // 通过源码断言：tStart = Date.now() 在 _runTarget 顶部；outcome.elapsedMs = targetElapsed()
-  const src = readFileSync(new URL('../lib/model-test.js', import.meta.url), 'utf8');
-  assert.ok(/const tStart = Date\.now\(\)/.test(src), '_runTarget 顶部取 tStart');
-  assert.ok(/targetElapsed\(\)/.test(src), 'outcome.elapsedMs 走 targetElapsed()');
-  // 跑批总量另存 report.elapsedMs
-  assert.ok(/report\.elapsedMs = this\.finishedAt - this\.startedAt/.test(src), 'report.elapsedMs 用 finishedAt-startedAt');
+test('v0.9.8: model-test——outcome.elapsedMs 按 target 起点（不累加跑批起点）', async () => {
+  // 行为断言：给每个 target 的 probe 相注入固定延迟，验证「每个 target 只算自己的耗时」。
+  // 旧实现（_elapsed() 用 this.startedAt）会让第 2 个 target 的 elapsedMs ≈ 两个 target 之和；
+  // 新实现应各自 ≈ 单次延迟。这是能区分新旧行为的断言。
+  const DELAY = 40;
+  const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+  runner._phaseProbe = async () => {
+    await new Promise((r) => setTimeout(r, DELAY));
+    return { ok: true, ttftMs: 5, errorCode: null, errorMessage: null, retries: 0 };
+  };
+  runner._phaseRpm = async () => ({ lastOkRpm: 0.1, first429Rpm: null, firstError: null, ladder: [] });
+  runner._phaseContext = async () => ({ sizes: [], maxAccepted: 0, firstError: null });
+  runner._phaseQuotaGroup = async () => ({ quotaGroup: null, members: [], firstError: null });
+
+  const report = await runner.run(
+    [{ provider: 'p1', model: 'm1', tier: 'free' }, { provider: 'p2', model: 'm2', tier: 'free' }],
+    { recoveryMs: 0 },
+  );
+  const [t1, t2] = report.targets;
+  assert.ok(t1.elapsedMs >= DELAY - 5, `第 1 个 target 至少含注入延迟（实际 ${t1.elapsedMs}）`);
+  assert.ok(t1.elapsedMs < DELAY * 2, `第 1 个 target 未虚高（实际 ${t1.elapsedMs}）`);
+  assert.ok(t2.elapsedMs < DELAY * 2,
+    `第 2 个 target 不累加第 1 个的耗时（实际 ${t2.elapsedMs}，旧实现会 ≥ ${DELAY * 2}）`);
+  assert.ok(Number.isFinite(report.elapsedMs) && report.elapsedMs >= t1.elapsedMs + t2.elapsedMs - 10,
+    `整批 elapsedMs 覆盖两个 target（整批 ${report.elapsedMs} vs 之和 ${t1.elapsedMs + t2.elapsedMs}）`);
 });
 
 test('v0.9.8: client——diag / phase payload / Markdown fallback 契约存在', () => {

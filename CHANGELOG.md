@@ -10,22 +10,28 @@
 
 - 根因：当前面板只展示最近尝试（每条独立行），用户看不到「这是同一会话的第几次尝试」与
   「上一跳是哪家供应商」。`metrics.sample` 记录的 `rec.seq` 是**全会话单调递增**，不是同一请求内的 hop 序号。
-- 修复：增加 5 个结构化字段到 `metrics.sample` 的 rec：
-  `seqId`（同一请求会话级唯一 ID）、`prevProvider`/`prevModel`（上一跳）、`segment`（当前时段标签，
-  详见 #6 但字段先落，值为 `null`）、`switched`（本次是否由前一跳切来）。
-- `runAttempt` 函数体顶部把 `prevProvider/prevModel/segment` 抽成 `metaFields`，7 处采样统一补字段——
-  不动各采样点的写法，最小改动。
+- 修复：增加 4 个结构化字段到 `metrics.sample` 的 rec：
+  `seqId`（同一请求会话级唯一 ID）、`prevProvider`/`prevModel`（上一跳）、`switched`（本次是否由前一跳切来）。
+  **不加 `segment`**——那是 v0.9.9 峰谷定价的内容，本版不提前耦合（单测显式断言 `'segment' in r === false`）。
+- `runAttempt` 函数体顶部把 `prevProvider/prevModel` 抽成 `metaFields`，7 处采样统一补字段——
+  不动各采样点的写法，最小改动。`switched` 由「真实前序 vs 当前 provider/model」比较得出，
+  不用 `attemptIndex` 猜。
 - seq 循环入口算 `prevHop = i>0 ? seq[i-1] : seed`；首次尝试时 `prevProvider/prevModel = seed`，
-  与方案既定一致。
-- **透传路径（无候选直连）也采 1 条 metrics**：`seqId` 由 caller 注入、`prevProvider = seed.provider`、
+  因此首跳 `switched=false`，与方案既定一致。
+- **透传路径（无候选直连）也采 1 条 metrics**：`seqId` 由 caller 注入、`prevProvider/prevModel = null`、
   `switched: false`。避免「无切换明细行」实际是「未采集」造成假阴性。
+- 透传路径的采样点共 3 处，互斥（gate 命中 `return`、catch 分支 `throw`、正常结束 fall through），
+  不会重复计数——已有单测断言「透传正常路径只采样一次」「透传 throw 只采样一次」。
+- 入口 `allBlocked`（全部窗口限额耗尽）另采 1 条 QUOTA 失败记录，避免「链耗尽计数有值但明细为空」；
+  该分支不重复调用 `quota.record`，无重复配额记账。
 - 前端切换日志页签：**新增「诊断」页签**（原 `切换日志` / `切换规则` / `可切换模型` 之后）。
   工具折叠区（探测 / 压测 / 用量窗口）从 `logs` 迁到 `diag`；统计 / Cooldown / 最近尝试仍留 `logs`。
   最少改法：logs 外层 `if (activeTab === "logs")` 加 `|| "diag"`；工具区单包 `if (activeTab === "diag")`。
-  **不搬 225 行**，避免括号与作用域风险。
-- 最近尝试新增「按 seqId 分组」折叠表格：每组首行展示 seqId 起讫、`switched=true` 计数、
-  最终结果 (`committed`/`failed`/`aborted`)，点击展开看每跳的 provider/model/outcome/errorCode。
-  分组保留**「无切换的 passthrough 行」**——它显示「同一请求只此一跳」更直观。
+  **不搬那 229 行** hyperscript，避免括号与作用域风险。
+- 最近尝试改为「按 seqId 分组」**平铺表格**（非折叠交互）：每组一个跨列组头行
+  （`请求链 · N 次尝试 · M 次切换 · @会话 · seqId`），其下逐跳列出
+  时间/从/到/结果/错误码/耗时/会话。分组保留**「无切换的 passthrough 行」**——
+  它显示「同一请求只此一跳」更直观。无 `seqId` 的旧记录用 `seq-<seq>` 兜底分组。
 
 ### 改进 · 报告结构化（ReportView，删 md 解析器，§5-2）
 
@@ -33,57 +39,84 @@
   才能把表格解析回 DOM。**实测 `/api/model-router/reports?day=2026-09-14` 返回顶层就有
   `{ok, report: {summary, byProviderModel[], errors[]}, generated, markdown}`**——`markdown`
   就是从 `report` 结构生成的（`lib/daily.js:541 formatReportMarkdown`）。
-- 修复：直接渲染 `body.report` 结构化数据，`markdown` 字段降级为「收起」的原 md 全文作为附录。
-  新增 `ReportView` 组件（约 60 行）：summary 关键指标 + byProviderModel 表格（8 列：模型/标签/
-  probe/RPM/Context/verdict 徽章+分/失败原因/操作）+ errors Top 表 + 原始 JSON 受控 details。
-  删除 `client.js` 里旧的 ~110 行 md 解析器。
-- `loadReport` 加 `setReport(body.report)`，向后兼容——旧响应没有 `report` 时降级到 markdown-only 渲染。
+- 修复：直接渲染 `body.report` 结构化数据，`markdown` 字段降级为「收起」的原 md 全文作为附录
+  （`<details>` + `<summary>查看 Markdown 原文（审计）</summary>`）。
+  **日报页签**渲染为：summary 关键指标行 + 「按供应商 × 模型」表（**10 列**：供应商/模型、评级、
+  调用、失败、成功率、TTFT 均值、P95 TTFT、token(入/出)、切换调用、主要错误）+
+  「错误码分布」区块 + 原始 JSON 受控 details。
+  **删除** `client.js` 里旧的 md→HTML 解析器（约 110 行）。
+- 旧响应（只有 `markdown`、没有 `report`）走 fallback：渲染一个默认展开的
+  `<details>Markdown 原文（旧响应兼容）</details>`，不让结构化数据缺失时页面变空。
+- `loadReport` 加 `setReport(body.report)`；`sShowMd/showMd/setShowMd` 三处 state 随之删除
+  （改为 `<details>` 原生折叠，不再需要独立 open state）。
 - `summary.switchCount` 确认算法：`sum(r.attempts > 1 ? r.attempts - 1 : 0)`，
   与 `switchedCalls`（含切换的调用数）语义不同，前端展示「切换 N 次」取 `switchCount`。
+
+> 注：**模型测试**页签的结果表是另一张表（7 列：模型、probe、RPM、Context、verdict/分、
+> 失败原因、操作），与日报表无关，见下方「失败原因可读」段。
 
 ### 改进 · 失败原因可读（probe 透传 failure.message，§5-1）
 
 - 根因：`/api/model-router/probe` 与 `model-test` 报告只显示 `errorCode`（如 `RATE_LIMIT`），
   用户看不到上游**具体错误消息**（如 `429: Rate limit reached for request`），无法判断是限流、
   模型不存在还是临时网络抖动。
-- 修复：`lib/probe.js:74/78/88` 三处失败分支都补 `errorMessage`：
+- 修复：`lib/probe.js` 三处失败分支都补 `errorMessage`（行 77 / 81 / 93）：
   - `error finish`：`chunk.reason?.failure?.message`
   - `aborted` 分支：固定字符串 `'aborted'`
   - `catch` 分支：`error?.message`
-- `ProbeBoard._record(:168)` 补 `lastErrorMessage`，同源 `formatReportMarkdown` 的「失败原因」段也补上。
-- `model-test` `_phaseProbe` 透传并截断 200 字符（避免报告膨胀）；`_phaseRpm` 补 `firstError: {code,message}`；
-  `_phaseContext` 每项补 `errorMessage`。
-- 前端 `ModelTestPanel` 最近一次报告「probe」列改 `title = probe.errorMessage`，鼠标悬停即可看完整原因。
-- 报告表新增「失败原因」列：按 `errorCode` 聚合展示。
+- `ProbeBoard._record` 补 `lastErrorMessage`（`h.lastErrorMessage = rec.ok ? undefined : rec.errorMessage`）。
+- `model-test` `_phaseProbe` 透传并截断 200 字符（避免报告膨胀）；`_phaseRpm` 补
+  `firstError: {errorCode, errorMessage}`（ladder 每档也带 `firstError`）；
+  `_phaseContext` 每项补 `errorMessage`；`_phaseQuotaGroup` 每个 member 补 `errorMessage`。
+- **模型测试结果表**（7 列：模型、probe、RPM、Context、verdict/分、失败原因、操作）：
+  - probe 单元格加 `title = probe.errorMessage`，鼠标悬停看完整原因；
+  - 新增「失败原因」列：取**首个** `phaseErrors` 条目渲染为 `errorCode：errorMessage`
+    （超过 48 字符截断为 `…`，完整内容在 `title`）；无错误时显示「跳过：<phase 列表>」；否则「—」。
+    注意是「取首个」而非「按 errorCode 聚合」——聚合展示在报告 md 的「错误详情」段。
+- `formatReportMarkdown` 新增「错误详情」段：逐 target 列出 `provider/model · phase · code：message`。
 
 ### 改进 · 模型测试退避重试（probe 仅，§5-3）
 
 - 根因：probe 是单点探测——一次失败（如 502 / 网络抖动）就标记整 target 失败。
   真实环境瞬时错误占比 ~10%，加重试更准确。
 - 修复：新增 `_singleWithRetry`（仅 `_phaseProbe` 用）：
-  - `RETRYABLE` 错误码集合：`RATE_LIMIT`/`QUOTA`/`QUOTA_EXCEEDED`/`TIMEOUT`/`STREAM_ERROR`/`502`/`503`/`504`。
-  - `maxRetries: 2`、`baseMs: 800`、`factor: 2`、`jitterMs: 250`——指数退避 + 抖动。
-  - 非 RETRYABLE（如 `INVALID_CREDENTIAL`）不重试，直接返回。
-- `_phaseRpm` / `_phaseContext` / `_phaseQuotaGroup` **不**重试——保持测量密度（重试会污染 RPM 测量）。
+  - `RETRYABLE` 错误码集合（**瞬时/传输类**）：`TRANSPORT`、`SERVER`、`UNKNOWN`、`TIMEOUT`、
+    `ABORTED`、`STREAM_ERROR`、`EMPTY_RESPONSE`。
+    **刻意不含** `AUTH`/`INVALID_CREDENTIAL`/`QUOTA`/`INVALID_REQUEST`/`RATE_LIMIT` 等确定性错误——
+    重试无意义，只会拖长跑批。
+  - 最多 3 次尝试（1 首次 + 2 重试）：`800ms` / `1600ms` 指数退避 + 最多 `250ms` 抖动（避免重试雷击）。
+  - 首次即成功、或首次即确定性失败（非 RETRYABLE）时 `retries = 0`，直接返回。
+- `_phaseRpm` / `_phaseContext` / `_phaseQuotaGroup` **不**重试——`_phaseRpm` 靠 `sleep(1000/qps)`
+  控制请求密度来测限流边界，插入退避会让 `lastOkRpm` / `first429Rpm` 失真。
 
 ### 改进 · 模型测试短路表（避免白耗 ~90s，§5-3）
 
 - 根因：probe 拿到 `INVALID_CREDENTIAL` / `QUOTA` 等硬错后，后续 rpm/context/quotaGroup 三相
   仍各跑 ~30s（合计 ~90s）——纯白耗，结果仍不会变。
-- 修复：新增 `shouldShortCircuit(errorCode, currentPhase)`：
-  - `INVALID_CREDENTIAL`/`MISSING_CREDENTIAL`/`AUTH`/`INVALID_REQUEST` → **全停**（所有后续相都跳）。
-  - `QUOTA`/`QUOTA_EXCEEDED` → 跳 rpm（rpm 即测限流，越界已识）。
-  - `CONTEXT_LENGTH`/`CONTEXT_WINDOW`/`TOO_MANY_TOKENS` → 跳 context（不跳 rpm，rpm 已跑）。
-  - `RATE_LIMIT` **不短路**——本相即测限流边界，越界即正常 verdict。
-- 短路结果写入 `outcome.skipped`（list）+ `outcome.shortCircuitReason`（string）。
-- `skipped` 与「未选择 phase」语义独立：未选择 → 不记入 `skipped`；短路跳过的 phase 才记入。
+- 修复：新增 `shouldShortCircuit(phase, error)` + 集中式 `SHORT_CIRCUIT_CODES` 表。
+  语义：**某一相拿到该相集合内的错误码 → 记 `stopReason`，此后所有已选相都跳**（写入
+  `outcome.skipped` + `outcome.skipReasons[phase]`）。
+  - `probe` 相：`AUTH` / `INVALID_CREDENTIAL` / `MISSING_CREDENTIAL` / `INVALID_REQUEST` /
+    `QUOTA` / `QUOTA_EXCEEDED` → **全停**（probe 是首相，故等效后续三相全跳）。
+  - `rpm` 相：`QUOTA` / `QUOTA_EXCEEDED` → 跳 `context` + `quota-group`。
+  - `context` 相：`CONTEXT_LENGTH` / `CONTEXT_WINDOW` / `TOO_MANY_TOKENS` → 跳 `quota-group`
+    （不跳 rpm，rpm 已跑完）。
+  - `RATE_LIMIT` **不在任何集合**——本相即测限流边界，越界即正常 verdict，不短路。
+- **只依据真实 `errorCode`**，不从 `lastOkRpm === null` / `maxAccepted === 0` 这类派生字段反推
+  （那些值可能来自 transport / auth / abort，反推会误判）。错误码来源见 `firstActualError(phase, result)`。
+- `skipped`（短路跳过）与 `notSelected`（未勾选该相）是**两个独立字段**，不混淆；
+  abort 时剩余相也记入 `skipped` 且 `skipReasons[phase] = 'ABORTED'`。
+  `skipReasons[phase]` 存短路原因字符串（如 `skipped: INVALID_CREDENTIAL after probe`）。
 
 ### 改进 · 测试耗时按 target 计算（修既有 bug，§5-3）
 
 - 根因：`ModelTestRunner._elapsed()` 始终用 `this.startedAt`（跑批起点）累加。
   多 target 跑批时 `target.elapsedMs` 累成 ~7M ms（不可读）；单 target 也因目标间 sleep 算入而虚高。
-- 修复：`_runTarget` 入口起 `tStart = Date.now()`；每相结束算 `targetElapsed()`；最终 `outcome.elapsedMs = targetElapsed()`。
-- 跑批总量存 `report.elapsedMs`，二者并存（既有 142/142 单测断言 `outcome.elapsedMs` 存在但不验语义，向后兼容）。
+- 修复：`_runTarget` 入口起 `tStart = Date.now()`；最终 `outcome.elapsedMs = targetElapsed()`
+  （即 `Date.now() - tStart`，只看本 target）。**删除了已无调用点的 `_elapsed()` 方法**。
+- 跑批总量另存 `report.elapsedMs = this.finishedAt - this.startedAt`，与 `target.elapsedMs` 并存
+  （前者看整批，后者看单 target）。
+- 前端「最近一次报告」摘要行与历史列表各新增「耗时」列，消费这两个字段；旧报告 JSON 无此字段时显示 `—`。
 
 ### 改进 · 测试 phase 可独立选择（§5-4）
 
@@ -94,35 +127,65 @@
   - 非法：`validatePhases` 抛错（含 `[]`、含未知项、缺类型），返回 400。
 - 常量 `MODEL_TEST_PHASES = ['probe', 'rpm', 'context', 'quota-group']` 与 `validatePhases`
   导出供面板消费。
-- 前端 ModelTestPanel 新建表单新增 4 个 checkbox，默认全选；提交时按选择发送 `phases`。
-  提交按钮显示「启动测试（N 个目标 / M 个 phase）」，如 `2 目标 / 仅 rpm`。
-- 凭据黄条：扫描 `last.targets` 统计 `probe.errorCode ∈ AUTH/INVALID_CREDENTIAL/MISSING_CREDENTIAL` 的数量，
-  顶部黄条「N 个目标为凭据类失败（上游 401/403）—— 不是限流，请检查该 provider 的 API key」。
+- 前端 ModelTestPanel 新建表单新增 4 个 checkbox（API 健康探测 / 压力·RPM 阶梯 / 上下文窗口 /
+  配额组联动），默认全选，按固定序 `probe→rpm→context→quota-group` 展示。
+  - 提交时**全选则不发 `phases`**（走服务端缺省，与旧客户端行为完全一致）；
+    **子集才发 `phases`**（`if (phases.length < 4) requestBody.phases = phases.slice()`）。
+  - 未选任何相时提交按钮 disabled，并提示「请至少选择一项测试内容」。
+  - 按钮文案「启动测试（N 个目标）」；旁边 meta 显示「已选 M 相」。
+- 凭据黄条：扫描 `last.targets` 统计 `probe.errorCode ∈ AUTH/INVALID_CREDENTIAL/MISSING_CREDENTIAL`
+  的目标数，顶部黄条「N 个目标为凭据类失败（上游 401/403），不是限流；请检查对应 provider 的 API key。」
+  **局限**：只看 `probe` 相——若用户只勾 rpm/context（未跑 probe），黄条不会触发。
 
 ### 清理
 
-- 删除 `routes.js:747-748` 的 `prompt` / `timeoutMs` 死代码——routes 透传但 runner 不用，
-  前端也不发（避免误导未来维护者）。
-- `run` 入口 `opts.recoveryMs` 透传保留；新增 `opts.phases` 透传。
-- `formatReportMarkdown` 新增「失败原因」「耗时」「phases 执行情况」段落；前端 `ReportView`
-  结构化视图保留 `topErrors`（≥3 错误聚合展示）。
+- 删除 `POST /model-test` 里的 `prompt` / `timeoutMs` 死代码——routes 层透传但 `ModelTestRunner.run`
+  从未读取，前端也不发（避免误导未来维护者）。
+- 删除 `client.js` 的 `sShowMd` / `showMd` / `setShowMd` 三处 state——Markdown 改为 `<details>` 原生折叠。
+- 删除 `ModelTestRunner._elapsed()`——改用 target 局部 `tStart`/`targetElapsed()`（见「测试耗时」段）。
+- `run` 入口 `opts.recoveryMs` 透传保留；新增 `opts.phases` 透传（`validatePhases` 兜底校验）。
+- `formatReportMarkdown` 新增两行摘要（「测试内容」「批次耗时」）与一个「错误详情」段
+  （逐 target 列 `provider/model · phase · code：message`）。
+- `listRunJson` 摘要补 `elapsedMs` / `phases` / `notSelected` / `skipped` / `phaseErrors`，
+  以及各相 `firstError`，供面板历史报告渲染。
 
 ### 单测
 
 - 新增 12 条用例（基线 142 → v0.9.8 共 154，全过）：
-  - `validatePhases` 边界：缺省、合法子集、`[]`、未知项、非数组。
-  - `shouldShortCircuit` 全停/跳 rpm/跳 context/不短路四类。
-  - `metrics.sample` rec 5 字段透传与默认值（passthrough 路径）。
-  - `model-test` 报告落 `errorMessage` 字段。
-  - `probe.js` 透传 errorMessage（error finish + catch 分支）。
-  - 客户端源码契约断言：report 结构化数据形态、`phases` 入参路径、shortCircuitReason 字段。
-- 12/12 全过，零回归。
+  - `validatePhases` 边界：缺省/`null` 全跑、去重 + 固定序、`[]`/未知项/非数组抛错。
+  - `MODEL_TEST_PHASES` 常量完整。
+  - **短路表行为**：凭据类 → 后续三相全跳（断言 `called` 调用序、`skipped`、`skipReasons`、
+    `phaseErrors`）；`RATE_LIMIT` → 不短路跑满四相；probe 正常 → 全跑且 `skipped`/`phaseErrors` 为空。
+  - **`_singleWithRetry` 行为**：首次成功、确定性错误（`INVALID_CREDENTIAL`）均不重试；
+    `TRANSPORT` 重试到 3 次上限（真实等待 800+1600ms 退避）；中途成功即停；
+    另加结构性检查「rpm/context/quota-group 三相不调用退避」。
+  - **独立 phases 行为**：缺省全跑；`phases:['rpm']` 只跑 rpm 且 `probe === null`；
+    `notSelected` 与 `skipped` 两字段分离。
+  - **`elapsedMs` 行为**：给两个 target 各注入 40ms 延迟，断言第 2 个 target 的 `elapsedMs`
+    不累加第 1 个的耗时（旧实现会 ≥ 2×延迟，直接变红）；整批 `report.elapsedMs` 覆盖两者。
+  - `metrics.sample` 用**真实 `Metrics` 类**断言 4 字段落库与默认值，并显式断言
+    `'segment' in r === false`（不提前耦合 v0.9.9）。
+  - `probe.js` 透传 `errorMessage`（error finish + catch 分支，用真实 `singleRaw` + mock stream）。
+  - `formatReportMarkdown` 的「错误详情」段含错误码与真实消息。
+  - 客户端源码契约：诊断页签存在、`phases` 子集提交路径、Markdown fallback 存在、不引入 `innerHTML`。
+- **测试有效性已用突变验证**（证明测试不是装饰）：分别注入
+  ①「短路表移除 `INVALID_CREDENTIAL`」②「恢复旧 `_elapsed` 累加」③「`RETRYABLE` 置空」
+  三个缺陷，对应用例均变红（153/154）；还原后 154/154。
+- 测试总时长约 9.5s（退避用例真实等待 2.4s + 1.6s 退避，属预期）。
 
 ### 风险与未做的
 
 - **未做** v0.9.9 段链路（峰谷定价）与统一测试档案新页签——按既定两版节奏延后。
-- **未做** 段链路 `pickPrimary` 的显式断言——已加单测但既有 142 项无相关断言；段启用后该路径
-  行为会变，已在 §十四-8 留底。
+  段链路启用后会改变 `pickPrimary` 的返回值（段 `route[0]` 而非原规则 `route[0]`），
+  该不变式目前无断言覆盖；**v0.9.9 实施时必须补**「`pickPrimary` 一致」用例。
+- **已知窄口径**：凭据失败黄条只读 `tr.probe.errorCode`。若用户只勾 rpm/context/quota-group
+  而未跑 probe，黄条不会触发（即便 rpm 相实际撞到 AUTH）。属有意的最小实现，后续可扩展到
+  `phaseErrors` 全相扫描。
+- **已知口径差异**（既有代码，非本版引入）：透传路径 `catch` 分支中，
+  新增的 `metrics.sample` 记真实 `error?.code ?? 'STREAM_ERROR'`，
+  而同分支既有的 `daily.recordCall` 记硬编码 `'EMPTY_RESPONSE'`。
+  两套账本对同一失败事件错误码不同。本版**未改动** `daily` 那行（避免超出范围），
+  仅在「切换明细」与「每日报告」并列时可见差异。
 - **既有 bug**（与本版无关）：`/api/model-router/model-test/list` 实测返回 `runs: []`——
   实机报告目录 `/Users/apple/Documents/dsh-model-router-reports/` 下 4 份 model-test.json 真实存在，
   需排查注册表 `reportDir` 同步问题。**本版不动**，单独修。
