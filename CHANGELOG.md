@@ -186,9 +186,10 @@
   而同分支既有的 `daily.recordCall` 记硬编码 `'EMPTY_RESPONSE'`。
   两套账本对同一失败事件错误码不同。本版**未改动** `daily` 那行（避免超出范围），
   仅在「切换明细」与「每日报告」并列时可见差异。
-- **既有 bug**（与本版无关）：`/api/model-router/model-test/list` 实测返回 `runs: []`——
-  实机报告目录 `/Users/apple/Documents/dsh-model-router-reports/` 下 4 份 model-test.json 真实存在，
-  需排查注册表 `reportDir` 同步问题。**本版不动**，单独修。
+- **更正（复核时自己引入的误报）**：早先本段记有一条「既有 bug：`/model-test/list` 返回
+  `runs: []`」——**该结论是错的**。实际响应键名是 **`list`**（不是 `runs`），用正确键名读回
+  **7 条报告**，且首条已含 v0.9.8 新增的 `elapsedMs: 1157595` / `phases: [...]` 字段。
+  误报根因：未先确认响应结构就按假定键名断言。**列表功能正常，无需修复。**
 
 ## 0.9.7 (2026-09-15)
 
