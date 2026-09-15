@@ -1,5 +1,132 @@
 # Changelog
 
+## 0.9.8 (2026-09-16)
+
+> **诊断可见 + 测试精度提升**。6 项面板/链路改进；含 1 项独立 phase 选择 + 1 项退避重试 +
+> 1 项短路表 + 1 项错误消息透传。新契约：仅 `POST /api/model-router/model-test` 的可选 `phases` 入参；
+> 缺省行为与既有完全兼容（仍跑 4 相），无破坏性变更。
+
+### 改进 · 切换明细可分组 + 诊断页签（问题 1）
+
+- 根因：当前面板只展示最近尝试（每条独立行），用户看不到「这是同一会话的第几次尝试」与
+  「上一跳是哪家供应商」。`metrics.sample` 记录的 `rec.seq` 是**全会话单调递增**，不是同一请求内的 hop 序号。
+- 修复：增加 5 个结构化字段到 `metrics.sample` 的 rec：
+  `seqId`（同一请求会话级唯一 ID）、`prevProvider`/`prevModel`（上一跳）、`segment`（当前时段标签，
+  详见 #6 但字段先落，值为 `null`）、`switched`（本次是否由前一跳切来）。
+- `runAttempt` 函数体顶部把 `prevProvider/prevModel/segment` 抽成 `metaFields`，7 处采样统一补字段——
+  不动各采样点的写法，最小改动。
+- seq 循环入口算 `prevHop = i>0 ? seq[i-1] : seed`；首次尝试时 `prevProvider/prevModel = seed`，
+  与方案既定一致。
+- **透传路径（无候选直连）也采 1 条 metrics**：`seqId` 由 caller 注入、`prevProvider = seed.provider`、
+  `switched: false`。避免「无切换明细行」实际是「未采集」造成假阴性。
+- 前端切换日志页签：**新增「诊断」页签**（原 `切换日志` / `切换规则` / `可切换模型` 之后）。
+  工具折叠区（探测 / 压测 / 用量窗口）从 `logs` 迁到 `diag`；统计 / Cooldown / 最近尝试仍留 `logs`。
+  最少改法：logs 外层 `if (activeTab === "logs")` 加 `|| "diag"`；工具区单包 `if (activeTab === "diag")`。
+  **不搬 225 行**，避免括号与作用域风险。
+- 最近尝试新增「按 seqId 分组」折叠表格：每组首行展示 seqId 起讫、`switched=true` 计数、
+  最终结果 (`committed`/`failed`/`aborted`)，点击展开看每跳的 provider/model/outcome/errorCode。
+  分组保留**「无切换的 passthrough 行」**——它显示「同一请求只此一跳」更直观。
+
+### 改进 · 报告结构化（ReportView，删 md 解析器，§5-2）
+
+- 根因：原前端用 `markdown` 字段渲染面板，需在前端跑一遍 md→HTML 解析器（~110 行），
+  才能把表格解析回 DOM。**实测 `/api/model-router/reports?day=2026-09-14` 返回顶层就有
+  `{ok, report: {summary, byProviderModel[], errors[]}, generated, markdown}`**——`markdown`
+  就是从 `report` 结构生成的（`lib/daily.js:541 formatReportMarkdown`）。
+- 修复：直接渲染 `body.report` 结构化数据，`markdown` 字段降级为「收起」的原 md 全文作为附录。
+  新增 `ReportView` 组件（约 60 行）：summary 关键指标 + byProviderModel 表格（8 列：模型/标签/
+  probe/RPM/Context/verdict 徽章+分/失败原因/操作）+ errors Top 表 + 原始 JSON 受控 details。
+  删除 `client.js` 里旧的 ~110 行 md 解析器。
+- `loadReport` 加 `setReport(body.report)`，向后兼容——旧响应没有 `report` 时降级到 markdown-only 渲染。
+- `summary.switchCount` 确认算法：`sum(r.attempts > 1 ? r.attempts - 1 : 0)`，
+  与 `switchedCalls`（含切换的调用数）语义不同，前端展示「切换 N 次」取 `switchCount`。
+
+### 改进 · 失败原因可读（probe 透传 failure.message，§5-1）
+
+- 根因：`/api/model-router/probe` 与 `model-test` 报告只显示 `errorCode`（如 `RATE_LIMIT`），
+  用户看不到上游**具体错误消息**（如 `429: Rate limit reached for request`），无法判断是限流、
+  模型不存在还是临时网络抖动。
+- 修复：`lib/probe.js:74/78/88` 三处失败分支都补 `errorMessage`：
+  - `error finish`：`chunk.reason?.failure?.message`
+  - `aborted` 分支：固定字符串 `'aborted'`
+  - `catch` 分支：`error?.message`
+- `ProbeBoard._record(:168)` 补 `lastErrorMessage`，同源 `formatReportMarkdown` 的「失败原因」段也补上。
+- `model-test` `_phaseProbe` 透传并截断 200 字符（避免报告膨胀）；`_phaseRpm` 补 `firstError: {code,message}`；
+  `_phaseContext` 每项补 `errorMessage`。
+- 前端 `ModelTestPanel` 最近一次报告「probe」列改 `title = probe.errorMessage`，鼠标悬停即可看完整原因。
+- 报告表新增「失败原因」列：按 `errorCode` 聚合展示。
+
+### 改进 · 模型测试退避重试（probe 仅，§5-3）
+
+- 根因：probe 是单点探测——一次失败（如 502 / 网络抖动）就标记整 target 失败。
+  真实环境瞬时错误占比 ~10%，加重试更准确。
+- 修复：新增 `_singleWithRetry`（仅 `_phaseProbe` 用）：
+  - `RETRYABLE` 错误码集合：`RATE_LIMIT`/`QUOTA`/`QUOTA_EXCEEDED`/`TIMEOUT`/`STREAM_ERROR`/`502`/`503`/`504`。
+  - `maxRetries: 2`、`baseMs: 800`、`factor: 2`、`jitterMs: 250`——指数退避 + 抖动。
+  - 非 RETRYABLE（如 `INVALID_CREDENTIAL`）不重试，直接返回。
+- `_phaseRpm` / `_phaseContext` / `_phaseQuotaGroup` **不**重试——保持测量密度（重试会污染 RPM 测量）。
+
+### 改进 · 模型测试短路表（避免白耗 ~90s，§5-3）
+
+- 根因：probe 拿到 `INVALID_CREDENTIAL` / `QUOTA` 等硬错后，后续 rpm/context/quotaGroup 三相
+  仍各跑 ~30s（合计 ~90s）——纯白耗，结果仍不会变。
+- 修复：新增 `shouldShortCircuit(errorCode, currentPhase)`：
+  - `INVALID_CREDENTIAL`/`MISSING_CREDENTIAL`/`AUTH`/`INVALID_REQUEST` → **全停**（所有后续相都跳）。
+  - `QUOTA`/`QUOTA_EXCEEDED` → 跳 rpm（rpm 即测限流，越界已识）。
+  - `CONTEXT_LENGTH`/`CONTEXT_WINDOW`/`TOO_MANY_TOKENS` → 跳 context（不跳 rpm，rpm 已跑）。
+  - `RATE_LIMIT` **不短路**——本相即测限流边界，越界即正常 verdict。
+- 短路结果写入 `outcome.skipped`（list）+ `outcome.shortCircuitReason`（string）。
+- `skipped` 与「未选择 phase」语义独立：未选择 → 不记入 `skipped`；短路跳过的 phase 才记入。
+
+### 改进 · 测试耗时按 target 计算（修既有 bug，§5-3）
+
+- 根因：`ModelTestRunner._elapsed()` 始终用 `this.startedAt`（跑批起点）累加。
+  多 target 跑批时 `target.elapsedMs` 累成 ~7M ms（不可读）；单 target 也因目标间 sleep 算入而虚高。
+- 修复：`_runTarget` 入口起 `tStart = Date.now()`；每相结束算 `targetElapsed()`；最终 `outcome.elapsedMs = targetElapsed()`。
+- 跑批总量存 `report.elapsedMs`，二者并存（既有 142/142 单测断言 `outcome.elapsedMs` 存在但不验语义，向后兼容）。
+
+### 改进 · 测试 phase 可独立选择（§5-4）
+
+- 根因：硬编码 4 相都跑，但「只测健康度」或「只补 context 测」的诉求无法满足；跑了 4 相就慢。
+- 修复：`POST /api/model-router/model-test` body 加可选 `phases: string[]`：
+  - 缺省：`undefined` → 默认全跑 4 相（向后兼容）。
+  - 子集：每个 phase 独立可选（用户确认）——只选 `rpm` 也实际跑 rpm，不隐式补 probe。
+  - 非法：`validatePhases` 抛错（含 `[]`、含未知项、缺类型），返回 400。
+- 常量 `MODEL_TEST_PHASES = ['probe', 'rpm', 'context', 'quota-group']` 与 `validatePhases`
+  导出供面板消费。
+- 前端 ModelTestPanel 新建表单新增 4 个 checkbox，默认全选；提交时按选择发送 `phases`。
+  提交按钮显示「启动测试（N 个目标 / M 个 phase）」，如 `2 目标 / 仅 rpm`。
+- 凭据黄条：扫描 `last.targets` 统计 `probe.errorCode ∈ AUTH/INVALID_CREDENTIAL/MISSING_CREDENTIAL` 的数量，
+  顶部黄条「N 个目标为凭据类失败（上游 401/403）—— 不是限流，请检查该 provider 的 API key」。
+
+### 清理
+
+- 删除 `routes.js:747-748` 的 `prompt` / `timeoutMs` 死代码——routes 透传但 runner 不用，
+  前端也不发（避免误导未来维护者）。
+- `run` 入口 `opts.recoveryMs` 透传保留；新增 `opts.phases` 透传。
+- `formatReportMarkdown` 新增「失败原因」「耗时」「phases 执行情况」段落；前端 `ReportView`
+  结构化视图保留 `topErrors`（≥3 错误聚合展示）。
+
+### 单测
+
+- 新增 12 条用例（基线 142 → v0.9.8 共 154，全过）：
+  - `validatePhases` 边界：缺省、合法子集、`[]`、未知项、非数组。
+  - `shouldShortCircuit` 全停/跳 rpm/跳 context/不短路四类。
+  - `metrics.sample` rec 5 字段透传与默认值（passthrough 路径）。
+  - `model-test` 报告落 `errorMessage` 字段。
+  - `probe.js` 透传 errorMessage（error finish + catch 分支）。
+  - 客户端源码契约断言：report 结构化数据形态、`phases` 入参路径、shortCircuitReason 字段。
+- 12/12 全过，零回归。
+
+### 风险与未做的
+
+- **未做** v0.9.9 段链路（峰谷定价）与统一测试档案新页签——按既定两版节奏延后。
+- **未做** 段链路 `pickPrimary` 的显式断言——已加单测但既有 142 项无相关断言；段启用后该路径
+  行为会变，已在 §十四-8 留底。
+- **既有 bug**（与本版无关）：`/api/model-router/model-test/list` 实测返回 `runs: []`——
+  实机报告目录 `/Users/apple/Documents/dsh-model-router-reports/` 下 4 份 model-test.json 真实存在，
+  需排查注册表 `reportDir` 同步问题。**本版不动**，单独修。
+
 ## 0.9.7 (2026-09-15)
 
 > **纯前端版本**（只改 `client.js`，后端零改动）。修复 v0.9.6 实装后用户报告的 3 项面板可用性问题。

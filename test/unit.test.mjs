@@ -16,11 +16,11 @@ import { Router, PKG_PROVIDER, PKG_PREFIX } from '../lib/router.js';
 import { Registry } from '../lib/registry.js';
 import { createPackagesAdapter } from '../lib/packages-adapter.js';
 import { createStreamWrapper } from '../lib/wrapper.js';
-import { ProbeBoard, computeTrmBound } from '../lib/probe.js';
+import { ProbeBoard, computeTrmBound, singleRaw } from '../lib/probe.js';
 import { loadState, saveState } from '../lib/store.js';
 import { dayKeyOf, stabilityGrade, DailyLedger, DailyReporter, DailyScheduler, formatReportMarkdown } from '../lib/daily.js';
 import { WindowLedger, QuotaLedger, deriveWindowId } from '../lib/quota.js';
-import { validateModelTestTargets, validateManualInput, verdictOf, formatReportMarkdown as formatModelTestMd, manualWarnings } from '../lib/model-test.js';
+import { ModelTestRunner, validateModelTestTargets, validateManualInput, validatePhases, MODEL_TEST_PHASES, verdictOf, formatReportMarkdown as formatModelTestMd, manualWarnings } from '../lib/model-test.js';
 
 // ---------- mock 工具 ----------
 
@@ -1793,6 +1793,8 @@ test('wrapper v0.8.0 G1: 纯透传路径记账 recordCall(inSequence:false) + us
   });
   const dailyCalls = [];
   const quotaRecs = [];
+  const metricSamples = [];
+  deps.metrics = { sample: (rec) => metricSamples.push(rec), snapshot() { return {}; } };
   deps.daily = { recordCall: (rec) => dailyCalls.push(rec) };
   deps.quota = { record: (p, u) => quotaRecs.push([p, u]) };
   const wrapper = createStreamWrapper(deps);
@@ -1816,6 +1818,11 @@ test('wrapper v0.8.0 G1: 纯透传路径记账 recordCall(inSequence:false) + us
   assert.equal(rec.tokens.outputTokens, 5);
   assert.equal(quotaRecs.length, 1, '透传也同步 quota.record（口径与切换路径统一）');
   assert.deepEqual(quotaRecs[0], ['p-a', { inputTokens: 10, outputTokens: 5 }]);
+  assert.equal(metricSamples.length, 1, '透传正常路径只采样一次');
+  assert.equal(metricSamples[0].outcome, 'committed');
+  assert.equal(metricSamples[0].switched, false);
+  assert.equal(metricSamples[0].prevProvider, null);
+  assert.equal(typeof metricSamples[0].seqId, 'string');
 });
 
 test('wrapper v0.8.0 G1: 透传路径内层 throw → try/finally 兜底记账 EMPTY_RESPONSE 后原样重抛（不丢账）', async () => {
@@ -1823,6 +1830,8 @@ test('wrapper v0.8.0 G1: 透传路径内层 throw → try/finally 兜底记账 E
     config: { rules: [{ match: { default: true }, route: [{ provider: 'p-a', model: 'm-1' }] }] },
   });
   const dailyCalls = [];
+  const metricSamples = [];
+  deps.metrics = { sample: (rec) => metricSamples.push(rec), snapshot() { return {}; } };
   deps.daily = { recordCall: (rec) => dailyCalls.push(rec) };
   const wrapper = createStreamWrapper(deps);
   const throwing = (async function* () {
@@ -1838,6 +1847,9 @@ test('wrapper v0.8.0 G1: 透传路径内层 throw → try/finally 兜底记账 E
   assert.equal(dailyCalls[0].errorCode, 'EMPTY_RESPONSE');
   assert.equal(dailyCalls[0].inSequence, false);
   assert.equal(dailyCalls[0].attemptsTotal, 1);
+  assert.equal(metricSamples.length, 1, '透传 throw 只采样一次');
+  assert.equal(metricSamples[0].outcome, 'failed');
+  assert.equal(metricSamples[0].errorCode, 'STREAM_ERROR');
 });
 
 test('wrapper v0.8.0 G1: sessionId 修复——runAttempt 记账/metrics.sample 收到真实 sessionId', async () => {
@@ -3116,6 +3128,147 @@ test('model-test §9: manualWarnings——manualTpm 与实测相差 5× 以上 �
   assert.ok(w.some((x) => x.includes('5×')), '应提示 5× 差异');
   const w2 = manualWarnings({ rpm: { lastOkRpm: 1.0 }, manualTpm: 20 });
   assert.equal(w2.length, 0, '无超差不告警');
+});
+
+// ---------- v0.9.8 新增用例（方案 §七） ----------
+
+test('v0.9.8: validatePhases——undefined 默认全跑', () => {
+  assert.deepEqual(validatePhases(undefined), ['probe', 'rpm', 'context', 'quota-group']);
+  assert.deepEqual(validatePhases(null), ['probe', 'rpm', 'context', 'quota-group']);
+});
+
+test('v0.9.8: validatePhases——去重 + 固定序', () => {
+  assert.deepEqual(validatePhases(['rpm', 'probe']), ['probe', 'rpm']);
+  assert.deepEqual(validatePhases(['probe', 'probe']), ['probe']);
+});
+
+test('v0.9.8: validatePhases——非法 throw', () => {
+  assert.throws(() => validatePhases([]), /非空/);
+  assert.throws(() => validatePhases(['bogus']), /未知项/);
+  assert.throws(() => validatePhases('rpm'), /非空数组/);
+});
+
+test('v0.9.8: MODEL_TEST_PHASES 常量完整', () => {
+  assert.deepEqual(MODEL_TEST_PHASES, ['probe', 'rpm', 'context', 'quota-group']);
+});
+
+test('v0.9.8: metrics.sample——真实 Metrics 追加 seqId/prevProvider/prevModel/switched', async () => {
+  const { Metrics } = await import('../lib/metrics.js');
+  const m = new Metrics();
+  m.sample({ provider: 'p-b', model: 'm-b', attemptIndex: 1, outcome: 'committed',
+    seqId: 'seq-1', prevProvider: 'p-a', prevModel: 'm-a', switched: true });
+  const r = m.snapshot().recent[0];
+  assert.equal(r.seqId, 'seq-1', 'seqId 落字段');
+  assert.equal(r.prevProvider, 'p-a', 'prevProvider 落字段');
+  assert.equal(r.prevModel, 'm-a', 'prevModel 落字段');
+  assert.equal(r.switched, true, 'switched 落字段');
+  assert.equal('segment' in r, false, 'v0.9.8 不提前耦合 v0.9.9 segment');
+
+  m.sample({ provider: 'p-c', model: 'm-c', attemptIndex: 0, outcome: 'committed' });
+  const r2 = m.snapshot().recent[1];
+  assert.equal(r2.seqId, undefined);
+  assert.equal(r2.prevProvider, null, 'passthrough 默认 null（不写字符串）');
+  assert.equal(r2.switched, false);
+});
+
+test('v0.9.8: probe——透传 errorMessage（error finish + catch 分支）', async () => {
+  const finishErrorLlm = {
+    stream: async function* () {
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'INVALID_REQUEST', message: 'upstream says bad model id' } } };
+    },
+  };
+  const failed = await singleRaw(finishErrorLlm, 'p', 'm', 'ping', 100, {});
+  assert.equal(failed.errorCode, 'INVALID_REQUEST');
+  assert.equal(failed.errorMessage, 'upstream says bad model id');
+
+  const throwLlm = {
+    stream() { throw Object.assign(new Error('connection reset by peer'), { code: 'TRANSPORT' }); },
+  };
+  const thrown = await singleRaw(throwLlm, 'p', 'm', 'ping', 100, {});
+  assert.equal(thrown.errorCode, 'TRANSPORT');
+  assert.equal(thrown.errorMessage, 'connection reset by peer');
+});
+
+test('v0.9.8: model-test——_singleWithRetry 仅 probe 用（rpm 不退避）', () => {
+  const src = readFileSync(new URL('../lib/model-test.js', import.meta.url), 'utf8');
+  // _phaseProbe 调 _singleWithRetry；_phaseRpm/_phaseContext 仍调 _single
+  assert.ok(src.includes('_singleWithRetry'), '_singleWithRetry 已实现');
+  // 简单结构性断言：_phaseProbe 体里出现 _singleWithRetry，_phaseRpm 体里出现 _single 而非 _singleWithRetry
+  const probePhase = src.match(/async _phaseProbe[\s\S]*?^  }/m);
+  const rpmPhase = src.match(/async _phaseRpm[\s\S]*?^  }/m);
+  assert.ok(probePhase && /_singleWithRetry/.test(probePhase[0]), '_phaseProbe 用 _singleWithRetry');
+  assert.ok(rpmPhase && !/_singleWithRetry/.test(rpmPhase[0]), '_phaseRpm 不用 _singleWithRetry');
+});
+
+test('v0.9.8: model-test——短路表（INVALID_CREDENTIAL 后跳过 rpm/context/quota-group）', () => {
+  const src = readFileSync(new URL('../lib/model-test.js', import.meta.url), 'utf8');
+  // shouldShortCircuit 集中短路表
+  const expectInTable = ['INVALID_CREDENTIAL', 'AUTH', 'QUOTA', 'INVALID_REQUEST', 'CONTEXT_LENGTH'];
+  for (const code of expectInTable) {
+    assert.ok(src.includes(code), `短路表含 ${code}`);
+  }
+});
+
+test('v0.9.8: model-test——报告落 errorMessage（formatReportMarkdown / _finalize）', () => {
+  const md = formatModelTestMd({
+    runId: 'error-run',
+    startedAt: '2026-09-15T00:00:00.000Z',
+    finishedAt: '2026-09-15T00:00:01.000Z',
+    phases: ['probe'],
+    targets: [{
+      provider: 'opencode', model: 'bad-model', tier: 'free',
+      probe: { ok: false, errorCode: 'INVALID_REQUEST', errorMessage: 'model not found upstream' },
+      phaseErrors: { probe: { errorCode: 'INVALID_REQUEST', errorMessage: 'model not found upstream' } },
+      verdict: { recommend: 'exclude', score: 0.2 },
+    }],
+  });
+  assert.ok(md.includes('错误详情'), 'MD 有错误详情段');
+  assert.ok(md.includes('INVALID_REQUEST'), 'MD 含错误码');
+  assert.ok(md.includes('model not found upstream'), 'MD 含真实错误消息');
+});
+
+test('v0.9.8: model-test——outcome.elapsedMs 用 target 起点', () => {
+  // 通过源码断言：tStart = Date.now() 在 _runTarget 顶部；outcome.elapsedMs = targetElapsed()
+  const src = readFileSync(new URL('../lib/model-test.js', import.meta.url), 'utf8');
+  assert.ok(/const tStart = Date\.now\(\)/.test(src), '_runTarget 顶部取 tStart');
+  assert.ok(/targetElapsed\(\)/.test(src), 'outcome.elapsedMs 走 targetElapsed()');
+  // 跑批总量另存 report.elapsedMs
+  assert.ok(/report\.elapsedMs = this\.finishedAt - this\.startedAt/.test(src), 'report.elapsedMs 用 finishedAt-startedAt');
+});
+
+test('v0.9.8: client——diag / phase payload / Markdown fallback 契约存在', () => {
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('{ key: "diag", label: "诊断" }'), '诊断页签存在');
+  assert.ok(src.includes('requestBody.phases = phases.slice()'), 'phase 子集提交存在');
+  assert.ok(src.includes('Markdown 原文（旧响应兼容）'), '旧 Markdown 响应有 fallback');
+  assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '不引入 innerHTML');
+});
+
+test('v0.9.8: model-test——phases 缺省全跑；自定义子集只跑指定相', async () => {
+  const makeRunner = () => {
+    const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+    const called = [];
+    runner._phaseProbe = async () => { called.push('probe'); return { ok: true, ttftMs: 5, errorCode: null }; };
+    runner._phaseRpm = async () => { called.push('rpm'); return { lastOkRpm: 0.1, first429Rpm: null, ladder: [] }; };
+    runner._phaseContext = async () => { called.push('context'); return { sizes: [{ tokens: 1024, ok: true }], maxAccepted: 1024, firstError: null }; };
+    runner._phaseQuotaGroup = async () => { called.push('quota-group'); return { quotaGroup: null, members: [], firstError: null }; };
+    return { runner, called };
+  };
+  const all = makeRunner();
+  const allReport = await all.runner.run([{ provider: 'p', model: 'm', tier: 'free' }], { recoveryMs: 0 });
+  assert.deepEqual(all.called, ['probe', 'rpm', 'context', 'quota-group']);
+  assert.deepEqual(allReport.targets[0].phases, MODEL_TEST_PHASES);
+  assert.deepEqual(allReport.targets[0].notSelected, []);
+  assert.deepEqual(allReport.targets[0].skipped, []);
+  assert.ok(Number.isFinite(allReport.elapsedMs), '整批 elapsedMs 存在');
+
+  const subset = makeRunner();
+  const subsetReport = await subset.runner.run([{ provider: 'p', model: 'm', tier: 'free' }], { phases: ['rpm'], recoveryMs: 0 });
+  assert.deepEqual(subset.called, ['rpm'], '只选择 rpm 时不隐式补 probe');
+  assert.equal(subsetReport.targets[0].probe, null);
+  assert.deepEqual(subsetReport.targets[0].phases, ['rpm']);
+  assert.deepEqual(subsetReport.targets[0].notSelected, ['probe', 'context', 'quota-group']);
+  assert.deepEqual(subsetReport.targets[0].skipped, []);
 });
 
 

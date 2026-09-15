@@ -50,11 +50,12 @@ window.__ModuleLoader__.load({
       "exclude-current": "排除当前·注册表全部（自动）"
     };
 
-    // v0.8.0 G2：五页签（原 4 页签 + 每日报告）
+    // v0.8.0 G2 + v0.9.8：七页签（原 4 页签 + 每日报告 + 模型测试 + 诊断）
     var TABS = [
       { key: "overview", label: "概览" },
       { key: "rules", label: "切换规则" },
       { key: "logs", label: "切换日志" },
+      { key: "diag", label: "诊断" },
       { key: "models", label: "可切换模型" },
       { key: "reports", label: "每日报告" },
       { key: "modelTest", label: "模型测试" }
@@ -352,10 +353,7 @@ window.__ModuleLoader__.load({
       var s11 = useState(null);
       var bench = s11[0];
       var setBench = s11[1];
-      // v0.9.5：报告页签 — 是否显示 Markdown 全文视图（全局 state）
-      var sShowMd = useState(false);
-      var showMd = sShowMd[0];
-      var setShowMd = sShowMd[1];
+      // v0.9.8：结构化日报为主视图；Markdown 原文 details 不需要独立 open state。
       // v0.9.7：模型档案抽屉——只上提「打开哪个 provider」一个状态，抽屉组件见文件末尾
       // ArchiveDrawer。因为 ModelTestPanel 只在 activeTab==="modelTest" 时挂载、切页签即卸载，
       // 其内部 state 会销毁，抽屉无法留在它内部被跨页签（切换日志）复用。
@@ -460,12 +458,10 @@ window.__ModuleLoader__.load({
             if (body && body.ok) {
               setReport(body.report);
               setMarkdown(typeof body.markdown === "string" ? body.markdown : null);
-              setShowMd(false);
               setReportError(null);
             } else {
               setReport(null);
               setMarkdown(null);
-              setShowMd(false);
               setReportError((body && body.error) || "报告不可用");
             }
           })
@@ -1200,9 +1196,12 @@ window.__ModuleLoader__.load({
           );
         }
 
-        // ============ 页签 3：切换日志（统计 + Cooldown + L3 工具折叠区） ============
-        if (activeTab === "logs") {
-          var w = status.wrapper || {};
+        // ============ 页签 3：切换日志（统计 + Cooldown + 切换明细）/ 诊断（工具） ============
+        // v0.9.8：工具区与切换日志语义不同，保持原代码原地不搬，仅扩大外层守卫，
+        // 再用 logs/diag 条件包裹，避免搬动 225 行 hyperscript 造成括号/作用域回归。
+        if (activeTab === "logs" || activeTab === "diag") {
+          if (activeTab === "logs") {
+            var w = status.wrapper || {};
           children.push(
             h("div", { key: "stats", style: styles.section },
               h("div", { style: styles.sectionTitle }, "切换统计"),
@@ -1211,8 +1210,10 @@ window.__ModuleLoader__.load({
                 " · 故障切换 " + fmtInt(w.failovers) + " · 看门狗超时 " + fmtInt(w.timeouts) +
                 " · 强制重试 " + fmtInt(w.forced) + " · 链耗尽 " + fmtInt(w.exhaustions) +
                 " · 用户取消 " + fmtInt(w.userAborts)))
-          );
-          var cooldownEntries = Object.entries(status.cooldown || {});
+            );
+          }
+          if (activeTab === "logs") {
+            var cooldownEntries = Object.entries(status.cooldown || {});
           children.push(
             h("div", { key: "cd", style: styles.section },
               h("div", { style: styles.sectionTitle }, "Cooldown 熔断"),
@@ -1227,8 +1228,17 @@ window.__ModuleLoader__.load({
                         "连续失败 " + pair[1].failures + " 次" + (pair[1].lastErrorCode ? " · 末次 " + pair[1].lastErrorCode : "")));
                   }))
           );
+          }
 
+          if (activeTab === "diag") {
+            children.push(
+              h("div", { key: "diag-title", style: styles.section },
+                h("div", { style: styles.sectionTitle }, "诊断工具"),
+                h("div", { style: styles.meta }, "健康探测、TRM 压测、用量窗口与窗口限额属于诊断/档案工具，不计入切换日志。"))
+            );
+          }
           // —— L3 工具折叠区（探测 / 压测 / 用量窗口）——
+          if (activeTab === "diag") {
           var probeEntries = status.probe ? Object.entries(status.probe.entries || {}) : [];
           children.push(
             h("div", { key: "tool-fold", style: styles.section },
@@ -1456,25 +1466,61 @@ window.__ModuleLoader__.load({
                   })(),
                   h("div", { style: styles.hint }, "窗口耗尽后 wrapper 主动避让（返回 QUOTA，不打实际 API）；点本表「档案」可声明限额、重置已用（「模型测试」行内同名按钮仍可用）。"))))
           );
+          }
 
+          if (activeTab === "logs") {
           var recent = (status.metrics && status.metrics.recent) || [];
+          var recentGroups = [];
+          var recentGroupById = {};
+          recent.slice().reverse().slice(0, 20).forEach(function (r) {
+            var gid = r.seqId || ("seq-" + r.seq);
+            if (recentGroupById[gid] === undefined) {
+              recentGroupById[gid] = recentGroups.length;
+              recentGroups.push({ id: gid, rows: [] });
+            }
+            recentGroups[recentGroupById[gid]].rows.push(r);
+          });
+          var recentTableRows = [];
+          recentGroups.forEach(function (g) {
+            g.rows.sort(function (a, b) { return (a.seq || 0) - (b.seq || 0); });
+            var switchedCount = g.rows.filter(function (r) { return r.switched === true; }).length;
+            var session = g.rows[0] && g.rows[0].sessionId ? " · @" + g.rows[0].sessionId.slice(0, 8) : "";
+            recentTableRows.push(h("tr", { key: "g-" + g.id },
+              h("td", { style: Object.assign({}, styles.td, { fontWeight: 600 }), colSpan: 7 },
+                "请求链 · " + g.rows.length + " 次尝试 · " + switchedCount + " 次切换" + session + " · " + g.id)));
+            g.rows.forEach(function (r) {
+              var from = r.prevProvider && r.prevModel ? r.prevProvider + "/" + r.prevModel : "—";
+              var to = r.provider && r.model ? r.provider + "/" + r.model : "—";
+              recentTableRows.push(h("tr", { key: "r-" + r.seq },
+                h("td", { style: styles.td }, fmtLogTime(r.ts)),
+                h("td", { style: styles.td }, h("span", { style: styles.mono }, from)),
+                h("td", { style: styles.td }, h("span", { style: styles.mono }, to)),
+                h("td", { style: styles.td }, r.switched ? "切换" : r.outcome || "—"),
+                h("td", { style: styles.td }, r.errorCode || "—"),
+                h("td", { style: styles.td },
+                  (typeof r.ttftMs === "number" ? "TTFT " + r.ttftMs + "ms" : "") +
+                  (typeof r.e2eMs === "number" ? (typeof r.ttftMs === "number" ? " · " : "") + "E2E " + r.e2eMs + "ms" : "") || "—"),
+                h("td", { style: styles.td }, r.sessionId ? "@" + r.sessionId.slice(0, 8) : "—")));
+            });
+          });
           children.push(
             h("div", { key: "recent", style: styles.section },
-              h("div", { style: styles.sectionTitle }, "最近尝试（新→旧，最多 20 条）"),
+              h("div", { style: styles.sectionTitle }, "切换明细（按请求链分组，最近 20 次尝试）"),
               recent.length === 0
                 ? h("div", { style: styles.meta }, "暂无记录——发起一次对话后再看")
-                : h("pre", { style: styles.box },
-                    recent.slice().reverse().slice(0, 20).map(function (r) {
-                      return fmtLogTime(r.ts) + "  #" + r.seq +
-                        "  " + r.provider + "/" + r.model +
-                        "  " + r.outcome +
-                        (r.errorCode ? "  " + r.errorCode : "") +
-                        (typeof r.ttftMs === "number" ? "  TTFT " + r.ttftMs + "ms" : "") +
-                        (typeof r.e2eMs === "number" ? "  E2E " + r.e2eMs + "ms" : "") +
-                        (r.sessionId ? "  @" + r.sessionId.slice(0, 8) : "") +
-                        "  (UTC: " + r.ts.slice(11, 19) + ")";
-                    }).join("\n")))
+                : h("table", { style: styles.table },
+                    h("thead", null,
+                      h("tr", null,
+                        h("th", { style: styles.th }, "时间"),
+                        h("th", { style: styles.th }, "从"),
+                        h("th", { style: styles.th }, "到"),
+                        h("th", { style: styles.th }, "结果"),
+                        h("th", { style: styles.th }, "错误码"),
+                        h("th", { style: styles.th }, "耗时"),
+                        h("th", { style: styles.th }, "会话"))),
+                    h("tbody", null, recentTableRows)))
           );
+          }
         }
 
         // ============ 页签 4：可切换模型 ============
@@ -1656,17 +1702,21 @@ window.__ModuleLoader__.load({
                     }))),
               h("div", { style: styles.hint },
                 "评级规则：样本 <3 为 N/A；失败率 0% = S、<2% = A、<5% = B、<15% = C、其余 = D。失败 = 报错结尾；用户取消（aborted）不计失败。"),
-              // v0.9.5：Markdown 视图切换
-              h("div", { key: "rp-md-toggle", style: Object.assign({}, styles.row, { marginTop: "8px" }) },
-                h("button", {
-                  style: styles.button,
-                  disabled: !markdown,
-                  onClick: function () { setShowMd(function (v) { return !v; }); },
-                  title: !markdown ? "需先点击「立即生成昨日报告」生成 md 文件" : ""
-                }, showMd ? "隐藏 Markdown" : "查看 Markdown")),
-              showMd && markdown
-                ? h("div", { key: "rp-md", style: Object.assign({}, styles.box, { whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "12px", maxHeight: "400px", overflow: "auto" }) }, markdown)
-                : null);
+              // v0.9.8：结构化 report 已是主视图；Markdown 仅保留为审计原文，默认收起。
+              // 不再让用户点击「查看 Markdown」后直接面对 ** / |---|---| 源码。
+              h("details", { key: "rp-md-source", style: styles.fold },
+                h("summary", { style: styles.foldSummary }, "查看 Markdown 原文（审计）"),
+                markdown
+                  ? h("div", { style: Object.assign({}, styles.box, { whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "12px", maxHeight: "400px", overflow: "auto" }) }, markdown)
+                  : h("div", { style: styles.meta }, "暂无 Markdown 文件——请先生成该日报告。")));
+          } else if (markdown) {
+            // 兼容旧服务端只返回 markdown 的情况：不让结构化 report 缺失时页面变空。
+            // 仍默认收起，明确这是 fallback 原文而非美化后的主视图。
+            children.push(
+              h("details", { key: "rp-md-fallback", style: styles.fold, open: true },
+                h("summary", { style: styles.foldSummary }, "Markdown 原文（旧响应兼容）"),
+                h("div", { style: Object.assign({}, styles.box, { whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "12px", maxHeight: "400px", overflow: "auto" }) }, markdown))
+            );
           }
         }
 
@@ -1762,6 +1812,21 @@ window.__ModuleLoader__.load({
       var sErr = useState(""); var err = sErr[0]; var setErr = sErr[1];
       var sBusy = useState(false); var busy = sBusy[0]; var setBusy = sBusy[1];
       var sForm = useState(false); var formOpen = sForm[0]; var setFormOpen = sForm[1];
+      // v0.9.8：测试内容四相独立可选；不把 probe 作为隐式前置。
+      var phaseOptions = [
+        { key: "probe", label: "API 健康探测" },
+        { key: "rpm", label: "压力 / RPM 阶梯" },
+        { key: "context", label: "上下文窗口" },
+        { key: "quota-group", label: "配额组联动" },
+      ];
+      var sPhases = useState(["probe", "rpm", "context", "quota-group"]);
+      var phases = sPhases[0]; var setPhases = sPhases[1];
+      function togglePhase(key) {
+        setPhases(function (cur) {
+          if (cur.includes(key)) return cur.filter(function (p) { return p !== key; });
+          return phaseOptions.map(function (p) { return p.key; }).filter(function (p) { return cur.includes(p) || p === key; });
+        });
+      }
       // v0.9.7：多目标测试。原为两个级联 <select>（provider + model），只能表达
       // 「单个 / 某 provider 全部 / 全部 provider 全部」三种粒度；后端本就支持任意长度
       // targets 数组（routes.js 直透 body.targets、model-test.js 逐元素校验并串行跑），
@@ -1885,12 +1950,16 @@ window.__ModuleLoader__.load({
       });
       var last = snap && snap.last;
       var rows = (last && Array.isArray(last.targets)) ? last.targets : [];
+      var credentialFailures = rows.filter(function (tr) {
+        var code = tr && tr.probe && tr.probe.errorCode;
+        return code === "AUTH" || code === "INVALID_CREDENTIAL" || code === "MISSING_CREDENTIAL";
+      });
       var children = [];
       children.push(
         h("div", { key: "mt-hdr", style: styles.section },
           h("div", { style: styles.sectionTitle }, "模型全自动测试"),
           h("div", { style: styles.meta },
-            "对指定 (provider×model) 串行跑 probe→rpm→context→quotaGroup 四相，产 verdict（首选/备用/排除）" +
+            "对指定 (provider×model) 串行跑 probe→rpm→context→quota-group 四相（可按需选择），产 verdict（首选/备用/排除）" +
             "并落盘 json+md 报告，可一键桥接进规则路由。"),
           // v0.9.7：档案入口此前只藏在「有测试结果」的表格行内 → 没跑过测试就找不到。
           // 现已挪到「切换日志 → 窗口限额」（那里列出全部已注册供应商，每行一个「档案」按钮），
@@ -1908,6 +1977,10 @@ window.__ModuleLoader__.load({
             }, formOpen ? "收起新建表单" : "＋ 新建测试")))
       );
 
+      if (credentialFailures.length > 0) {
+        children.push(h("div", { key: "mt-credential-warn", style: { background: "#fff8c5", border: "1px solid #d4a72c", color: "#6e4c00", borderRadius: "6px", padding: "8px 10px", marginBottom: "8px", fontSize: "12px" } },
+          credentialFailures.length + " 个目标为凭据类失败（上游 401/403），不是限流；请检查对应 provider 的 API key。"));
+      }
       if (err) {
         children.push(h("div", { key: "mt-err", style: Object.assign({}, styles.section, { color: "#c42b1c" }) }, err));
       }
@@ -1919,6 +1992,14 @@ window.__ModuleLoader__.load({
         var cleanTargets = targets.filter(function (r) { return r.provider && r.model; });
         var ff = h("div", { key: "mt-form", style: styles.section },
           h("div", { style: styles.sectionTitle }, "新建测试（free tier 默认；可添加多个目标做批量测试）"),
+          h("div", { style: styles.row, key: "mt-phases" },
+            h("span", { style: styles.meta }, "测试内容："),
+            phaseOptions.map(function (p) {
+              return h("label", { key: p.key, style: { display: "inline-flex", alignItems: "center", marginRight: "10px", gap: "3px" } },
+                h("input", { type: "checkbox", checked: phases.includes(p.key), onChange: function () { togglePhase(p.key); } }),
+                h("span", null, p.label));
+            }),
+            phases.length === 0 ? h("span", { style: { color: "#c42b1c" } }, "至少选择一项") : null),
           h("div", { style: styles.row, key: "mt-tools" },
             h("select", {
               style: styles.narrowSelect,
@@ -1972,15 +2053,18 @@ window.__ModuleLoader__.load({
           h("div", { style: styles.row, key: "mt-submit" },
             h("button", {
               style: styles.button,
-              disabled: busy || cleanTargets.length === 0 || (snap && snap.running),
+              disabled: busy || cleanTargets.length === 0 || phases.length === 0 || (snap && snap.running),
               onClick: function () {
                 if (!cleanTargets.length) { setErr("请先添加至少一个测试目标（每行选供应商 + 模型）"); return; }
+                if (!phases.length) { setErr("请至少选择一项测试内容"); return; }
                 setBusy(true);
                 var payload = cleanTargets.map(function (r) { return { provider: r.provider, model: r.model, tier: "free" }; });
+                var requestBody = { targets: payload };
+                if (phases.length < phaseOptions.length) requestBody.phases = phases.slice();
                 fetch(API.modelTest, {
                   method: "POST",
                   headers: { "content-type": "application/json" },
-                  body: JSON.stringify({ targets: payload })
+                  body: JSON.stringify(requestBody)
                 }).then(function (r) { return r.json(); }).then(function (b) {
                   setBusy(false);
                   if (!b || !b.ok) { setErr((b && b.error) || "启动失败"); return; }
@@ -1990,7 +2074,7 @@ window.__ModuleLoader__.load({
                 }).catch(function () { setBusy(false); setErr("启动请求失败"); });
               }
             }, busy ? "启动中…" : "启动测试（" + cleanTargets.length + " 个目标）"),
-            h("span", { style: styles.meta }, "仅测 free tier，不烧付费 token。串行 4 相，目标越多耗时越长。")));
+            h("span", { style: styles.meta }, "仅测 free tier，不烧付费 token。已选 " + phases.length + " 相，目标越多耗时越长。")));
         children.push(ff);
       }
 
@@ -1998,11 +2082,24 @@ window.__ModuleLoader__.load({
       var displayRows = selRun ? (Array.isArray(selRun.targets) ? selRun.targets : []) : rows;
       var displayTitle = selRun
         ? ("历史报告 · " + selRun.runId + (selRun.aborted ? "（已中断）" : ""))
-        : (last ? "最近一次报告 · " + (last.runId || "—") + (last.aborted ? "（已中断）" : "") : null);
+        : (last ? ("最近一次报告 · " + (last.runId || "—") + (last.aborted ? "（已中断）" : "")) : null);
+      var displayReport = selRun || last;
+      var displayVerdictCounts = { primary: 0, backup: 0, exclude: 0 };
+      (displayReport && Array.isArray(displayReport.targets) ? displayReport.targets : []).forEach(function (tr) {
+        var rec = tr.verdict && tr.verdict.recommend;
+        if (Object.prototype.hasOwnProperty.call(displayVerdictCounts, rec)) displayVerdictCounts[rec] += 1;
+      });
       if (displayTitle) {
         children.push(
           h("div", { key: "mt-last", style: styles.section },
             h("div", { style: styles.sectionTitle }, displayTitle),
+            h("div", { style: styles.meta },
+              "开始 " + (displayReport && displayReport.startedAt ? new Date(displayReport.startedAt).toLocaleString() : "—") +
+              " · 结束 " + (displayReport && displayReport.finishedAt ? new Date(displayReport.finishedAt).toLocaleString() : "—") +
+              " · 耗时 " + (displayReport && displayReport.elapsedMs != null ? fmtInt(displayReport.elapsedMs) + "ms" : "—") +
+              " · 目标 " + (displayReport && Array.isArray(displayReport.targets) ? displayReport.targets.length : "—") +
+              " · 首选 " + displayVerdictCounts.primary + " / 备用 " + displayVerdictCounts.backup + " / 排除 " + displayVerdictCounts.exclude +
+              " · 测试内容 " + (displayReport && Array.isArray(displayReport.phases) ? displayReport.phases.join(" / ") : "全量")),
             displayRows.length === 0
               ? h("div", { style: styles.meta }, "本次跑批无完成样本（可能被中断）")
               : h("table", { style: styles.table },
@@ -2011,22 +2108,33 @@ window.__ModuleLoader__.load({
                     h("th", { style: styles.th }, "probe"),
                     h("th", { style: styles.th }, "RPM"),
                     h("th", { style: styles.th }, "Context"),
-                    h("th", { style: styles.th }, "verdict"),
-                    h("th", { style: styles.th }, "分"),
+                    h("th", { style: styles.th }, "verdict / 分"),
+                    h("th", { style: styles.th }, "失败原因"),
                     h("th", { style: styles.th }, "操作"))),
                   h("tbody", null, displayRows.map(function (tr) {
                     var v = tr.verdict || { recommend: "—", score: null };
                     var vcolor = v.recommend === "primary" ? "#1dc981" : v.recommend === "backup" ? "#0969da" : "#e8463a";
                     var probe = tr.probe ? (tr.probe.ok ? "OK" : "FAIL(" + (tr.probe.errorCode || "?") + ")") : "—";
+                    var probeTip = tr.probe && tr.probe.errorMessage ? tr.probe.errorMessage : "";
                     var rpm = (tr.rpm && tr.rpm.lastOkRpm != null) ? tr.rpm.lastOkRpm : "—";
                     var ctx = (tr.context && tr.context.maxAccepted != null) ? String(tr.context.maxAccepted) + "t" : "—";
+                    var phaseError = null;
+                    if (tr.phaseErrors && typeof tr.phaseErrors === "object") {
+                      Object.keys(tr.phaseErrors).some(function (phase) { phaseError = tr.phaseErrors[phase]; return !!phaseError; });
+                    }
+                    if (!phaseError && tr.probe && !tr.probe.ok) phaseError = { errorCode: tr.probe.errorCode, errorMessage: tr.probe.errorMessage };
+                    var failureReason = phaseError && phaseError.errorCode
+                      ? phaseError.errorCode + (phaseError.errorMessage ? "：" + phaseError.errorMessage : "")
+                      : (Array.isArray(tr.skipped) && tr.skipped.length ? "跳过：" + tr.skipped.join("、") : "—");
                     var cells = [
                       h("td", { style: styles.td }, h("span", { style: styles.mono }, (tr.provider || "?") + " / " + (tr.model || "?"))),
-                      h("td", { style: styles.td }, h("span", { style: { color: tr.probe && tr.probe.ok ? "#1a7f37" : "#c42b1c" } }, probe)),
+                      h("td", { style: styles.td, title: probeTip }, h("span", { style: { color: tr.probe && tr.probe.ok ? "#1a7f37" : "#c42b1c" } }, probe)),
                       h("td", { style: styles.td }, String(rpm)),
                       h("td", { style: styles.td }, ctx),
-                      h("td", { style: styles.td }, h("span", { style: Object.assign({}, styles.badge, { color: vcolor, background: vcolor === "#e8463a" ? "#fde7e7" : vcolor === "#0969da" ? "#e8f2fe" : "#e8f7ec" }) }, v.recommend)),
-                      h("td", { style: styles.td }, v.score != null ? v.score.toFixed(2) : "—"),
+                      h("td", { style: styles.td },
+                        h("span", { style: Object.assign({}, styles.badge, { color: vcolor, background: vcolor === "#e8463a" ? "#fde7e7" : vcolor === "#0969da" ? "#e8f2fe" : "#e8f7ec" }) }, v.recommend),
+                        h("span", { style: Object.assign({}, styles.meta, { marginLeft: "5px" }) }, v.score != null ? v.score.toFixed(2) : "—")),
+                      h("td", { style: styles.td, title: failureReason }, failureReason.length > 48 ? failureReason.slice(0, 48) + "…" : failureReason),
                       h("td", { style: styles.td }, h("div", { style: styles.row },
                         h("button", { style: styles.button, disabled: busy, onClick: function () { (props.onOpenArchive || function () {})(tr.provider); } }, "档案"),
                         h("button", { style: styles.button, disabled: busy, onClick: function () { bridge(tr, "primary"); } }, "首选"),
@@ -2046,7 +2154,8 @@ window.__ModuleLoader__.load({
             : h("table", { style: styles.table },
                 h("thead", null, h("tr", null,
                   h("th", { style: styles.th }, "runId"),
-                  h("th", { style: styles.th }, "开始"),
+                    h("th", { style: styles.th }, "开始"),
+                  h("th", { style: styles.th }, "耗时"),
                   h("th", { style: styles.th }, "模型数"),
                   h("th", { style: styles.th }, "状态"))),
                 h("tbody", null, list.map(function (m) {
@@ -2059,6 +2168,7 @@ window.__ModuleLoader__.load({
                     }
                   }, h("td", { style: styles.td }, h("span", { style: styles.mono }, m.runId)),
                     h("td", { style: styles.td }, m.startedAt ? new Date(m.startedAt).toLocaleString() : "—"),
+                    h("td", { style: styles.td }, m.elapsedMs != null ? fmtInt(m.elapsedMs) + "ms" : "—"),
                     h("td", { style: styles.td }, String(m.targetCount != null ? m.targetCount : "—")),
                     h("td", { style: styles.td }, m.aborted ? "已中断" : "完成"));
                 })))));
