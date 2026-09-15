@@ -13,3 +13,7 @@ npm-debug.log*
 
 # 构建产物（可由源码重新打包；发布包存 NAS 归档）
 DSH-model-router-v*.zip
+
+# 本机 Info-ZIP（Apple 版）在目标文件名含非 ASCII 时（如「…部署包.zip」）
+# 会创建 ziXXXXXX 形式的临时文件且不自动清理。打包后请随手 rm，勿入库。
+zi??????
