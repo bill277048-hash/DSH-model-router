@@ -1,6 +1,6 @@
 # @botton/dsh-model-router
 
-DSH 多供应商模型路由插件（v0.9.6）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告（Markdown）** + **模型全自动测试** + **模型档案窗口限额（5h / 1周 / 自定义）** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板 + **match 收紧密（allowLegacyMatch）** + **free-tier 跨请求节流** + **context 窗口感知重排** + **每日报告一键启用与生成 toast**。
+DSH 多供应商模型路由插件（v0.9.7）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告（Markdown）** + **模型全自动测试** + **模型档案窗口限额（5h / 1周 / 自定义）** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板 + **match 收紧密（allowLegacyMatch）** + **free-tier 跨请求节流** + **context 窗口感知重排** + **每日报告一键启用与生成 toast**。
 
 - 兼容：dsh ≥ 0.1.1-rc.1，Node ≥ 22.19，零第三方运行时依赖
 - 许可证：Apache-2.0
@@ -110,6 +110,9 @@ curl --noproxy '*' -s 'http://127.0.0.1:3081/api/model-router/model-test/list'  
   `verdict`（`primary` / `backup` / `exclude` + `score` + `quotaRisk`）
 - 报告落盘 `<reportDir>/<runId>.model-test.{json,md}` 双份；`POST /model-test/manual` 可补人工字段
   （如上游文档标称的 `manualTpm`），与实测差异 >5× 时记 `verdict.warnings` 但不阻断
+- **多目标批量测试**（v0.9.7）：「＋ 新建测试」表单为**可增删的目标行列表**——每行选供应商 + 模型，
+  可跨供应商任意组合；工具栏提供「＋ 添加该供应商全部模型」「＋ 添加全部供应商全部模型」「＋ 添加目标」
+  「清空」等批量入口。`(provider, model)` 自动去重，空列表禁止提交
 - 面板「模型测试」页签可建测试、看 verdict，并用行内三按钮一键桥接进规则：
   **加入首选**（插入当前规则 `route[0]`）/ **加入备用**（追加到 `route` 末尾）/
   **排除**（写 `providerMeta.<provider>.exclude=true`）
@@ -134,6 +137,10 @@ curl --noproxy '*' -s -X POST 'http://127.0.0.1:3081/api/model-router/quota/rese
   上游返回 429/QUOTA 时自动 `markBurnedOut` 置满兜底；`resetAt` 到期自动滑窗清零
 - 动态运行态（`used` / 滑窗后的 `resetAt`）独立持久化到 `~/.deepseek-harness/home/quota-state.json`
   （30s 周期 flush + 进程退出同步兜底），与配置态 `model-router-state.json` 两层分离
+- **配置入口**（v0.9.7）：**「切换日志」→「窗口限额」栏目**列出**全部已注册供应商**（不只已声明的），
+  每行一个「档案」按钮打开抽屉，可声明 5h / 1周限额、填刷新时刻、重置已用——**无需先跑一次模型测试**。
+  「模型测试」结果行内的同名「档案」按钮仍可用（但需先有测试结果）。
+  「切换日志」的两个折叠块（用量窗口 / 窗口限额）**默认展开**且带折叠箭头，可手动收起
 - 面板「模型测试」行内「档案」按钮可配置窗口并人工重置；概览卡「窗口限额」段显示 `used/limit` 使用率
 - 未声明 `quotaWindows` 的 provider **不受拦截**（不会误伤），面板会提示「建议补填窗口限额」
 
