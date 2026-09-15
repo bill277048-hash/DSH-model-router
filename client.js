@@ -200,8 +200,10 @@ window.__ModuleLoader__.load({
         cursor: "pointer",
         fontWeight: 600,
         fontSize: "12px",
-        color: "#1f2328",
-        listStyle: "none"
+        color: "#1f2328"
+        // v0.9.7：删掉 listStyle:"none"。它把浏览器原生的折叠三角一并隐藏了，
+        // 用户只看到「一行标题 + 下方空白」，连可点的提示都没有 → 「无信息展示」。
+        // 恢复后 4 个折叠块（健康探测 / TRM 压测 / 用量窗口 / 窗口限额）都会显示 ▸/▾。
       },
       foldBody: { padding: "0 10px 10px" },
       table: { borderCollapse: "collapse", width: "100%", fontSize: "12px" },
@@ -354,6 +356,19 @@ window.__ModuleLoader__.load({
       var sShowMd = useState(false);
       var showMd = sShowMd[0];
       var setShowMd = sShowMd[1];
+      // v0.9.7：模型档案抽屉——只上提「打开哪个 provider」一个状态，抽屉组件见文件末尾
+      // ArchiveDrawer。因为 ModelTestPanel 只在 activeTab==="modelTest" 时挂载、切页签即卸载，
+      // 其内部 state 会销毁，抽屉无法留在它内部被跨页签（切换日志）复用。
+      var sArch = useState(null);
+      var archProvider = sArch[0];
+      var setArchProvider = sArch[1];
+      // v0.9.7：切换日志页签两个折叠块改为**完全受控**（默认展开）。刻意不用 <details> 的
+      // onToggle——非概览页签每 5s 走 refresh()→setStatus 全量重渲染（见下方轮询 effect），
+      // 受控 open 每次渲染都会被回写；一旦 toggle 事件未按预期触发，用户收起后就会被轮询
+      // 弹开（即本次要修的缺陷）。故改用 summary 的 onClick + preventDefault 由 state 驱动。
+      var sFoldOpen = useState({ quota: true, windows: true });
+      var foldOpen = sFoldOpen[0];
+      var setFoldOpen = sFoldOpen[1];
       var sMarkdown = useState(null);
       var markdown = sMarkdown[0];
       var setMarkdown = sMarkdown[1];
@@ -1292,8 +1307,20 @@ window.__ModuleLoader__.load({
                     : null,
                   h("div", { style: styles.hint }, "压测会真实消耗目标模型的 token 配额（安全系数 0.6 起步）。结果写入探测板的 benchmark 条目，可回看。"))),
 
-              h("details", { key: "fold-quota", style: styles.fold },
-                h("summary", { style: styles.foldSummary }, "用量窗口（5h / 1w）· 口径：全部调用（含透传）"),
+              h("details", { key: "fold-quota", style: styles.fold, open: !!foldOpen.quota },
+                h("summary", {
+                  style: styles.foldSummary,
+                  // v0.9.7：完全受控。刻意不用 <details> 的 onToggle——非概览页签每 5s 走
+                  // refresh()→setStatus 全量重渲染，受控 open 会被回写；若 toggle 事件不可靠，
+                  // 用户收起后会被轮询弹开（即本次要修的缺陷）。改用 onClick + preventDefault。
+                  onClick: function (ev) {
+                    ev.preventDefault();
+                    setFoldOpen(function (c) { var n = Object.assign({}, c); n.quota = !c.quota; return n; });
+                  }
+                }, (function () {
+                  var n = Object.keys(status.quota || {}).length;
+                  return "用量窗口（5h / 1w）· " + (n ? n + " 家" : "暂无记录") + " · 口径：全部调用（含透传）";
+                })()),
                 h("div", { style: styles.foldBody },
                   (function () {
                     var q = status.quota || {};
@@ -1320,14 +1347,67 @@ window.__ModuleLoader__.load({
                   })(),
                   h("div", { style: styles.hint }, "滚动窗口按 provider 粒度记账；口径与每日报告一致（含纯透传调用）。"))),
 
-              h("details", { key: "fold-windows", style: styles.fold },
-                h("summary", { style: styles.foldSummary }, "窗口限额（5h / 1周 / 自定义）· 耗尽自动避让、不打上游"),
+              h("details", { key: "fold-windows", style: styles.fold, open: !!foldOpen.windows },
+                h("summary", {
+                  style: styles.foldSummary,
+                  onClick: function (ev) {
+                    ev.preventDefault();
+                    setFoldOpen(function (c) { var n = Object.assign({}, c); n.windows = !c.windows; return n; });
+                  }
+                }, (function () {
+                  var n = Object.keys(status.quotaWindows || {}).length;
+                  return "窗口限额（5h / 1周 / 自定义）· " + (n ? "已声明 " + n + " 家" : "未声明") + " · 耗尽自动避让、不打上游";
+                })()),
                 h("div", { style: styles.foldBody },
+                  // —— 段 1（v0.9.7 新增）：供应商档案总览 ——
+                  // 列出**全部已注册 provider**（不只 providerMeta 里已声明的），每行一个「档案」按钮。
+                  // 这是本页签成为「可填写位置」的关键：此前 quotaWindows 只由 Object.keys(providerMeta)
+                  // 生成，providerMeta 为空时该栏目结构性永远为空，且整页无任何输入控件 → 用户
+                  // 既看不到信息也找不到填写入口。
+                  (function () {
+                    var qw = status.quotaWindows || {};
+                    var pids = activeProviders.map(function (p) { return p.provider; });
+                    Object.keys(qw).forEach(function (k) { if (pids.indexOf(k) < 0) pids.push(k); });
+                    if (pids.length === 0) {
+                      return h("div", { style: styles.meta }, "注册表为空——请先在「可切换模型」页确认已装配供应商。");
+                    }
+                    function cell(pid, slot) {
+                      var w = (qw[pid] || {})[slot];
+                      if (!w || w.limit == null) {
+                        return h("span", { style: Object.assign({}, styles.meta, { color: "#8c959f" }) }, "未声明");
+                      }
+                      var ratio = w.usedRatio == null ? null : Math.round(w.usedRatio * 100);
+                      var hot = ratio != null && ratio >= 95;
+                      var color = ratio == null ? "#6e7781" : hot ? "#cf222e" : ratio >= 60 ? "#bf8700" : "#1a7f37";
+                      return h("span", { style: Object.assign({}, styles.mono, hot ? { fontWeight: 600 } : {}, { color: color }) },
+                        fmtInt(w.used) + " / " + fmtInt(w.limit) + (ratio == null ? "" : " · " + ratio + "%"));
+                    }
+                    return h("table", { style: styles.table },
+                      h("thead", null,
+                        h("tr", null,
+                          h("th", { style: styles.th }, "供应商（全部已注册）"),
+                          h("th", { style: styles.th }, "5h 限额"),
+                          h("th", { style: styles.th }, "1周 限额"),
+                          h("th", { style: styles.th }, "自定义"),
+                          h("th", { style: styles.th }, "操作"))),
+                      h("tbody", null, pids.map(function (pid) {
+                        var e = qw[pid] || {};
+                        var nCustom = Array.isArray(e.customWindows) ? e.customWindows.length : 0;
+                        return h("tr", { key: "ov-" + pid },
+                          h("td", { style: styles.td }, h("span", { style: styles.mono }, pid)),
+                          h("td", { style: styles.td }, cell(pid, "fiveHour")),
+                          h("td", { style: styles.td }, cell(pid, "weekly")),
+                          h("td", { style: styles.td }, nCustom ? nCustom + " 个" : "—"),
+                          h("td", { style: styles.td },
+                            h("button", { style: styles.button, onClick: function () { setArchProvider(pid); } }, "档案")));
+                      })));
+                  })(),
+                  // —— 段 2：已声明窗口明细（沿用原 winRow 表格，仅在已声明时渲染）——
                   (function () {
                     var qw = status.quotaWindows || {};
                     var qwKeys = Object.keys(qw);
                     if (qwKeys.length === 0) {
-                      return h("div", { style: styles.meta }, "暂无窗口限额声明（在 providerMeta 或「模型测试」行内「档案」中配置）");
+                      return h("div", { style: styles.meta }, "暂无窗口限额声明——点上方供应商行的「档案」声明 5h / 1周 限额（含人工重置点）。");
                     }
                     function winRow(pid, title, w) {
                       if (!w || w.limit == null) return null;
@@ -1373,7 +1453,7 @@ window.__ModuleLoader__.load({
                           h("th", { style: styles.th }, "占比 / 状态"))),
                       h("tbody", null, allRows));
                   })(),
-                  h("div", { style: styles.hint }, "窗口耗尽后 wrapper 主动避让（返回 QUOTA，不打实际 API）；「模型测试」行内「档案」按钮可配置与人工重置。"))))
+                  h("div", { style: styles.hint }, "窗口耗尽后 wrapper 主动避让（返回 QUOTA，不打实际 API）；点本表「档案」可声明限额、重置已用（「模型测试」行内同名按钮仍可用）。"))))
           );
 
           var recent = (status.metrics && status.metrics.recent) || [];
@@ -1591,7 +1671,8 @@ window.__ModuleLoader__.load({
 
         // ============ 页签 6：模型测试（v0.9.5 §9） ============
         if (activeTab === "modelTest") {
-          children.push(h(ModelTestPanel, { status: status }));
+          // v0.9.7：把「打开档案抽屉」的能力传给子组件（抽屉本身由顶层渲染，见下方 L1596 之后）
+          children.push(h(ModelTestPanel, { status: status, onOpenArchive: setArchProvider }));
         }
       }
 
@@ -1599,6 +1680,19 @@ window.__ModuleLoader__.load({
         h("div", { key: "btn", style: { marginTop: "8px" } },
           h("button", { style: styles.button, onClick: function () { refresh(); } }, "立即刷新"))
       );
+
+      // v0.9.7：模型档案抽屉挂载点 —— 必须在**所有页签条件块之外**（上面的 tab 区在 L1610 处闭合）。
+      // ⚠ 若误写进 `if (activeTab === "modelTest")` 块内，抽屉就只在模型测试页签渲染，
+      //   从「切换日志 → 窗口限额」点「档案」将毫无反应。
+      // 层级：overlay 是 position:fixed + zIndex:50，高于 toast 的 zIndex:10，不会被盖住。
+      if (archProvider) {
+        children.push(h(ArchiveDrawer, {
+          key: "arch",
+          provider: archProvider,
+          onClose: function () { setArchProvider(null); },
+          onSaved: function () { refresh(); }
+        }));
+      }
 
       // v0.9.4 UX 补丁：浮层 toast——覆盖整个面板顶层，用户不会错过反馈
       if (toast) {
@@ -1667,15 +1761,55 @@ window.__ModuleLoader__.load({
       var sErr = useState(""); var err = sErr[0]; var setErr = sErr[1];
       var sBusy = useState(false); var busy = sBusy[0]; var setBusy = sBusy[1];
       var sForm = useState(false); var formOpen = sForm[0]; var setFormOpen = sForm[1];
-      var sProvider = useState(""); var selProvider = sProvider[0]; var setSelProvider = sProvider[1];
-      var sModel = useState(""); var selModel = sModel[0]; var setSelModel = sModel[1];
+      // v0.9.7：多目标测试。原为两个级联 <select>（provider + model），只能表达
+      // 「单个 / 某 provider 全部 / 全部 provider 全部」三种粒度；后端本就支持任意长度
+      // targets 数组（routes.js 直透 body.targets、model-test.js 逐元素校验并串行跑），
+      // 属纯前端限制。现改为可增删的 target 行列表。
+      var sTargets = useState([]); var targets = sTargets[0]; var setTargets = sTargets[1];
+      var sBatch = useState(""); var batchProvider = sBatch[0]; var setBatchProvider = sBatch[1];
+      /** 行稳定 key 的单调计数器（用 useRef 而非 index——删行后 index 会错位导致输入框串值） */
+      var seqRef = useRef(0);
+      function mkRow(pid, mid) {
+        seqRef.current += 1;
+        return { key: "t" + seqRef.current, provider: pid || "", model: mid || "" };
+      }
+      /** 批量追加目标行，对 (provider, model) 去重；重复数通过 setErr 提示 */
+      function addRows(pairs) {
+        var seen = {};
+        targets.forEach(function (r) { if (r.provider && r.model) seen[r.provider + "\u0000" + r.model] = 1; });
+        var fresh = [];
+        var dup = 0;
+        pairs.forEach(function (p) {
+          var k = p.provider + "\u0000" + p.model;
+          if (seen[k]) { dup += 1; return; }
+          seen[k] = 1;
+          // key 在 updater 外生成：避免 StrictMode 双调用 updater 时计数器被多推、key 错位
+          fresh.push(mkRow(p.provider, p.model));
+        });
+        setTargets(function (cur) {
+          var have = {};
+          cur.forEach(function (r) { if (r.provider && r.model) have[r.provider + "\u0000" + r.model] = 1; });
+          return cur.concat(fresh.filter(function (r) { return !have[r.provider + "\u0000" + r.model]; }));
+        });
+        setErr(dup ? "已忽略 " + dup + " 个重复目标" : "");
+      }
+      function setRow(i, field, value) {
+        setTargets(function (cur) {
+          var next = cur.slice();
+          var r = Object.assign({}, next[i]);
+          r[field] = value;
+          if (field === "provider") r.model = ""; // 换 provider 必须清空该行 model
+          next[i] = r;
+          return next;
+        });
+      }
+      function removeRow(i) {
+        setTargets(function (cur) { var next = cur.slice(); next.splice(i, 1); return next; });
+      }
       var sSelRun = useState(null); var selRun = sSelRun[0]; var setSelRun = sSelRun[1];
-      // v0.9.5 §11 模型档案抽屉
-      var sArch = useState(null); var archProvider = sArch[0]; var setArchProvider = sArch[1];
-      var sArchWin = useState(null); var archWin = sArchWin[0]; var setArchWin = sArchWin[1];
-      var sArchErr = useState(""); var archErr = sArchErr[0]; var setArchErr = sArchErr[1];
-      var sArchBusy = useState(false); var archBusy = sArchBusy[0]; var setArchBusy = sArchBusy[1];
-      var sArchSaved = useState(false); var archSaved = sArchSaved[0]; var setArchSaved = sArchSaved[1];
+      // v0.9.7：原 v0.9.5 的 5 个档案 state、全部 handler 与抽屉 overlay 渲染已抽出为
+      // 模块级组件 ArchiveDrawer（原因：本组件切页签即卸载，抽屉无法跨页签复用）。
+      // 结果行内的「档案」按钮改为调用 props.onOpenArchive(provider)。
 
       var load = useCallback(function () {
         fetch(API.modelTest)
@@ -1735,115 +1869,9 @@ window.__ModuleLoader__.load({
         }).catch(function () { setBusy(false); setErr("读取状态失败"); });
       }
 
-      // v0.9.5 §11 模型档案抽屉：打开 / 编辑 / 保存窗口限额 / 人工重置
-      function openArchive(provider) {
-        setArchProvider(provider);
-        setArchWin(null);
-        setArchErr("");
-        setArchSaved(false);
-        fetch(API.quotaWindows + "?provider=" + encodeURIComponent(provider))
-          .then(function (r) { return r.json(); })
-          .then(function (b) {
-            if (!b || !b.ok) { setArchErr((b && b.error) || "读取窗口失败"); return; }
-            setArchWin({
-              fiveHour: b.fiveHour ? { limit: b.fiveHour.limit, resetAt: b.fiveHour.resetAt } : null,
-              weekly: b.weekly ? { limit: b.weekly.limit, resetAt: b.weekly.resetAt } : null,
-              customWindows: Array.isArray(b.customWindows) ? b.customWindows.map(function (w) { return { id: w.id, windowMs: w.windowMs, limit: w.limit }; }) : []
-            });
-          })
-          .catch(function () { setArchErr("请求失败"); });
-      }
-      function setWindowSlot(slot, field, value) {
-        setArchWin(function (cur) {
-          if (!cur) return cur;
-          var next = Object.assign({}, cur);
-          if (slot === "customWindows") { next.customWindows = Array.isArray(value) ? value : []; return next; }
-          var w = Object.assign({}, next[slot] || {});
-          if (field === "limit" && (value === "" || value === null)) delete w.limit; else w[field] = value;
-          next[slot] = w;
-          return next;
-        });
-      }
-      function saveArchive() {
-        if (!archProvider || !archWin) return;
-        setArchBusy(true);
-        var windows = {
-          fiveHour: archWin.fiveHour && (archWin.fiveHour.limit !== undefined || archWin.fiveHour.limit !== null) ? { limit: archWin.fiveHour.limit, resetAt: archWin.fiveHour.resetAt || null } : null,
-          weekly: archWin.weekly && (archWin.weekly.limit !== undefined || archWin.weekly.limit !== null) ? { limit: archWin.weekly.limit, resetAt: archWin.weekly.resetAt || null } : null,
-          customWindows: archWin.customWindows || []
-        };
-        fetch(API.quotaSync, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ provider: archProvider, windows: windows })
-        }).then(function (r) { return r.json(); }).then(function (b) {
-          setArchBusy(false);
-          if (!b || !b.ok) { setArchErr((b && b.error) || "保存失败"); return; }
-          setArchErr("");
-          setArchSaved(true);
-          setArchProvider(null); // 关闭抽屉；保存成功由服务端即时生效
-          load();
-        }).catch(function () { setArchBusy(false); setArchErr("保存请求失败"); });
-      }
-      function resetWindow(windowId) {
-        if (!archProvider) return;
-        setArchBusy(true);
-        fetch(API.quotaReset, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ provider: archProvider, windowId: windowId })
-        }).then(function (r) { return r.json(); }).then(function (b) {
-          setArchBusy(false);
-          if (!b || !b.ok) { setArchErr((b && b.error) || "重置失败"); return; }
-          setArchErr("");
-          openArchive(archProvider);
-        }).catch(function () { setArchBusy(false); setArchErr("重置请求失败"); });
-      }
-      function toLocalDate(iso) {
-        if (!iso) return "";
-        var d = new Date(iso);
-        if (isNaN(d.getTime())) return "";
-        var p = function (n) { return (n < 10 ? "0" : "") + n; };
-        return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes());
-      }
-      function toISO(local) {
-        if (!local) return null;
-        var d = new Date(local);
-        return isNaN(d.getTime()) ? null : d.toISOString();
-      }
-      var archInputStyle = {
-        width: "150px", boxSizing: "border-box", marginRight: "6px",
-        border: "1px solid #d0d7de", borderRadius: "6px", padding: "4px 8px", fontSize: "12px"
-      };
-      function archWindowRow(slot, label) {
-        var w = (archWin || {})[slot] || {};
-        var has = !!archWin && !!(w && (w.limit !== undefined && w.limit !== null));
-        return h("div", { key: "row-" + slot, style: styles.section },
-          h("div", { style: styles.row },
-            h("span", { style: styles.meta }, label + (has ? "：" : "（未启用）")),
-            !has ? h("button", { style: styles.button, onClick: function () { setWindowSlot(slot, "limit", 1000000); } }, "启用") : null),
-          has ? h("div", { style: styles.row, key: "ed-" + slot },
-            h("input", { style: archInputStyle, type: "number", min: 0, placeholder: "限额", value: w.limit == null ? "" : String(w.limit), onChange: function (e) { setWindowSlot(slot, "limit", e.target.value === "" ? null : Number(e.target.value)); } }),
-            h("input", { style: archInputStyle, type: "datetime-local", value: toLocalDate(w.resetAt), onChange: function (e) { setWindowSlot(slot, "resetAt", toISO(e.target.value)); } }),
-            h("button", { style: styles.button, disabled: archBusy, onClick: function () { resetWindow(slot); } }, "重置"),
-            h("button", { style: styles.button, onClick: function () { setWindowSlot(slot, "limit", null); } }, "删除")) : null);
-      }
-      function addCustomWindow() {
-        setWindowSlot("customWindows", null, ((archWin && archWin.customWindows) || []).concat([{ id: "custom" + ((archWin && archWin.customWindows.length) || 0) + 1, windowMs: 3600000, limit: 1000 }]));
-      }
-      function setCustomField(idx, field, value) {
-        setArchWin(function (cur) {
-          if (!cur) return cur;
-          var list = (cur.customWindows || []).slice();
-          if (field === "remove") { list.splice(idx, 1); return Object.assign({}, cur, { customWindows: list }); }
-          var item = Object.assign({}, list[idx] || {});
-          if (field === "windowMs") item.windowMs = value === "" ? null : Number(value);
-          else if (field === "limit") item.limit = value === "" ? null : Number(value);
-          else item[field] = value;
-          list[idx] = item;
-          return Object.assign({}, cur, { customWindows: list });
-        });
-      }
+      // v0.9.7：档案抽屉的 openArchive / setWindowSlot / saveArchive / resetWindow /
+      // toLocalDate / toISO / archInputStyle / archWindowRow / addCustomWindow / setCustomField
+      // 已整体迁入模块级组件 ArchiveDrawer（见文件末尾）。本组件不再持有任何档案状态。
 
       var registry = (props && props.status && props.status.registry) || null;
       var providers = (registry && registry.providers) || [];
@@ -1863,6 +1891,11 @@ window.__ModuleLoader__.load({
           h("div", { style: styles.meta },
             "对指定 (provider×model) 串行跑 probe→rpm→context→quotaGroup 四相，产 verdict（首选/备用/排除）" +
             "并落盘 json+md 报告，可一键桥接进规则路由。"),
+          // v0.9.7：档案入口此前只藏在「有测试结果」的表格行内 → 没跑过测试就找不到。
+          // 现已挪到「切换日志 → 窗口限额」（那里列出全部已注册供应商，每行一个「档案」按钮），
+          // 此处补一句引导，避免用户继续在本页签空找。
+          h("div", { style: styles.meta },
+            "窗口限额（5h / 1周）请在「切换日志」→「窗口限额」配置，或跑完测试后点结果行内「档案」。"),
           h("div", { style: styles.row, key: "mt-toolbar" },
             snap ? h("span", { style: styles.meta },
               (snap.running ? "● 正在运行" : "空闲") + (last ? " · 上次 runId " + (last.runId || "—") : "")) : null,
@@ -1879,47 +1912,84 @@ window.__ModuleLoader__.load({
       }
 
       if (formOpen) {
+        // v0.9.7：行列表 + 批量添加入口。原「全部 provider / 全部模型」的便捷语义保留，
+        // 但改由「＋ 添加全部供应商全部模型」按钮承担（不再用 "" 哨兵值表达「全部」）。
+        var selectableProviders = providers.filter(function (p) { return !p.dormant; });
+        var cleanTargets = targets.filter(function (r) { return r.provider && r.model; });
         var ff = h("div", { key: "mt-form", style: styles.section },
-          h("div", { style: styles.sectionTitle }, "新建测试（free tier 默认；不选则对全部模型跑）"),
-          h("div", { style: styles.row },
+          h("div", { style: styles.sectionTitle }, "新建测试（free tier 默认；可添加多个目标做批量测试）"),
+          h("div", { style: styles.row, key: "mt-tools" },
             h("select", {
               style: styles.narrowSelect,
-              value: selProvider,
-              onChange: function (ev) { setSelProvider(ev.target.value); setSelModel(""); }
-            }, [h("option", { key: "__all", value: "" }, "全部 provider")].concat(providers.filter(function (p) { return !p.dormant; }).map(function (p) {
+              value: batchProvider,
+              onChange: function (ev) { setBatchProvider(ev.target.value); }
+            }, [h("option", { key: "__p", value: "" }, "选择供应商…")].concat(selectableProviders.map(function (p) {
               return h("option", { key: p.provider, value: p.provider }, p.provider);
             }))),
-            h("select", {
-              style: styles.narrowSelect,
-              value: selModel,
-              disabled: !selProvider,
-              onChange: function (ev) { setSelModel(ev.target.value); }
-            }, [h("option", { key: "__any", value: "" }, selProvider ? "该 provider 全部模型" : "先选 provider")].concat(
-              providers.filter(function (p) { return p.provider === selProvider && !p.dormant; }).length
-                ? providers.filter(function (p) { return p.provider === selProvider && !p.dormant; })[0].models.map(function (mo) {
-                    return h("option", { key: mo.id, value: mo.id }, mo.id);
-                  })
-                : []))),
+            h("button", {
+              style: styles.button,
+              disabled: !batchProvider,
+              title: batchProvider ? "" : "请先选左侧供应商",
+              onClick: function () {
+                addRows(providerOptions.filter(function (o) { return o.provider === batchProvider; }));
+              }
+            }, "＋ 添加该供应商全部模型"),
+            h("button", {
+              style: styles.button,
+              onClick: function () { addRows(providerOptions); }
+            }, "＋ 添加全部供应商全部模型"),
+            h("button", {
+              style: styles.button,
+              onClick: function () {
+                // 空行：key 在 updater 外生成，避免 StrictMode 双调用时计数器多推
+                var r = mkRow(batchProvider, "");
+                setTargets(function (cur) { return cur.concat([r]); });
+              }
+            }, "＋ 添加目标"),
+            targets.length ? h("button", { style: styles.button, onClick: function () { setTargets([]); setErr(""); } }, "清空") : null),
+          targets.length === 0
+            ? h("div", { style: styles.meta, key: "mt-empty" }, "尚未添加目标——用上方按钮添加（每行需选齐供应商 + 模型）。")
+            : h("div", { key: "mt-rows" }, targets.map(function (row, i) {
+                var models = (selectableProviders.filter(function (p) { return p.provider === row.provider; })[0] || {}).models || [];
+                return h("div", { key: row.key, style: styles.row },
+                  h("select", {
+                    style: styles.narrowSelect,
+                    value: row.provider,
+                    onChange: function (ev) { setRow(i, "provider", ev.target.value); }
+                  }, [h("option", { key: "__p", value: "" }, "选择供应商…")].concat(selectableProviders.map(function (p) {
+                    return h("option", { key: p.provider, value: p.provider }, p.provider);
+                  }))),
+                  h("select", {
+                    style: styles.narrowSelect,
+                    value: row.model,
+                    disabled: !row.provider,
+                    onChange: function (ev) { setRow(i, "model", ev.target.value); }
+                  }, [h("option", { key: "__m", value: "" }, row.provider ? "选择模型…" : "先选供应商")].concat(
+                    models.map(function (mo) { return h("option", { key: mo.id, value: mo.id }, mo.id); }))),
+                  h("button", { style: styles.button, onClick: function () { removeRow(i); } }, "删除"));
+              })),
           h("div", { style: styles.row, key: "mt-submit" },
-            h("button", { style: styles.button, disabled: busy, onClick: function () {
-              setBusy(true);
-              var targets = providerOptions
-                .filter(function (o) { return (!selProvider || o.provider === selProvider) && (!selModel || o.model === selModel); })
-                .map(function (o) { return { provider: o.provider, model: o.model, tier: "free" }; });
-              if (!targets.length) { setBusy(false); setErr("无可用模型，请先在「可切换模型」页刷新看是否已装配"); return; }
-              fetch(API.modelTest, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ targets: targets })
-              }).then(function (r) { return r.json(); }).then(function (b) {
-                setBusy(false);
-                if (!b || !b.ok) { setErr((b && b.error) || "启动失败"); return; }
-                setErr("");
-                setFormOpen(false);
-                load();
-              }).catch(function () { setBusy(false); setErr("启动请求失败"); });
-            } }, busy ? "启动中…" : "启动测试"),
-            h("span", { style: styles.meta }, "仅测 free tier，不烧付费 token。")));
+            h("button", {
+              style: styles.button,
+              disabled: busy || cleanTargets.length === 0 || (snap && snap.running),
+              onClick: function () {
+                if (!cleanTargets.length) { setErr("请先添加至少一个测试目标（每行选供应商 + 模型）"); return; }
+                setBusy(true);
+                var payload = cleanTargets.map(function (r) { return { provider: r.provider, model: r.model, tier: "free" }; });
+                fetch(API.modelTest, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ targets: payload })
+                }).then(function (r) { return r.json(); }).then(function (b) {
+                  setBusy(false);
+                  if (!b || !b.ok) { setErr((b && b.error) || "启动失败"); return; }
+                  setErr("");
+                  setFormOpen(false);
+                  load(); // 刻意不重置 targets——便于对同一批目标复跑
+                }).catch(function () { setBusy(false); setErr("启动请求失败"); });
+              }
+            }, busy ? "启动中…" : "启动测试（" + cleanTargets.length + " 个目标）"),
+            h("span", { style: styles.meta }, "仅测 free tier，不烧付费 token。串行 4 相，目标越多耗时越长。")));
         children.push(ff);
       }
 
@@ -1957,7 +2027,7 @@ window.__ModuleLoader__.load({
                       h("td", { style: styles.td }, h("span", { style: Object.assign({}, styles.badge, { color: vcolor, background: vcolor === "#e8463a" ? "#fde7e7" : vcolor === "#0969da" ? "#e8f2fe" : "#e8f7ec" }) }, v.recommend)),
                       h("td", { style: styles.td }, v.score != null ? v.score.toFixed(2) : "—"),
                       h("td", { style: styles.td }, h("div", { style: styles.row },
-                        h("button", { style: styles.button, disabled: busy, onClick: function () { openArchive(tr.provider); } }, "档案"),
+                        h("button", { style: styles.button, disabled: busy, onClick: function () { (props.onOpenArchive || function () {})(tr.provider); } }, "档案"),
                         h("button", { style: styles.button, disabled: busy, onClick: function () { bridge(tr, "primary"); } }, "首选"),
                         h("button", { style: styles.button, disabled: busy, onClick: function () { bridge(tr, "backup"); } }, "备用"),
                         h("button", { style: styles.button, disabled: busy, onClick: function () { bridge(tr, "exclude"); } }, "排除")))
@@ -1992,47 +2062,182 @@ window.__ModuleLoader__.load({
                     h("td", { style: styles.td }, m.aborted ? "已中断" : "完成"));
                 })))));
 
-      // v0.9.5 §11 模型档案抽屉（overlay）
-      if (archProvider) {
-        var archRows = [];
-        var archBody;
-        if (archWin) {
-          archBody = h("div", null,
-            archWindowRow("fiveHour", "5 小时限额"),
-            archWindowRow("weekly", "1 周限额"),
-            h("div", { key: "row-custom", style: styles.section },
-              h("div", { style: styles.row },
-                h("span", { style: styles.meta }, "自定义窗口"),
-                h("button", { style: styles.button, onClick: addCustomWindow }, "＋ 添加")),
-              (archWin.customWindows || []).length === 0
-                ? h("div", { style: styles.meta }, "无自定义窗口")
-                : archWin.customWindows.map(function (cw, ci) {
-                    return h("div", { key: "cw" + ci, style: styles.row },
-                      h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), value: cw.id, onChange: function (e) { setCustomField(ci, "id", e.target.value); } }),
-                      h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), type: "number", placeholder: "毫秒", value: cw.windowMs == null ? "" : String(cw.windowMs), onChange: function (e) { setCustomField(ci, "windowMs", e.target.value); } }),
-                      h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), type: "number", placeholder: "限额", value: cw.limit == null ? "" : String(cw.limit), onChange: function (e) { setCustomField(ci, "limit", e.target.value); } }),
-                      h("button", { style: styles.button, disabled: archBusy, onClick: function () { resetWindow("custom:" + cw.id); } }, "重置"),
-                      h("button", { style: styles.button, onClick: function () { setCustomField(ci, "remove", true); } }, "删"));
-                  })));
-        } else {
-          archBody = h("div", { style: styles.meta }, "加载窗口信息…");
-        }
-        archRows.push(h("div", { key: "arch-windows" }, archBody));
-        archRows.push(
-          archErr ? h("div", { key: "arch-err", style: { color: "#c42b1c", margin: "6px 0" } }, archErr) : null,
-          archSaved ? h("div", { key: "arch-ok", style: { color: "#1a7f37", margin: "6px 0" } }, "已保存并即时生效") : null,
-          h("div", { key: "arch-actions", style: styles.row },
-            h("button", { style: styles.button, disabled: archBusy || !archWin, onClick: saveArchive }, archBusy ? "处理中…" : "保存"),
-            h("button", { style: styles.button, onClick: function () { setArchProvider(null); } }, "关闭")));
-        children.push(
-          h("div", { key: "arch-overlay", style: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.35)", zIndex: 50, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 16px", overflow: "auto" } },
-            h("div", { style: { background: "#fff", border: "1px solid #d0d7de", borderRadius: "10px", maxWidth: "620px", width: "100%", padding: "18px 20px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" } },
-              h("div", { style: styles.sectionTitle }, "模型档案 · " + archProvider),
-              h("div", { style: styles.meta }, "窗口限额：某窗口耗尽后 wrapper 主动避让、不打上游；留空 limit = 不限制。重置按钮清零 used 并重算 resetAt。"),
-              archRows)));
-      }
+      // v0.9.7：档案抽屉 overlay 渲染已迁入模块级 ArchiveDrawer（见文件末尾）。
+      // 抽出原因：本组件只在 activeTab==="modelTest" 时挂载，抽屉必须能跨页签复用。
 
       return h("div", { key: "mt-panel" }, children);
+    }
+
+    // ============ 模型档案抽屉（v0.9.7：从 ModelTestPanel 抽出，供跨页签复用） ============
+    //
+    // 为什么必须是独立组件、不能留在 ModelTestPanel 内：
+    //   ModelTestPanel 只在 activeTab==="modelTest" 时挂载（切页签即卸载），其内部 state 会销毁。
+    //   而「切换日志 → 窗口限额」栏目也要能打开同一个抽屉，故抽为模块级组件，
+    //   顶层只上提「打开哪个 provider」一个状态（props.provider），其余状态留在组件内。
+    //
+    // props:
+    //   provider  要编辑的供应商 id（顶层仅在非空时才渲染本组件）
+    //   onClose   关闭抽屉（顶层把 archProvider 置 null）
+    //   onSaved   保存成功后通知顶层 refresh() 拉全量 status（含 quotaWindows，供窗口限额栏目同步）
+    function ArchiveDrawer(props) {
+      var provider = props.provider;
+      var sWin = useState(null); var archWin = sWin[0]; var setArchWin = sWin[1];
+      var sErr = useState(""); var archErr = sErr[0]; var setArchErr = sErr[1];
+      var sBusy = useState(false); var archBusy = sBusy[0]; var setArchBusy = sBusy[1];
+      var sSaved = useState(false); var archSaved = sSaved[0]; var setArchSaved = sSaved[1];
+
+      // 拉取该 provider 的窗口声明（原 ModelTestPanel.openArchive 的取数部分）
+      var load = useCallback(function () {
+        setArchWin(null);
+        setArchErr("");
+        setArchSaved(false);
+        fetch(API.quotaWindows + "?provider=" + encodeURIComponent(provider))
+          .then(function (r) { return r.json(); })
+          .then(function (b) {
+            if (!b || !b.ok) { setArchErr((b && b.error) || "读取窗口失败"); return; }
+            setArchWin({
+              fiveHour: b.fiveHour ? { limit: b.fiveHour.limit, resetAt: b.fiveHour.resetAt } : null,
+              weekly: b.weekly ? { limit: b.weekly.limit, resetAt: b.weekly.resetAt } : null,
+              customWindows: Array.isArray(b.customWindows) ? b.customWindows.map(function (w) { return { id: w.id, windowMs: w.windowMs, limit: w.limit }; }) : []
+            });
+          })
+          .catch(function () { setArchErr("请求失败"); });
+      }, [provider]);
+      useEffect(function () { load(); }, [load]);
+
+      function setWindowSlot(slot, field, value) {
+        setArchWin(function (cur) {
+          if (!cur) return cur;
+          var next = Object.assign({}, cur);
+          if (slot === "customWindows") { next.customWindows = Array.isArray(value) ? value : []; return next; }
+          var w = Object.assign({}, next[slot] || {});
+          if (field === "limit" && (value === "" || value === null)) delete w.limit; else w[field] = value;
+          next[slot] = w;
+          return next;
+        });
+      }
+      function saveArchive() {
+        if (!archWin) return;
+        setArchBusy(true);
+        var windows = {
+          fiveHour: archWin.fiveHour && (archWin.fiveHour.limit !== undefined || archWin.fiveHour.limit !== null) ? { limit: archWin.fiveHour.limit, resetAt: archWin.fiveHour.resetAt || null } : null,
+          weekly: archWin.weekly && (archWin.weekly.limit !== undefined || archWin.weekly.limit !== null) ? { limit: archWin.weekly.limit, resetAt: archWin.weekly.resetAt || null } : null,
+          customWindows: archWin.customWindows || []
+        };
+        fetch(API.quotaSync, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ provider: provider, windows: windows })
+        }).then(function (r) { return r.json(); }).then(function (b) {
+          setArchBusy(false);
+          if (!b || !b.ok) { setArchErr((b && b.error) || "保存失败"); return; }
+          setArchErr("");
+          setArchSaved(true);
+          // v0.9.7：原为 ModelTestPanel 的 load() + setArchProvider(null)；
+          // 抽出后改由顶层负责刷新（refresh 拉全量 status，范围更大）与关闭。
+          if (props.onSaved) props.onSaved();
+          if (props.onClose) props.onClose();
+        }).catch(function () { setArchBusy(false); setArchErr("保存请求失败"); });
+      }
+      function resetWindow(windowId) {
+        setArchBusy(true);
+        fetch(API.quotaReset, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ provider: provider, windowId: windowId })
+        }).then(function (r) { return r.json(); }).then(function (b) {
+          setArchBusy(false);
+          if (!b || !b.ok) { setArchErr((b && b.error) || "重置失败"); return; }
+          setArchErr("");
+          // v0.9.7 关键修正：原为 openArchive(archProvider)（重开抽屉=重拉数据）。
+          // 抽出后 props.provider 不变、组件不会重挂载，useEffect(load,[provider]) 不会再次触发，
+          // 故必须显式调用本组件内部的 load()，否则重置后抽屉仍显示旧 used（看起来像重置失败）。
+          load();
+        }).catch(function () { setArchBusy(false); setArchErr("重置请求失败"); });
+      }
+      function toLocalDate(iso) {
+        if (!iso) return "";
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return "";
+        var p = function (n) { return (n < 10 ? "0" : "") + n; };
+        return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes());
+      }
+      function toISO(local) {
+        if (!local) return null;
+        var d = new Date(local);
+        return isNaN(d.getTime()) ? null : d.toISOString();
+      }
+      var archInputStyle = {
+        width: "150px", boxSizing: "border-box", marginRight: "6px",
+        border: "1px solid #d0d7de", borderRadius: "6px", padding: "4px 8px", fontSize: "12px"
+      };
+      // v0.9.7 文案：把「启用 / 删除」改直白为「声明限额 / 取消声明」，让「是否有限额」的语义显式
+      function archWindowRow(slot, label) {
+        var w = (archWin || {})[slot] || {};
+        var has = !!archWin && !!(w && (w.limit !== undefined && w.limit !== null));
+        return h("div", { key: "row-" + slot, style: styles.section },
+          h("div", { style: styles.row },
+            h("span", { style: styles.meta }, label + (has ? "：" : "：未声明（不限制、不参与避让）")),
+            !has ? h("button", { style: styles.button, onClick: function () { setWindowSlot(slot, "limit", 1000000); } }, "声明限额") : null),
+          has ? h("div", { style: styles.row, key: "ed-" + slot },
+            h("input", { style: archInputStyle, type: "number", min: 0, placeholder: "token 上限", value: w.limit == null ? "" : String(w.limit), onChange: function (e) { setWindowSlot(slot, "limit", e.target.value === "" ? null : Number(e.target.value)); } }),
+            h("input", { style: archInputStyle, type: "datetime-local", value: toLocalDate(w.resetAt), onChange: function (e) { setWindowSlot(slot, "resetAt", toISO(e.target.value)); } }),
+            h("button", { style: styles.button, disabled: archBusy, onClick: function () { resetWindow(slot); } }, "重置已用"),
+            h("button", { style: styles.button, onClick: function () { setWindowSlot(slot, "limit", null); } }, "取消声明")) : null);
+      }
+      function addCustomWindow() {
+        setWindowSlot("customWindows", null, ((archWin && archWin.customWindows) || []).concat([{ id: "custom" + ((archWin && archWin.customWindows.length) || 0) + 1, windowMs: 3600000, limit: 1000 }]));
+      }
+      function setCustomField(idx, field, value) {
+        setArchWin(function (cur) {
+          if (!cur) return cur;
+          var list = (cur.customWindows || []).slice();
+          if (field === "remove") { list.splice(idx, 1); return Object.assign({}, cur, { customWindows: list }); }
+          var item = Object.assign({}, list[idx] || {});
+          if (field === "windowMs") item.windowMs = value === "" ? null : Number(value);
+          else if (field === "limit") item.limit = value === "" ? null : Number(value);
+          else item[field] = value;
+          list[idx] = item;
+          return Object.assign({}, cur, { customWindows: list });
+        });
+      }
+
+      var archRows = [];
+      var archBody;
+      if (archWin) {
+        archBody = h("div", null,
+          archWindowRow("fiveHour", "5 小时限额"),
+          archWindowRow("weekly", "1 周限额"),
+          h("div", { key: "row-custom", style: styles.section },
+            h("div", { style: styles.row },
+              h("span", { style: styles.meta }, "自定义窗口"),
+              h("button", { style: styles.button, onClick: addCustomWindow }, "＋ 添加")),
+            (archWin.customWindows || []).length === 0
+              ? h("div", { style: styles.meta }, "无自定义窗口")
+              : archWin.customWindows.map(function (cw, ci) {
+                  return h("div", { key: "cw" + ci, style: styles.row },
+                    h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), value: cw.id, onChange: function (e) { setCustomField(ci, "id", e.target.value); } }),
+                    h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), type: "number", placeholder: "毫秒", value: cw.windowMs == null ? "" : String(cw.windowMs), onChange: function (e) { setCustomField(ci, "windowMs", e.target.value); } }),
+                    h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), type: "number", placeholder: "token 上限", value: cw.limit == null ? "" : String(cw.limit), onChange: function (e) { setCustomField(ci, "limit", e.target.value); } }),
+                    h("button", { style: styles.button, disabled: archBusy, onClick: function () { resetWindow("custom:" + cw.id); } }, "重置已用"),
+                    h("button", { style: styles.button, onClick: function () { setCustomField(ci, "remove", true); } }, "移除窗口"));
+                })));
+      } else {
+        archBody = h("div", { style: styles.meta }, "加载窗口信息…");
+      }
+      archRows.push(h("div", { key: "arch-windows" }, archBody));
+      archRows.push(
+        archErr ? h("div", { key: "arch-err", style: { color: "#c42b1c", margin: "6px 0" } }, archErr) : null,
+        archSaved ? h("div", { key: "arch-ok", style: { color: "#1a7f37", margin: "6px 0" } }, "已保存并即时生效") : null,
+        h("div", { key: "arch-actions", style: styles.row },
+          h("button", { style: styles.button, disabled: archBusy || !archWin, onClick: saveArchive }, archBusy ? "处理中…" : "保存"),
+          h("button", { style: styles.button, onClick: function () { if (props.onClose) props.onClose(); } }, "关闭")));
+
+      return h("div", { key: "arch-overlay", style: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.35)", zIndex: 50, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 16px", overflow: "auto" } },
+        h("div", { style: { background: "#fff", border: "1px solid #d0d7de", borderRadius: "10px", maxWidth: "620px", width: "100%", padding: "18px 20px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" } },
+          h("div", { style: styles.sectionTitle }, "模型档案 · " + provider),
+          h("div", { style: styles.meta }, "窗口限额：某窗口耗尽后 wrapper 主动避让、不打上游；未声明 = 不限制，声明后耗尽即避让。「重置已用」清零 used 并重算 resetAt。"),
+          archRows));
     }
 
     var CLAIM_KEY = "__dsh_model_router_panel_mounted__";
