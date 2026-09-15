@@ -372,7 +372,8 @@ window.__ModuleLoader__.load({
       var sMarkdown = useState(null);
       var markdown = sMarkdown[0];
       var setMarkdown = sMarkdown[1];
-      // v0.9.5：切换规则页签 — 每条规则的高级选项（mode / 时序参数）折叠开关
+      // v0.9.5 引入；v0.9.6 起真正生效——「切换规则」页签每条规则的高级选项折叠开关，
+      // 控制 strategy 下拉的显示（默认只显示当前策略名，展开才给 4 档下拉）。
       var sShowAdvanced = useState(new Set());
       var showAdvancedSet = sShowAdvanced[0];
       var setShowAdvancedSet = sShowAdvanced[1];
