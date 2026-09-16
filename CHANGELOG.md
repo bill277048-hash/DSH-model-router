@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.9.9.5 (2026-09-16)
+
+> **「测试档案」页签上线**（v0.9.9 收口 Task 7 + 8）。前端消费 v0.9.9.4 的两个端点；
+> 三类档案（模型测试 / 负载测试 / 健康探测）可罗列 + 点行看详情。
+> 至此 **v0.9.9 的「档案」部分完成**（cosmic-forging §6-2 全项）。
+
+### 新增 · 「测试档案」页签（Task 7）
+
+- `TABS` 追加 `{ key: 'archives', label: '测试档案' }`（第 8 个页签，紧随「模型测试」）
+- 新增 `ArchivesPanel` 组件（与既有 `ModelTestPanel` 同模式）：
+  - 挂载即拉 `GET /test-archives`（轻量列表）
+  - **按 kind 三组**展示（模型测试 / 负载测试 / 健康探测），组内时间倒序（后端已排序）
+  - 每行显示 `runId` / 时间 / 大小；空组显示「暂无档案」
+  - **点行开详情**（选中行高亮 + `cursor: pointer`）
+  - 刷新按钮 + 错误提示
+
+### 新增 · 三个详情视图（Task 8）
+
+新增 `renderArchiveDetail(detail)`，按 kind 分支：
+
+| kind | 展示内容 |
+| --- | --- |
+| `model-test` | 目标数 / 相 / 是否中断 + **targets 表**（provider / model / verdict / 分）+ Markdown 原文折叠 |
+| `loadtest` | 已完成相列表 + 每相的目标数与时间 |
+| `probe` | 探测目标数 / 是否启用周期探测 + **entries 表**（目标 / 状态 / 成功总 / 最近探测） |
+
+- **不强行复用** `ModelTestPanel` 内的内联渲染器（那是内联实现，抽取会引入重构风险）——
+  本组件按 kind 写简洁视图（Enforce Simplicity）
+- **所有文本走 `h()` 子节点**，全文件无 HTML 直通（源码级断言守住）
+
+### 改进 · 命名消歧（方案 §6-2 要求）
+
+- `ArchiveDrawer` 标题：`模型档案 · <provider>` → **`窗口限额档案 · <provider>`**
+- 与新页签「测试档案」区分——两者都叫「档案」但语义不同
+  （窗口限额档案 = 渠道的限额声明；测试档案 = 一次跑批的结果）
+
+### 单测
+
+- 184 → **185**（+1 条）：
+  `v0.9.9.5 Task7/8: client——archives 页签 / ArchivesPanel / 详情渲染 / 命名消歧 契约存在`
+  （源码级断言，与既有 v0.9.8 client 测试同模式）
+- **mock React runtime**：8 个页签（含新 `archives`）全部渲染成功、无抛错
+
+### 踩坑记录
+
+初版 `renderArchiveDetail` 的注释写了「绝不 innerHTML」—— 触发既有源码级断言
+`assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false)`（**注释也会被匹配**）。
+→ 改措辞为「不使用 HTML 直通」。
+**教训**：源码级断言的 pattern 会匹配注释，写注释时要避开被断言的敏感词。
+
 ## 0.9.9.4 (2026-09-16)
 
 > **档案端点上线 + 路径穿越漏洞加固**（v0.9.9 收口 Task 5 + 6）。

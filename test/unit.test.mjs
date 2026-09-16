@@ -3386,6 +3386,27 @@ test('v0.9.8: client——diag / phase payload / Markdown fallback 契约存在'
   assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '不引入 innerHTML');
 });
 
+test('v0.9.9.5 Task7/8: client——archives 页签 / ArchivesPanel / 详情渲染 / 命名消歧 契约存在', () => {
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 页签注册
+  assert.ok(src.includes('{ key: "archives", label: "测试档案" }'), 'archives 页签已注册');
+  // 组件与渲染器
+  assert.ok(/function ArchivesPanel\(/.test(src), 'ArchivesPanel 组件存在');
+  assert.ok(/function renderArchiveDetail\(/.test(src), '详情渲染器存在');
+  // 端点消费
+  assert.ok(src.includes('API.testArchives'), '消费 /test-archives');
+  assert.ok(src.includes('API.testArchivesDetail'), '消费 /test-archives/detail');
+  // 三类 kind 分组
+  for (const k of ['model-test', 'loadtest', 'probe']) {
+    assert.ok(src.includes(`"${k}"`), `kind ${k} 出现`);
+  }
+  // 命名消歧（方案 §6-2）：抽屉标题改为「窗口限额档案」，与「测试档案」页签区分
+  assert.ok(src.includes('窗口限额档案 · '), 'ArchiveDrawer 标题已消歧');
+  assert.equal(src.includes('模型档案 · '), false, '旧「模型档案」标题已移除');
+  // XSS 边界：全文件无 HTML 直通
+  assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '不引入 HTML 直通');
+});
+
 test('v0.9.8: model-test——phases 缺省全跑；自定义子集只跑指定相', async () => {
   const makeRunner = () => {
     const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });

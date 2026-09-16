@@ -36,6 +36,9 @@ window.__ModuleLoader__.load({
       modelTest: "/api/model-router/model-test",
       modelTestManual: "/api/model-router/model-test/manual",
       modelTestList: "/api/model-router/model-test/list",
+      // v0.9.9.5 Task 7/8：统一测试档案（三类 kind 列表 + 详情）
+      testArchives: "/api/model-router/test-archives",
+      testArchivesDetail: "/api/model-router/test-archives/detail",
       quotaWindows: "/api/model-router/quota/windows",
       quotaReset: "/api/model-router/quota/reset",
       quotaSync: "/api/model-router/quota/sync"
@@ -58,7 +61,9 @@ window.__ModuleLoader__.load({
       { key: "diag", label: "诊断" },
       { key: "models", label: "可切换模型" },
       { key: "reports", label: "每日报告" },
-      { key: "modelTest", label: "模型测试" }
+      { key: "modelTest", label: "模型测试" },
+      // v0.9.9.5 Task 7：统一测试档案（三类 kind 罗列 + 详情）
+      { key: "archives", label: "测试档案" }
     ];
 
     var styles = {
@@ -1947,6 +1952,11 @@ window.__ModuleLoader__.load({
           // v0.9.7：把「打开档案抽屉」的能力传给子组件（抽屉本身由顶层渲染，见下方 L1596 之后）
           children.push(h(ModelTestPanel, { status: status, onOpenArchive: setArchProvider }));
         }
+
+        // ============ 页签 7：测试档案（v0.9.9.5 Task 7/8） ============
+        if (activeTab === "archives") {
+          children.push(h(ArchivesPanel, { key: "arch-tab" }));
+        }
       }
 
       children.push(
@@ -2401,6 +2411,204 @@ window.__ModuleLoader__.load({
       return h("div", { key: "mt-panel" }, children);
     }
 
+    // ============ v0.9.9.5 Task 7/8：测试档案页签（三类 kind 列表 + 详情） ============
+    /**
+     * 消费 v0.9.9.4 的两个端点：
+     * - GET /test-archives        → 轻量列表（只 stat，不读内容）
+     * - GET /test-archives/detail → { report, markdown }
+     *
+     * 与 ModelTestPanel 的分工：ModelTestPanel 是「跑测试」，本组件是「看历史档案」。
+     * 详情视图不复用 ModelTestPanel 内的内联渲染器——那是内联实现，抽取会引入
+     * 重构风险；本组件按 kind 分支写简洁视图（Enforce Simplicity）。
+     */
+    var ARCHIVE_KIND_LABELS = {
+      "model-test": "模型测试",
+      loadtest: "负载测试",
+      probe: "健康探测"
+    };
+
+    function fmtBytes(n) {
+      if (typeof n !== "number") return "—";
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+      return (n / 1024 / 1024).toFixed(1) + " MB";
+    }
+
+    function ArchivesPanel() {
+      var sItems = useState(null); var items = sItems[0]; var setItems = sItems[1];
+      var sErr = useState(""); var err = sErr[0]; var setErr = sErr[1];
+      var sBusy = useState(false); var busy = sBusy[0]; var setBusy = sBusy[1];
+      // 选中的档案（{kind, runId}）；null = 未选
+      var sSel = useState(null); var sel = sSel[0]; var setSel = sSel[1];
+      // 详情响应；{ error } 表示失败
+      var sDetail = useState(null); var detail = sDetail[0]; var setDetail = sDetail[1];
+      var sDetailBusy = useState(false); var detailBusy = sDetailBusy[0]; var setDetailBusy = sDetailBusy[1];
+
+      function load() {
+        setBusy(true);
+        fetch(API.testArchives)
+          .then(function (r) { return r.json(); })
+          .then(function (b) {
+            if (b && b.ok) { setItems(b.items || []); setErr(""); }
+            else setErr((b && b.error) || "加载失败");
+          })
+          .catch(function (e) { setErr(String(e && e.message ? e.message : e)); })
+          .then(function () { setBusy(false); });
+      }
+      useEffect(function () { load(); }, []);
+
+      function openDetail(kind, runId) {
+        setSel({ kind: kind, runId: runId });
+        setDetail(null);
+        setDetailBusy(true);
+        fetch(API.testArchivesDetail + "?kind=" + encodeURIComponent(kind) + "&runId=" + encodeURIComponent(runId))
+          .then(function (r) { return r.json(); })
+          .then(function (b) {
+            if (b && b.ok) setDetail(b);
+            else setDetail({ error: (b && b.error) || "加载失败" });
+          })
+          .catch(function (e) { setDetail({ error: String(e && e.message ? e.message : e) }); })
+          .then(function () { setDetailBusy(false); });
+      }
+
+      var children = [];
+      children.push(
+        h("div", { key: "arch-head", style: styles.row },
+          h("span", { style: styles.meta },
+            "三类档案（模型测试 / 负载测试 / 健康探测）· 按时间倒序 · 点行查看详情"),
+          h("button", { style: styles.button, disabled: busy, onClick: load },
+            busy ? "加载中…" : "刷新"))
+      );
+      if (err) children.push(h("div", { key: "arch-err", style: styles.warn }, "⚠ " + err));
+
+      var list = items || [];
+      ["model-test", "loadtest", "probe"].forEach(function (kind) {
+        var g = list.filter(function (i) { return i.kind === kind; });
+        var rows = g.map(function (it) {
+          var isSel = sel && sel.kind === it.kind && sel.runId === it.runId;
+          return h("tr", {
+            key: "a-" + it.kind + "-" + it.runId,
+            style: isSel ? { background: "#f0f6ff", cursor: "pointer" } : { cursor: "pointer" },
+            onClick: function () { openDetail(it.kind, it.runId); }
+          },
+            h("td", { style: styles.td }, h("span", { style: styles.mono }, it.runId)),
+            h("td", { style: styles.td }, it.startedAt ? new Date(it.startedAt).toLocaleString() : "—"),
+            h("td", { style: styles.td }, fmtBytes(it.size)));
+        });
+        children.push(
+          h("div", { key: "arch-g-" + kind, style: styles.section },
+            h("div", { style: styles.sectionTitle },
+              ARCHIVE_KIND_LABELS[kind] + "（" + g.length + "）"),
+            g.length === 0
+              ? h("div", { style: styles.meta }, "暂无档案")
+              : h("table", { style: styles.table },
+                  h("thead", null,
+                    h("tr", null,
+                      h("th", { style: styles.th }, "runId"),
+                      h("th", { style: styles.th }, "时间"),
+                      h("th", { style: styles.th }, "大小"))),
+                  h("tbody", null, rows)))
+        );
+      });
+
+      // ---- 详情区 ----
+      if (sel) {
+        var body;
+        if (detailBusy) body = h("div", { style: styles.meta }, "加载详情中…");
+        else if (!detail) body = h("div", { style: styles.meta }, "（未加载）");
+        else if (detail.error) body = h("div", { style: styles.warn }, "⚠ " + detail.error);
+        else body = renderArchiveDetail(detail);
+        children.push(
+          h("div", { key: "arch-detail", style: styles.section },
+            h("div", { style: styles.sectionTitle },
+              "详情 · " + ARCHIVE_KIND_LABELS[sel.kind] + " · " + sel.runId),
+            body));
+      }
+
+      return h("div", { key: "arch-panel" }, children);
+    }
+
+    /** 按 kind 渲染档案详情（纯展示，所有文本走 h() 子节点，不使用 HTML 直通）。 */
+    function renderArchiveDetail(d) {
+      var rep = d.report || {};
+      var out = [];
+      // 通用头
+      out.push(
+        h("div", { key: "d-head", style: styles.meta },
+          "kind=" + (rep.kind || d.kind) + " · schemaVersion=" + (rep.schemaVersion != null ? rep.schemaVersion : "—") +
+          (rep.startedAt ? " · 开始 " + new Date(rep.startedAt).toLocaleString() : "") +
+          (typeof rep.elapsedMs === "number" ? " · 耗时 " + fmtInt(rep.elapsedMs) + "ms" : ""))
+      );
+
+      if (d.kind === "model-test") {
+        var targets = Array.isArray(rep.targets) ? rep.targets : [];
+        out.push(h("div", { key: "d-mt-meta", style: styles.meta },
+          "目标 " + targets.length + " 个" +
+          (Array.isArray(rep.phases) ? " · 相 " + rep.phases.join("/") : "") +
+          (rep.aborted ? " · 已中断" : "")));
+        if (targets.length) {
+          out.push(h("table", { key: "d-mt-tbl", style: styles.table },
+            h("thead", null, h("tr", null,
+              h("th", { style: styles.th }, "provider"),
+              h("th", { style: styles.th }, "model"),
+              h("th", { style: styles.th }, "verdict"),
+              h("th", { style: styles.th }, "分"))),
+            h("tbody", null, targets.map(function (t, i) {
+              var v = t.verdict || {};
+              return h("tr", { key: "d-t-" + i },
+                h("td", { style: styles.td }, h("span", { style: styles.mono }, t.provider || "—")),
+                h("td", { style: styles.td }, h("span", { style: styles.mono }, t.model || "—")),
+                h("td", { style: styles.td }, v.recommend || "—"),
+                h("td", { style: styles.td }, v.score != null ? String(v.score) : "—"));
+            }))));
+        }
+      } else if (d.kind === "loadtest") {
+        var phases = Array.isArray(rep.phases) ? rep.phases : [];
+        out.push(h("div", { key: "d-lt-meta", style: styles.meta },
+          "已完成相：" + (phases.length ? phases.join(" / ") : "（无）")));
+        phases.forEach(function (ph) {
+          var r = (rep.results || {})[ph] || {};
+          var n = Array.isArray(r.targets) ? r.targets.length : 0;
+          out.push(h("div", { key: "d-lt-" + ph, style: styles.meta },
+            "· " + ph + "：" + n + " 个目标" + (r.at ? "（" + r.at + "）" : "")));
+        });
+      } else if (d.kind === "probe") {
+        var entries = rep.entries || {};
+        var keys = Object.keys(entries);
+        out.push(h("div", { key: "d-pb-meta", style: styles.meta },
+          "探测目标 " + (rep.targetCount != null ? rep.targetCount : keys.length) + " 个" +
+          (rep.enabled ? " · 周期探测已启用" : "")));
+        if (keys.length) {
+          out.push(h("table", { key: "d-pb-tbl", style: styles.table },
+            h("thead", null, h("tr", null,
+              h("th", { style: styles.th }, "目标"),
+              h("th", { style: styles.th }, "状态"),
+              h("th", { style: styles.th }, "成功/总"),
+              h("th", { style: styles.th }, "最近探测"))),
+            h("tbody", null, keys.map(function (k) {
+              var e = entries[k] || {};
+              return h("tr", { key: "d-e-" + k },
+                h("td", { style: styles.td }, h("span", { style: styles.mono }, k)),
+                h("td", { style: styles.td }, e.status || "—"),
+                h("td", { style: styles.td }, String(e.success != null ? e.success : "—") + "/" + String(e.total != null ? e.total : "—")),
+                h("td", { style: styles.td }, e.lastProbeAt ? new Date(e.lastProbeAt).toLocaleString() : "—"));
+            }))));
+        }
+      }
+
+      // markdown 折叠（仅 model-test 有）
+      if (d.markdown) {
+        out.push(
+          h("details", { key: "d-md", style: styles.fold },
+            h("summary", { style: styles.foldSummary }, "Markdown 原文"),
+            h("div", { style: Object.assign({}, styles.box, {
+              whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "12px"
+            }) }, d.markdown))
+        );
+      }
+      return h("div", { key: "d-body" }, out);
+    }
+
     // ============ 模型档案抽屉（v0.9.7：从 ModelTestPanel 抽出，供跨页签复用） ============
     //
     // 为什么必须是独立组件、不能留在 ModelTestPanel 内：
@@ -2568,7 +2776,7 @@ window.__ModuleLoader__.load({
 
       return h("div", { key: "arch-overlay", style: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.35)", zIndex: 50, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 16px", overflow: "auto" } },
         h("div", { style: { background: "#fff", border: "1px solid #d0d7de", borderRadius: "10px", maxWidth: "620px", width: "100%", padding: "18px 20px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" } },
-          h("div", { style: styles.sectionTitle }, "模型档案 · " + provider),
+          h("div", { style: styles.sectionTitle }, "窗口限额档案 · " + provider),
           h("div", { style: styles.meta }, "窗口限额：某窗口耗尽后 wrapper 主动避让、不打上游；未声明 = 不限制，声明后耗尽即避让。「重置已用」清零 used 并重算 resetAt。"),
           archRows));
     }
