@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.9.9.1 (2026-09-16)
+
+> **修一个 P0 + 一处过度设计修正**。行为变更：空 `provider` / `model` 不再被
+> `normalizeTimeWindows` 放行——与 `rules[].route` 走同一校验函数（`checkProviderModel`）。
+> 零破坏性变更。
+
+### 修复 · `normalizeTimeWindows` 放行空 provider/model（P0，真 bug）
+
+- **现象**：v0.9.9 实施时 `lib/config.js:47` 留了 TODO「复用 checkProviderModel...留待」，但未完成。
+  校验只查 `typeof === 'string'`，**不查非空**——`{provider:"", model:""}` 被放行。
+- **可达路径**：面板「+ 添加候选」在 `knownPairs` 为空（registry 未就绪）时，默认值
+  `{provider:"", model:""}` → 提交后通过 → 存入空 route。
+- **修复**：`normalizeTimeWindows` 改用 `checkProviderModel` 校验 route hop，与
+  `rules[].route`（`config.js:549`）走同一函数。两条路径校验强度一致。
+- **保留**：合法 route 的 `quotaGroup` / `tier` / `key` 内联字段（`checkProviderModel` 会提取）。
+- **单测红→绿**：回退到 buggy 版 → 新断言 `not ok 165`；恢复 fixed → 166/166 全绿。
+- **影响范围**：`lib/config.js`（1 处替换）+ `test/unit.test.mjs`（v0.9.9 用例扩展为 v0.9.9.1）。
+  总数 166 → 166（v0.9.9 用例被同名替换/扩展）。
+
+### 未做
+
+- v0.9.9 收口的其余 6 项 Task（详见 `docs/v0.9.9-实施方案.md`）——按既定节奏分批推进。
+
 ## 0.9.9 (2026-09-16)
 
 > **极简峰谷定价 + 配置持久化补全**。新增 `timeWindows` 字段（峰谷两段完整候选链），新契约 1 项：

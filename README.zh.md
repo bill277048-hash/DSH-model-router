@@ -1,6 +1,6 @@
 # @botton/dsh-model-router
 
-DSH 多供应商模型路由插件（v0.9.9）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告（结构化 + Markdown）** + **模型全自动测试（独立 phase + 退避 + 短路）** + **模型档案窗口限额（5h / 1周 / 自定义）** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板 + **诊断页签（按 seqId 分组的切换明细）** + **凭据失败黄条** + **match 收紧密（allowLegacyMatch）** + **free-tier 跨请求节流** + **context 窗口感知重排** + **每日报告一键启用与生成 toast**。
+DSH 多供应商模型路由插件（v0.9.9.1）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告（结构化 + Markdown）** + **模型全自动测试（独立 phase + 退避 + 短路）** + **模型档案窗口限额（5h / 1周 / 自定义）** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板 + **诊断页签（按 seqId 分组的切换明细）** + **凭据失败黄条** + **match 收紧密（allowLegacyMatch）** + **free-tier 跨请求节流** + **context 窗口感知重排** + **每日报告一键启用与生成 toast**。
 
 - 兼容：dsh ≥ 0.1.1-rc.1，Node ≥ 22.19，零第三方运行时依赖
 - 许可证：Apache-2.0

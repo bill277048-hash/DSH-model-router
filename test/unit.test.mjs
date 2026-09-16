@@ -3517,16 +3517,24 @@ test('v0.9.9: matchRule 段链路——包模式（__mr_rule）不受段影响',
   assert.equal(r.byName('pkg').route[0].provider, 'pkg-a', 'byName 拿原始规则，不受段链路影响');
 });
 
-test('v0.9.9: normalizeTimeWindows 校验——HH:MM / 峰谷点不等 / route 结构', () => {
+test('v0.9.9.1: normalizeTimeWindows 校验——HH:MM / 峰谷点不等 / route 结构 / 空 provider/model 拒绝（Task 1a）', () => {
   // HH:MM 格式校验
   assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '9:00', valleyStart: '22:00' }), /peakStart 须为 HH:MM/);
   assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00', peak: { route: 'bad' } }), /peak\.route 须为数组/);
   assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '09:00' }), /不能相等/);
-  // 正常
+  // v0.9.9.1 Task 1a：空 provider/model 必须被拒绝（与 rules[].route 走同一校验）
+  assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00',
+    peak: { route: [{ provider: '', model: '' }] } }), /非空 provider/);
+  assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00',
+    peak: { route: [{ provider: 'p' }] } }), /须含非空 model/);
+  assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00',
+    valley: { route: [{ provider: '' }] } }), /非空 provider/);
+  // 正常：quotaGroup/tier 等内联字段必须保留（与 rules[].route 行为一致）
   const tw = normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00',
-    peak: { route: [{ provider: 'a', model: 'A' }] }, valley: { route: [{ provider: 'b', model: 'B' }] } });
+    peak: { route: [{ provider: 'a', model: 'A', quotaGroup: 'g1', tier: 'free' }] },
+    valley: { route: [{ provider: 'b', model: 'B' }] } });
   assert.equal(tw.enabled, true);
-  assert.deepEqual(tw.peak.route, [{ provider: 'a', model: 'A' }]);
+  assert.deepEqual(tw.peak.route, [{ provider: 'a', model: 'A', quotaGroup: 'g1', tier: 'free' }]);
   assert.deepEqual(tw.valley.route, [{ provider: 'b', model: 'B' }]);
   assert.ok(Object.isFrozen(tw.peak.route));
 });
