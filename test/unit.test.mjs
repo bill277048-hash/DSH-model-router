@@ -21,6 +21,7 @@ import { loadState, saveState } from '../lib/store.js';
 import { dayKeyOf, stabilityGrade, DailyLedger, DailyReporter, DailyScheduler, formatReportMarkdown } from '../lib/daily.js';
 import { WindowLedger, QuotaLedger, deriveWindowId } from '../lib/quota.js';
 import { ModelTestRunner, validateModelTestTargets, validateManualInput, validatePhases, MODEL_TEST_PHASES, PHASE_EXEC_ORDER, orderPhasesForExecution, verdictOf, formatReportMarkdown as formatModelTestMd, manualWarnings } from '../lib/model-test.js';
+import { normalizeTimeWindows } from '../lib/config.js';
 
 // ---------- mock 工具 ----------
 
@@ -3152,23 +3153,31 @@ test('v0.9.8: MODEL_TEST_PHASES 常量完整', () => {
   assert.deepEqual(MODEL_TEST_PHASES, ['probe', 'rpm', 'context', 'quota-group']);
 });
 
-test('v0.9.8: metrics.sample——真实 Metrics 追加 seqId/prevProvider/prevModel/switched', async () => {
+test('v0.9.8/9.9: metrics.sample——真实 Metrics 追加 seqId/prevProvider/prevModel/switched/segment', async () => {
   const { Metrics } = await import('../lib/metrics.js');
   const m = new Metrics();
+  // v0.9.8：五字段（seqId/prev*/switched）落库
   m.sample({ provider: 'p-b', model: 'm-b', attemptIndex: 1, outcome: 'committed',
-    seqId: 'seq-1', prevProvider: 'p-a', prevModel: 'm-a', switched: true });
+    seqId: 'seq-1', prevProvider: 'p-a', prevModel: 'm-a', switched: true, segment: 'peak' });
   const r = m.snapshot().recent[0];
   assert.equal(r.seqId, 'seq-1', 'seqId 落字段');
   assert.equal(r.prevProvider, 'p-a', 'prevProvider 落字段');
   assert.equal(r.prevModel, 'm-a', 'prevModel 落字段');
   assert.equal(r.switched, true, 'switched 落字段');
-  assert.equal('segment' in r, false, 'v0.9.8 不提前耦合 v0.9.9 segment');
+  assert.equal(r.segment, 'peak', 'v0.9.9 segment 落字段');
 
+  // 旧 caller 不传 segment 时默认为 null（保持签名向后兼容）
   m.sample({ provider: 'p-c', model: 'm-c', attemptIndex: 0, outcome: 'committed' });
   const r2 = m.snapshot().recent[1];
   assert.equal(r2.seqId, undefined);
   assert.equal(r2.prevProvider, null, 'passthrough 默认 null（不写字符串）');
   assert.equal(r2.switched, false);
+  assert.equal(r2.segment, null, '未传 segment 时默认 null');
+
+  // v0.9.9：非法 segment 值（不是 peak/valley）一律归 null
+  m.sample({ provider: 'p-d', model: 'm-d', attemptIndex: 0, outcome: 'committed', segment: 'bogus' });
+  const r3 = m.snapshot().recent[2];
+  assert.equal(r3.segment, null, '非法 segment 值归 null');
 });
 
 test('v0.9.8: probe——透传 errorMessage（error finish + catch 分支）', async () => {
@@ -3405,4 +3414,133 @@ test('v0.9.8: model-test——phases 缺省全跑；自定义子集只跑指定�
   assert.deepEqual(subsetReport.targets[0].skipped, []);
 });
 
+
+// ============================================================
+// v0.9.9 极简峰谷定价（方案 §6-1）：10 条行为断言
+// ============================================================
+
+/** 构造一个含 timeWindows 的 Router，时间用 _now 注入。 */
+function makeRouterWithTW(tw, tz = null, now = null) {
+  const r = new Router({ rules: [], timeZone: tz, timeWindows: tw }, null, null);
+  if (now) r._now = now;
+  return r;
+}
+
+test('v0.9.9: segmentOf 半开区间——非跨零点（09:00-22:00）', () => {
+  const r = makeRouterWithTW({ enabled: true, peakStart: '09:00', valleyStart: '22:00' });
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T08:59:59')), 'valley');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T09:00:00')), 'peak');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T21:59:59')), 'peak');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T22:00:00')), 'valley');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T23:30:00')), 'valley');
+});
+
+test('v0.9.9: segmentOf 半开区间——跨零点（22:00-08:00）', () => {
+  const r = makeRouterWithTW({ enabled: true, peakStart: '22:00', valleyStart: '08:00' });
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T22:00:00')), 'peak');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T07:59:59')), 'peak');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T08:00:00')), 'valley');
+  assert.equal(r.segmentOf(r.config.timeWindows, null, new Date('2026-09-16T12:00:00')), 'valley');
+});
+
+test('v0.9.9: segmentOf 未启用 / 缺字段 → null（零行为变化）', () => {
+  const r1 = makeRouterWithTW({ enabled: false, peakStart: '09:00', valleyStart: '22:00' });
+  assert.equal(r1.segmentOf(r1.config.timeWindows, null, new Date('2026-09-16T12:00:00')), null);
+  const r2 = makeRouterWithTW({ enabled: true }); // 缺 peakStart/valleyStart
+  assert.equal(r2.segmentOf(r2.config.timeWindows, null, new Date('2026-09-16T12:00:00')), null);
+  const r3 = makeRouterWithTW(null);
+  assert.equal(r3.segmentOf(r3.config.timeWindows, null, new Date('2026-09-16T12:00:00')), null);
+});
+
+test('v0.9.9: segmentOfNow 实例方法复用 config 与 _now 注入', () => {
+  const r = new Router({ rules: [], timeZone: null, timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00' } });
+  r._now = new Date('2026-09-16T12:00:00');
+  assert.equal(r.segmentOfNow(), 'peak');
+  r._now = new Date('2026-09-16T03:00:00');
+  assert.equal(r.segmentOfNow(), 'valley');
+});
+
+test('v0.9.9: segmentChain——未启用/段无 route → null；启用时返回完整链', () => {
+  const r = new Router({ rules: [], timeZone: null,
+    timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00',
+      peak: { route: [{ provider: 'a', model: 'A' }] },
+      valley: { route: [{ provider: 'b', model: 'B' }, { provider: 'c', model: 'C' }] } } }, null, null);
+  r._now = new Date('2026-09-16T12:00:00');
+  assert.deepEqual(r.segmentChain(), [{ provider: 'a', model: 'A' }]);
+  r._now = new Date('2026-09-16T03:00:00');
+  assert.deepEqual(r.segmentChain(), [{ provider: 'b', model: 'B' }, { provider: 'c', model: 'C' }]);
+  // 段无 route（仍可识别段，但 chain 为 null）
+  const r2 = new Router({ rules: [], timeZone: null,
+    timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00' } }, null, null);
+  r2._now = new Date('2026-09-16T12:00:00');
+  assert.equal(r2.segmentChain(), null);
+});
+
+test('v0.9.9: matchRule 段链路——未命中规则时合成 __segment 规则', () => {
+  const r = new Router({ rules: [], timeZone: null,
+    timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00',
+      peak: { route: [{ provider: 'peak-a', model: 'pk-A' }, { provider: 'peak-b', model: 'pk-B' }] } } }, null, null);
+  r._now = new Date('2026-09-16T12:00:00');
+  const seg = r.matchRule({ provider: 'orig', model: 'M' });
+  assert.ok(seg, '未命中但段有 route 时仍返回合成规则');
+  assert.equal(seg.name, '__segment', 'name 标记为 __segment（识别用）');
+  assert.equal(seg.strategy, 'explicit');
+  assert.equal(seg.__segment, 'peak');
+  assert.deepEqual(seg.route, [{ provider: 'peak-a', model: 'pk-A' }, { provider: 'peak-b', model: 'pk-B' }],
+    'route 与该段声明一致');
+});
+
+test('v0.9.9: matchRule 段链路——时间切换后 route 跟着变（v0.9.8.1 留底：pickPrimary 断言）', () => {
+  const r = new Router({ rules: [], timeZone: null,
+    timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00',
+      peak: { route: [{ provider: 'pk', model: 'PK' }] },
+      valley: { route: [{ provider: 'vl', model: 'VL' }] } } }, null, null);
+  // 峰段
+  r._now = new Date('2026-09-16T12:00:00');
+  assert.deepEqual(r.pickPrimary({ provider: 'orig', model: 'M' }), { provider: 'pk', model: 'PK' },
+    '峰段启用时 pickPrimary 返回段 route[0]（v0.9.8.1 留底断言）');
+  // 谷段
+  r._now = new Date('2026-09-16T03:00:00');
+  assert.deepEqual(r.pickPrimary({ provider: 'orig', model: 'M' }), { provider: 'vl', model: 'VL' },
+    '谷段启用时 pickPrimary 返回段 route[0]');
+});
+
+test('v0.9.9: matchRule 段链路——包模式（__mr_rule）不受段影响', () => {
+  // 模拟规则包绑定的「显式选包」场景：绑定到 __mr_rule 后直接走 byName，不经段。
+  // 这里验证段链路不会污染 byName：候选链应来自原始规则，不来自段。
+  const r = new Router({ rules: [{ name: 'pkg', route: [{ provider: 'pkg-a', model: 'M1' }] }],
+    timeZone: null,
+    timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00',
+      peak: { route: [{ provider: 'SEG', model: 'S' }] } } }, null, null);
+  r._now = new Date('2026-09-16T12:00:00');
+  // byName 路径直接拿原始规则，与段无关
+  assert.equal(r.byName('pkg').route[0].provider, 'pkg-a', 'byName 拿原始规则，不受段链路影响');
+});
+
+test('v0.9.9: normalizeTimeWindows 校验——HH:MM / 峰谷点不等 / route 结构', () => {
+  // HH:MM 格式校验
+  assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '9:00', valleyStart: '22:00' }), /peakStart 须为 HH:MM/);
+  assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00', peak: { route: 'bad' } }), /peak\.route 须为数组/);
+  assert.throws(() => normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '09:00' }), /不能相等/);
+  // 正常
+  const tw = normalizeTimeWindows({ enabled: true, peakStart: '09:00', valleyStart: '22:00',
+    peak: { route: [{ provider: 'a', model: 'A' }] }, valley: { route: [{ provider: 'b', model: 'B' }] } });
+  assert.equal(tw.enabled, true);
+  assert.deepEqual(tw.peak.route, [{ provider: 'a', model: 'A' }]);
+  assert.deepEqual(tw.valley.route, [{ provider: 'b', model: 'B' }]);
+  assert.ok(Object.isFrozen(tw.peak.route));
+});
+
+test('v0.9.9: normalizeState 透传 timeWindows；normalizeConfig 拒非对象', () => {
+  // normalizeState 把 timeWindows 透传到返回结果（与 reports 同模式）
+  const state = normalizeState({ rules: [], timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00',
+    peak: { route: [{ provider: 'a', model: 'A' }] }, valley: { route: [{ provider: 'b', model: 'B' }] } } });
+  assert.ok(state.timeWindows, 'timeWindows 出现在返回 state');
+  assert.equal(state.timeWindows.enabled, true);
+  // 未提交时不出现（与 providerMeta 同语义：undefined = 保留 patch 值）
+  const state2 = normalizeState({ rules: [] });
+  assert.equal(state2.timeWindows, undefined);
+  // normalizeConfig 接受非法的 timeWindows 应抛错
+  assert.throws(() => normalizeConfig({ timeWindows: 'bad' }), /须为对象/);
+});
 

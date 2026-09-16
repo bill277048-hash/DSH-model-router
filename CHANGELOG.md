@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.9.9 (2026-09-16)
+
+> **极简峰谷定价 + 配置持久化补全**。新增 `timeWindows` 字段（峰谷两段完整候选链），新契约 1 项：
+> `POST /api/model-router/state` body 含可选 `timeWindows` 字段；`GET /api/model-router/status` 回显
+> 现算的 `segment` 与 `nextBoundaryAt`。缺省行为与既有完全兼容（仍跑 4 相），无破坏性变更。
+
+### 改进 · 极简峰谷定价（问题 1，方案 §6-1）
+
+**结构**（`lib/config.js` `DEFAULT_CONFIG` 与 `normalizeTimeWindows`）：
+
+```js
+timeWindows: {
+  enabled: false,
+  peakStart: "09:00", valleyStart: "22:00",
+  peak:   { route: [{ provider, model }, ...] },   // 峰段：完整候选链
+  valley: { route: [{ provider, model }, ...] },   // 谷段：完整候选链
+}
+```
+
+**消费点（关键：放 `matchRule` 末尾）**：`router.js` 新增 `segmentOf` / `segmentOfNow` / `segmentChain`；
+`matchRule` 返回处统一收口（**一处覆盖 4 个消费者**：match / matchName / candidates / pickPrimary）。
+
+- **半开区间 [peakStart, valleyStart)**：跨零点按 `t >= peak || t < valley` 处理，
+  两段拼接完整 24 小时，无重叠无缝隙。峰谷点相等 → 抛错。
+- **优先级**：段 `route` **整体替换**候选链，不引入「段 strategy 覆盖原规则」的组合语义；
+  `__segment` 仅内存，绝不写回 config / store。
+- **包模式（`__mr_rule` 绑定 / `__pkg:`）不受段影响**——与 v0.9.7 `exclude` 的边界一致。
+- **时区取 `config.timeZone`**（null = 系统），与既有时间窗同口径。
+
+**记录点**：`wrapper/index.js` 4 处 `metrics.sample` 与 `daily.recordCall` 全部写入
+`segment`（peak / valley / null）。`metrics.js` rec 增加 `segment` 字段，向后兼容（缺省 null）。
+`/status` 回显现算的 `segment` + `nextBoundaryAt`（ISO 时间戳）。
+
+### 改进 · 配置持久化补全（顺手修 v0.9.8 §十三-9 已知问题）
+
+- `timeWindows` 接入 store 白名单（`store.js loadState` 与 `index.js` 合并点），跨重启保留。
+- 顺手修 `timeZone` 与 `mode` 持久化断链（v0.9.8 已知但未修，本次一并补）。
+
+### 新增 / 改进端点
+
+- `GET /api/model-router/status` 回显 `timeWindows: { enabled, peakStart, valleyStart, segment, nextBoundaryAt, tz }`
+  —— `segment` 与 `nextBoundaryAt` 由 routes 侧用 `segmentOf` + `localHHMM` **现算**，不落 config
+- `POST /api/model-router/state` 接受 `timeWindows`（与现有 `reports` / `providerMeta` 同模式）
+- 峰谷点相等 → `400 + 含具体错误信息`
+
+### 前端 · 峰谷 UI（替换原「时间窗口径」块）
+
+- 总开关 checkbox + 两个 `input type="time"`（峰起 / 谷起）+ 当前段指示徽章
+- 峰 / 谷两套候选链编辑（双 select + 删除按钮 + 添加按钮，provider/model 联动）
+- 峰谷点相同 → 实时校验提示
+- **主保存 body 必须包含 `timeWindows`**（§十四-7；未提交时由后端兜底为保留 patch 值）
+
+### 单测
+
+- 154/156 → **166/166**（新增 10 条行为断言）：
+  - `segmentOf` 半开区间（含跨零点）/ 未启用 → null / 缺字段 → null
+  - `segmentOfNow` 实例方法复用 config 与 `_now` 注入
+  - `segmentChain` 未启用/段无 route → null
+  - `matchRule` 段链路合成 `__segment` 规则
+  - **`pickPrimary` 在段启用时返回段 route[0]**（v0.9.8.1 留底断言）
+  - 包模式 `byName` 不受段影响
+  - `normalizeTimeWindows` HH:MM / 峰谷不等 / route 结构校验
+  - `normalizeState` 透传 / `normalizeConfig` 拒非对象
+- **突变验证**（证明测试是有效的）：
+  - 反相 `segmentOf` → 5 条用例变红
+  - 禁用段链路 → 2 条用例变红（matchRule + pickPrimary）
+  - 还原 → 166/166
+
+### 风险与未做
+
+- 未做任意时段列表 / 多窗口叠加（极简峰谷两段制满足典型作息）
+- 未做段级 `ruleName` / `strategy` 覆盖（方案 §十四-5 砍掉：递归风险 + 实机 `rules=[]` 时无规则可名）
+- 未做 v0.9.9 方案 §6-2 的「统一测试档案」——按既定节奏推迟到 v0.9.9.1 或 v1.0.0
+
 ## 0.9.8.1 (2026-09-16)
 
 > **测量修正版**。`context` 相改为**隔离执行**（提前到 `rpm` 相之前），消除 `rpm` 相的

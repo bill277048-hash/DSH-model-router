@@ -416,6 +416,9 @@ window.__ModuleLoader__.load({
                     rules: JSON.parse(JSON.stringify(body.config.rules || [])),
                     timeZone: typeof body.config.timeZone === "string" ? body.config.timeZone : "",
                     mode: typeof body.config.mode === "string" ? body.config.mode : "balanced",
+                    // v0.9.9：timeWindows 初值——未启用/未配置时给默认空对象，
+                    // 面板展示「未启用」状态。
+                    timeWindows: normalizeEditTW(body.config.timeWindows),
                     dirty: false,
                     syncedAt: "server"
                   };
@@ -565,7 +568,15 @@ window.__ModuleLoader__.load({
         fetch(API.state, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ rules: saveRules, timeZone: edit.timeZone ? edit.timeZone : null, mode: edit.mode || "balanced" })
+          body: JSON.stringify({
+            rules: saveRules,
+            timeZone: edit.timeZone ? edit.timeZone : null,
+            mode: edit.mode || "balanced",
+            // v0.9.9（方案 §十四-7）：主保存必须包含 timeWindows，否则新 UI 的
+            // 总开关 / 峰起谷起 / 候选链 / 偏好**存不进去**。
+            // 未提交（edit.timeWindows 为 undefined）由后端 normalizeState 兜底为保留 patch 值。
+            ...(edit.timeWindows !== undefined ? { timeWindows: edit.timeWindows } : {}),
+          })
         })
           .then(function (res) { return res.json(); })
           .then(function (body) {
@@ -796,10 +807,101 @@ window.__ModuleLoader__.load({
           rules: JSON.parse(JSON.stringify(status.config.rules || [])),
           timeZone: typeof status.config.timeZone === "string" ? status.config.timeZone : "",
           mode: typeof status.config.mode === "string" ? status.config.mode : "balanced",
+          timeWindows: normalizeEditTW(status.config.timeWindows),
           dirty: false,
           syncedAt: "server"
         });
         setFeedback(null);
+      }
+
+      /**
+       * v0.9.9：把服务端 timeWindows 字段归一成「面板可编辑的形态」：
+       * - 未提交 / 未启用 / 字段缺失 → 返回 enabled:false 的默认空对象（面板显示「未启用」）
+       * - 已提交 → 浅拷贝 route 数组（深拷贝过大，面板编辑时按需 deepcopy）
+       *
+       * 避免「state.config.timeWindows 为 undefined」导致面板崩，也避免「传数组引用」导致脏写。
+       */
+      function normalizeEditTW(tw) {
+        if (!tw || typeof tw !== "object") {
+          return { enabled: false, peakStart: "09:00", valleyStart: "22:00", peak: { route: [] }, valley: { route: [] } };
+        }
+        return {
+          enabled: tw.enabled === true,
+          peakStart: typeof tw.peakStart === "string" ? tw.peakStart : "09:00",
+          valleyStart: typeof tw.valleyStart === "string" ? tw.valleyStart : "22:00",
+          peak: { route: Array.isArray(tw.peak && tw.peak.route) ? tw.peak.route.slice() : [] },
+          valley: { route: Array.isArray(tw.valley && tw.valley.route) ? tw.valley.route.slice() : [] },
+        };
+      }
+
+      /**
+       * v0.9.9：峰/谷段候选链编辑器。
+       * - 每行：下拉选 (provider, model) + 「删除」按钮
+       * - 底部：「+ 添加候选」按钮（复用 select 样式）
+       * - onChange(route) 整体替换父级 route 数组
+       *
+       * 用 select 而非 input 文本框的原因：避免拼写错误、避免与注册表漂移。
+       * 已知下拉项由 knownPairs（status.registry 推算）传入；若与注册的 provider/model
+       * 不一致（手动构造），后端 normalizeTimeWindows 校验会拒。
+       */
+      function renderSegRouteEditor(segName, route, knownPairs, onChange) {
+        var sel = styles.narrowSelect || styles.button || {};
+        var rows = (route || []).map(function (hop, idx) {
+          return h("div", { key: "sr-" + segName + "-" + idx, style: Object.assign({}, styles.row, { marginTop: "4px", gap: "6px" }) },
+            h("span", { style: Object.assign({}, styles.mono || {}, { minWidth: "70px" }) }, "[" + (idx + 1) + "]"),
+            h("select", {
+              value: hop.provider || "",
+              style: sel,
+              onChange: function (e) {
+                var newProvider = (e && e.target && e.target.value) || "";
+                var newModel = knownPairs.filter(function (p) { return p.provider === newProvider; })[0]
+                  ? knownPairs.filter(function (p) { return p.provider === newProvider; })[0].model
+                  : (hop.model || "");
+                var newRoute = route.map(function (h2, i) {
+                  return i === idx ? { provider: newProvider, model: newModel } : h2;
+                });
+                onChange(newRoute);
+              }
+            },
+              h("option", { value: "" }, "（选 provider）"),
+              Array.from(new Set(knownPairs.map(function (p) { return p.provider; }))).map(function (pn) {
+                return h("option", { key: pn, value: pn }, pn);
+              })),
+            h("select", {
+              value: hop.model || "",
+              style: sel,
+              onChange: function (e) {
+                var newModel = (e && e.target && e.target.value) || "";
+                var newRoute = route.map(function (h2, i) {
+                  return i === idx ? Object.assign({}, h2, { model: newModel }) : h2;
+                });
+                onChange(newRoute);
+              }
+            },
+              h("option", { value: "" }, "（选 model）"),
+              knownPairs.filter(function (p) { return p.provider === hop.provider; }).map(function (p) {
+                return h("option", { key: p.provider + "/" + p.model, value: p.model }, p.model);
+              })),
+            h("button", {
+              style: Object.assign({}, styles.button || {}, { padding: "2px 8px" }),
+              onClick: function () {
+                var newRoute = route.filter(function (_h2, i) { return i !== idx; });
+                onChange(newRoute);
+              }
+            }, "删除"));
+        });
+        var addBtn = h("button", {
+          style: styles.button,
+          onClick: function () {
+            var first = knownPairs[0] || { provider: "", model: "" };
+            onChange(route.concat([{ provider: first.provider, model: first.model }]));
+          }
+        }, "+ 添加候选");
+        return h("div", { key: "sre-" + segName, style: Object.assign({}, styles.section, { padding: "6px", border: "1px dashed #d0d7de", borderRadius: "4px", marginBottom: "6px" }) },
+          h("div", { style: styles.meta },
+            (segName === "peak" ? "峰段" : "谷段") + "候选链（" + (route || []).length + " 项）"),
+          rows.length === 0 ? h("div", { style: styles.hint }, "（空）") : rows,
+          addBtn);
       }
 
       // ---------- 派生数据 ----------
@@ -969,23 +1071,134 @@ window.__ModuleLoader__.load({
 
         // ============ 页签 2：切换规则 ============
         if (activeTab === "rules") {
-          // 时间规则时区状态（v0.5.0）：Intl 换算不依赖 IP，VPN 不直接影响；
-          // 但 VPN 可能改变系统自动定位的时区——显式固定规则时区可彻底免疫
+          // v0.5.0 沿用的时区信息保留——用于诊断 VPN 改系统时区的影响。
           var sysTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
           var cfgTz = (status.config && status.config.timeZone) || sysTz;
+          // v0.9.9（方案 §6-1 第 7 条）：峰谷定价 UI 块
+          var editTW = (edit && edit.timeWindows) || { enabled: false, peakStart: "09:00", valleyStart: "22:00", peak: { route: [] }, valley: { route: [] } };
+          var cfgTW = (status.config && status.config.timeWindows) || null;
+          // 现算当前段：复用本地判定逻辑（与 router.segmentOf 一致）
+          var curSegment = (function () {
+            if (!editTW.enabled) return null;
+            var ps = editTW.peakStart, vs = editTW.valleyStart;
+            if (typeof ps !== "string" || typeof vs !== "string") return null;
+            var opts = { hour: "2-digit", minute: "2-digit", hour12: false };
+            if (cfgTz) opts.timeZone = cfgTz;
+            var t = new Intl.DateTimeFormat("en-GB", opts).format(new Date());
+            var inPeak = (ps <= vs) ? (t >= ps && t < vs) : (t >= ps || t < vs);
+            return inPeak ? "peak" : "valley";
+          })();
+          var segBadgeColor = curSegment === "peak" ? "#1dc981" : curSegment === "valley" ? "#0969da" : "#8c959f";
+          // 已知 provider/model 候选下拉（复用既有 select 样式）
+          var knownPairs = (status.registry && Array.isArray(status.registry.providers))
+            ? status.registry.providers.reduce(function (acc, p) {
+                var pn = p.provider || p.id || p.name;
+                var models = Array.isArray(p.models) ? p.models : [];
+                models.forEach(function (m) {
+                  if (m && (m.id || m.name)) acc.push({ provider: pn, model: m.id || m.name });
+                });
+                return acc;
+              }, [])
+            : [];
           children.push(
             h("div", { key: "tzrow", style: styles.section },
               h("div", { style: styles.sectionTitle }, "时间窗口径（峰谷定价）"),
-              h("div", { style: styles.row },
-                h("span", { style: styles.meta },
-                  "规则时区 " + cfgTz + " · 当前时间 " + fmtNowInTz(cfgTz)),
-                (status.config && status.config.timeZone && sysTz !== status.config.timeZone)
-                  ? h("span", { style: styles.warn },
-                      "⚠ 系统时区 " + sysTz + " 与规则时区不一致——时间窗一律按规则时区执行，VPN 改系统时区不影响")
-                  : (!(status.config && status.config.timeZone))
-                    ? h("span", { style: styles.meta },
-                        "未显式固定——现用系统时区；若设备 VPN 可能改变系统时区，请在下方把它固定（如 Asia/Shanghai）")
-                    : null))
+              h("div", { style: styles.meta },
+                "规则时区 " + cfgTz + " · 当前时间 " + fmtNowInTz(cfgTz)),
+              // v0.9.9 新增：峰谷定价配置
+              (status.config && status.config.timeZone && sysTz !== status.config.timeZone)
+                ? h("div", { style: styles.warn },
+                    "⚠ 系统时区 " + sysTz + " 与规则时区不一致——时间窗一律按规则时区执行，VPN 改系统时区不影响")
+                : (!(status.config && status.config.timeZone))
+                  ? h("div", { style: styles.meta },
+                      "未显式固定——现用系统时区；若设备 VPN 可能改变系统时区，请在下方把它固定（如 Asia/Shanghai）")
+                  : null),
+              // v0.9.9：总开关 + 当前段指示
+              h("div", { style: Object.assign({}, styles.row, { marginTop: "8px", flexWrap: "wrap", gap: "12px" }) },
+                h("label", { style: { display: "inline-flex", alignItems: "center", gap: "4px" } },
+                  h("input", {
+                    type: "checkbox",
+                    checked: !!editTW.enabled,
+                    onChange: function (e) {
+                      var v = e && e.target && e.target.checked;
+                      setEdit(function (prev) {
+                        return prev ? Object.assign({}, prev, {
+                          timeWindows: Object.assign({}, editTW, { enabled: v === true }),
+                          dirty: true
+                        }) : prev;
+                      });
+                    }
+                  }),
+                  h("span", null, "启用峰谷定价")),
+                curSegment
+                  ? h("span", { style: Object.assign({}, styles.badge || {}, {
+                      padding: "2px 8px", borderRadius: "10px",
+                      background: segBadgeColor === "#1dc981" ? "#e8f7ec" : "#e8f2fe",
+                      color: segBadgeColor, fontSize: "12px" }) },
+                      "当前段：" + (curSegment === "peak" ? "峰" : "谷") + "（" + (editTW.peakStart || "?") + " → " + (editTW.valleyStart || "?") + "）")
+                  : null),
+              // 峰起 / 谷起（HH:MM 输入）
+              editTW.enabled
+                ? h("div", { style: Object.assign({}, styles.row, { marginTop: "6px", flexWrap: "wrap", gap: "12px" }) },
+                    h("label", { style: { display: "inline-flex", alignItems: "center", gap: "4px" } },
+                      h("span", null, "峰起"),
+                      h("input", {
+                        type: "time",
+                        value: editTW.peakStart || "09:00",
+                        onChange: function (e) {
+                          var v = (e && e.target && e.target.value) || "09:00";
+                          setEdit(function (prev) {
+                            return prev ? Object.assign({}, prev, {
+                              timeWindows: Object.assign({}, editTW, { peakStart: v }),
+                              dirty: true
+                            }) : prev;
+                          });
+                        }
+                      })),
+                    h("label", { style: { display: "inline-flex", alignItems: "center", gap: "4px" } },
+                      h("span", null, "谷起"),
+                      h("input", {
+                        type: "time",
+                        value: editTW.valleyStart || "22:00",
+                        onChange: function (e) {
+                          var v = (e && e.target && e.target.value) || "22:00";
+                          setEdit(function (prev) {
+                            return prev ? Object.assign({}, prev, {
+                              timeWindows: Object.assign({}, editTW, { valleyStart: v }),
+                              dirty: true
+                            }) : prev;
+                          });
+                        }
+                      })),
+                    // 峰谷点相同校验
+                    (editTW.peakStart === editTW.valleyStart)
+                      ? h("span", { style: styles.warn }, "⚠ 峰起与谷起不能相等（否则无完整时段覆盖）")
+                      : null)
+                : null,
+              // 峰/谷两套偏好输入（候选链编辑）
+              editTW.enabled
+                ? h("div", { style: Object.assign({}, styles.row, { marginTop: "8px", flexWrap: "wrap", gap: "10px" }) },
+                    renderSegRouteEditor("peak", editTW.peak.route, knownPairs, function (newRoute) {
+                      setEdit(function (prev) {
+                        return prev ? Object.assign({}, prev, {
+                          timeWindows: Object.assign({}, editTW, { peak: Object.assign({}, editTW.peak, { route: newRoute }) }),
+                          dirty: true
+                        }) : prev;
+                      });
+                    }),
+                    renderSegRouteEditor("valley", editTW.valley.route, knownPairs, function (newRoute) {
+                      setEdit(function (prev) {
+                        return prev ? Object.assign({}, prev, {
+                          timeWindows: Object.assign({}, editTW, { valley: Object.assign({}, editTW.valley, { route: newRoute }) }),
+                          dirty: true
+                        }) : prev;
+                      });
+                    }))
+                : null,
+              (editTW.enabled && cfgTW === null)
+                ? h("div", { style: styles.hint },
+                    "提示：当前 server 未持久化 timeWindows（首次启用需在下方「保存」生效；面板状态「未保存」会显示）。")
+                : null
           );
           children.push(
             h("div", { key: "rules", style: styles.section },
