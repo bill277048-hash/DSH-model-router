@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.9.8.1 (2026-09-16)
+
+> **测量修正版**。`context` 相改为**隔离执行**（提前到 `rpm` 相之前），消除 `rpm` 相的
+> TPM 消耗对上下文容量测量的污染。新增 `PHASE_EXEC_ORDER` / `phaseOrder`；契约顺序不变。
+> **行为变更**：`context` 相拿到容量类错误时，现在会同时跳过 `rpm` 与 `quota-group`（此前只跳后者）。
+
+### 修复 · `context` 相测量被前序相污染（问题定位）
+
+- **现象**：实机 ST-rrx（`apikey-202606301659`）/ ST-rrx199（`apikey-202608290333`）的
+  `deepseek-v4-flash` 在 `model-test` 报告中 `context` 相为「1024 ✓ / 8192 ✗ RATE_LIMIT」，
+  初看像「上下文越长越易限流」。
+- **根因**：上游错误消息（v0.9.8 起透传）为 `inference exceeds tpm/rpm limit`（code `429001`）
+  ——**是 TPM（tokens per minute）类限流，不是「输入过长」**。而 `rpm` 相是最多 4 档 × 5 样本的
+  阶梯压测，跑完已大量消耗 TPM；`context` 相排在其后，测到的「能否接受 N tokens」被前序消耗污染。
+- **佐证**：同一渠道的 `glm-5.2` 在同批测试中 `8192 ✓` 全通过——说明不是该渠道整体受限，
+  且耦合是「渠道 × 模型」级属性。
+
+### 修复 · 相间隔离
+
+- 新增 `PHASE_EXEC_ORDER = ['probe', 'context', 'rpm', 'quota-group']`（**执行顺序**）与
+  `orderPhasesForExecution(phases)` 辅助函数（均导出）。
+- `_runTarget` 改为按**执行顺序**遍历；`context` 相在 `rpm` 相之前执行，测量不再被污染。
+- **契约顺序不变**：`MODEL_TEST_PHASES`（`validatePhases` 返回值 / 面板勾选顺序 / 报告 `phases` 字段）
+  仍是 `probe → rpm → context → quota-group`，既有消费者不受影响。
+- 新增 `phaseOrder` 字段（report 级与 target 级），报告 md 显式标注「执行顺序」，
+  避免「报告里的相顺序与勾选顺序不一致」被误读为 bug。
+- `routes.js` 的 `listRunJson` 透传 `phaseOrder`，供面板历史报告渲染。
+
+### 实机 A/B 对照验证（隔离有效性的直接证据）
+
+同一渠道、同一模型、同一测试内容（`context` 相 8192 tokens），**唯一变量是执行顺序**：
+
+| 条件 | 执行顺序 | `context` 相 8192 结果 |
+| --- | --- | --- |
+| 隔离**前**（报告 `2026-09-16T00-46-57-oqdp`） | `rpm` → `context` | **8192 ✗ `RATE_LIMIT`**（`maxAccepted=1024`） |
+| 隔离**后**（本版实机复测） | `context` → `rpm` | **8192 ✓**（`maxAccepted=8192`） |
+
+- 目标：`apikey-202606301659`（ST-rrx）/ `deepseek-v4-flash`
+- 结论：**此前的 8192 失败源于前序 `rpm` 相的 TPM 消耗，与「上下文长度」无关**。
+  这也构成「不把上下文长度作为独立限制维度」的实证依据（见方向性方案 4.7 第 2 点）。
+- 附：同批验证 `report.phases=["rpm","context"]`（契约序）而 `report.phaseOrder=["context","rpm"]`（执行序），
+  两者分离符合设计。
+
+### 变更 · 短路语义更保守
+
+- `context` 相位于 `rpm` 之前后，其短路影响范围扩大：拿到 `CONTEXT_LENGTH` / `CONTEXT_WINDOW` /
+  `TOO_MANY_TOKENS` 时，现在会跳过 `rpm` **与** `quota-group`（此前只跳 `quota-group`）。
+- **语义上更合理**：模型容量都不够，测速率无意义。
+
+### 变更 · `skipped` 顺序规范化
+
+- `skipped` 收集时按执行序 push，`_finalize` 现按**契约顺序**重排，与 `phases` / `notSelected`
+  三者同序，便于面板对照展示（`skipReasons` 是对象，顺序无关）。
+
+### 单测
+
+- 154 → **156**（新增 2 条）：
+  - 「`context` 相隔离执行（在 `rpm` 之前）」——断言执行序、契约序不变、`phaseOrder` 记录正确、
+    `orderPhasesForExecution` 对子集同样按执行序排列。
+  - 「短路语义随执行序变化」——断言 `context` 容量类错误现在跳 `rpm` + `quota-group`。
+- 既有 2 条断言随执行序更新（`called` 顺序）。
+- **突变验证**：把 `PHASE_EXEC_ORDER` 改回契约顺序（即取消隔离）→ 4 条用例变红；
+  还原后 156/156。
+
+### 未做的
+
+- **未改** `MODEL_TEST_PHASES`（契约顺序）——避免破坏面板与既有 API 消费者。
+- **未扩展** `context` 相粒度（仍是 1024 / 8192 两档）——隔离后精度问题降级，
+  容量上限探测排在 v1.x（见方向性方案 6-C）。
+
 ## 0.9.8 (2026-09-16)
 
 > **诊断可见 + 测试精度提升**。6 项面板/链路改进；含 1 项独立 phase 选择 + 1 项退避重试 +

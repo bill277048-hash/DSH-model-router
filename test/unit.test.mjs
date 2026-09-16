@@ -20,7 +20,7 @@ import { ProbeBoard, computeTrmBound, singleRaw } from '../lib/probe.js';
 import { loadState, saveState } from '../lib/store.js';
 import { dayKeyOf, stabilityGrade, DailyLedger, DailyReporter, DailyScheduler, formatReportMarkdown } from '../lib/daily.js';
 import { WindowLedger, QuotaLedger, deriveWindowId } from '../lib/quota.js';
-import { ModelTestRunner, validateModelTestTargets, validateManualInput, validatePhases, MODEL_TEST_PHASES, verdictOf, formatReportMarkdown as formatModelTestMd, manualWarnings } from '../lib/model-test.js';
+import { ModelTestRunner, validateModelTestTargets, validateManualInput, validatePhases, MODEL_TEST_PHASES, PHASE_EXEC_ORDER, orderPhasesForExecution, verdictOf, formatReportMarkdown as formatModelTestMd, manualWarnings } from '../lib/model-test.js';
 
 // ---------- mock 工具 ----------
 
@@ -3262,17 +3262,66 @@ test('v0.9.8: model-test——短路表行为（凭据类全停 / RATE_LIMIT 不
   assert.ok(cred.target.skipReasons.rpm.includes('INVALID_CREDENTIAL'), 'skipReasons 带错误码');
   assert.equal(cred.target.phaseErrors.probe.errorCode, 'INVALID_CREDENTIAL', 'phaseErrors 落错误码');
 
-  // 2) RATE_LIMIT 不在短路表 → 继续跑满
+  // 2) RATE_LIMIT 不在短路表 → 继续跑满（执行序：probe→context→rpm→quota-group）
   const rate = await runWithProbe({ ok: false, errorCode: 'RATE_LIMIT', errorMessage: '429 too many', retries: 0 });
-  assert.deepEqual(rate.called, ['probe', 'rpm', 'context', 'quota-group'], 'RATE_LIMIT 不短路');
+  assert.deepEqual(rate.called, ['probe', 'context', 'rpm', 'quota-group'], 'RATE_LIMIT 不短路');
   assert.deepEqual(rate.target.skipped, [], 'skipped 为空');
   assert.equal(rate.target.phaseErrors.probe.errorCode, 'RATE_LIMIT', '仍记录错误码');
 
   // 3) probe 正常 → 全跑、无 skipped
   const ok = await runWithProbe({ ok: true, errorCode: null, errorMessage: null, retries: 0 });
-  assert.deepEqual(ok.called, ['probe', 'rpm', 'context', 'quota-group'], '正常全跑');
+  assert.deepEqual(ok.called, ['probe', 'context', 'rpm', 'quota-group'], '正常全跑');
   assert.deepEqual(ok.target.skipped, [], 'skipped 为空');
   assert.deepEqual(ok.target.phaseErrors, {}, 'phaseErrors 为空');
+});
+
+test('v0.9.8.1: model-test——context 相隔离执行（在 rpm 之前）', async () => {
+  const called = [];
+  const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+  runner._phaseProbe = async () => { called.push('probe'); return { ok: true, ttftMs: 1, errorCode: null, errorMessage: null, retries: 0 }; };
+  runner._phaseRpm = async () => { called.push('rpm'); return { lastOkRpm: 0.1, first429Rpm: null, firstError: null, ladder: [] }; };
+  runner._phaseContext = async () => { called.push('context'); return { sizes: [], maxAccepted: 0, firstError: null }; };
+  runner._phaseQuotaGroup = async () => { called.push('quota-group'); return { quotaGroup: null, members: [], firstError: null }; };
+
+  const report = await runner.run([{ provider: 'p', model: 'm', tier: 'free' }], { recoveryMs: 0 });
+  const t = report.targets[0];
+
+  // 核心不变式：context 必须在 rpm 之前执行（否则 rpm 的 TPM 消耗会污染容量测量）
+  assert.ok(called.indexOf('context') < called.indexOf('rpm'),
+    `context 应在 rpm 之前执行（实际顺序 ${called.join('→')}）`);
+
+  // 契约顺序不变：phases 仍是 MODEL_TEST_PHASES 的顺序，供面板/报告展示
+  assert.deepEqual(t.phases, MODEL_TEST_PHASES, 'phases 保持契约顺序');
+  assert.deepEqual(report.phases, MODEL_TEST_PHASES, 'report.phases 保持契约顺序');
+  // 执行顺序单独记录，且与契约顺序不同
+  assert.deepEqual(t.phaseOrder, PHASE_EXEC_ORDER, 'target.phaseOrder 记录执行顺序');
+  assert.deepEqual(report.phaseOrder, PHASE_EXEC_ORDER, 'report.phaseOrder 记录执行顺序');
+  assert.notDeepEqual(PHASE_EXEC_ORDER, MODEL_TEST_PHASES, '执行顺序与契约顺序刻意不同');
+
+  // orderPhasesForExecution 对子集同样按执行序排列
+  assert.deepEqual(orderPhasesForExecution(['rpm', 'context']), ['context', 'rpm'],
+    '子集也按执行序排列（context 在前）');
+  assert.deepEqual(orderPhasesForExecution(['probe']), ['probe']);
+});
+
+test('v0.9.8.1: model-test——短路语义随执行序变化（context 失败现会跳 rpm）', async () => {
+  const called = [];
+  const runner = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+  runner._phaseProbe = async () => { called.push('probe'); return { ok: true, ttftMs: 1, errorCode: null, errorMessage: null, retries: 0 }; };
+  runner._phaseRpm = async () => { called.push('rpm'); return { lastOkRpm: 0.1, first429Rpm: null, firstError: null, ladder: [] }; };
+  // context 相返回容量类错误 → 应短路掉后续的 rpm 与 quota-group
+  runner._phaseContext = async () => {
+    called.push('context');
+    return { sizes: [{ tokens: 1024, ok: false, errorCode: 'CONTEXT_LENGTH' }], maxAccepted: 0, firstError: { errorCode: 'CONTEXT_LENGTH', errorMessage: 'too long' } };
+  };
+  runner._phaseQuotaGroup = async () => { called.push('quota-group'); return { quotaGroup: null, members: [], firstError: null }; };
+
+  const report = await runner.run([{ provider: 'p', model: 'm', tier: 'free' }], { recoveryMs: 0 });
+  const t = report.targets[0];
+  // 隔离前：context 在最后，短路只能跳 quota-group；隔离后：context 在中间，短路跳 rpm + quota-group
+  assert.deepEqual(called, ['probe', 'context'], 'context 失败后不再跑 rpm/quota-group');
+  assert.deepEqual(t.skipped, ['rpm', 'quota-group'], 'rpm 与 quota-group 记入 skipped');
+  assert.ok(t.skipReasons.rpm.includes('CONTEXT_LENGTH'), 'skipReasons 带容量错误码');
 });
 
 test('v0.9.8: model-test——报告落 errorMessage（formatReportMarkdown / _finalize）', () => {
@@ -3340,7 +3389,8 @@ test('v0.9.8: model-test——phases 缺省全跑；自定义子集只跑指定�
   };
   const all = makeRunner();
   const allReport = await all.runner.run([{ provider: 'p', model: 'm', tier: 'free' }], { recoveryMs: 0 });
-  assert.deepEqual(all.called, ['probe', 'rpm', 'context', 'quota-group']);
+  // v0.9.8.1：执行序为 probe→context→rpm→quota-group（context 隔离到 rpm 之前）
+  assert.deepEqual(all.called, ['probe', 'context', 'rpm', 'quota-group']);
   assert.deepEqual(allReport.targets[0].phases, MODEL_TEST_PHASES);
   assert.deepEqual(allReport.targets[0].notSelected, []);
   assert.deepEqual(allReport.targets[0].skipped, []);
