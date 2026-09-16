@@ -3632,3 +3632,208 @@ test('v0.9.9.1: archive——writeAtomic 原子写（tmp 不残留）', async ()
   }
 });
 
+test('v0.9.9.2: archive——resolveArchiveDir 优先 reports.dir，否则默认目录', async () => {
+  const { resolveArchiveDir, defaultArchiveDir } = await import('../lib/archive.js');
+  assert.equal(resolveArchiveDir({ reports: { dir: '/tmp/custom-dir' } }), '/tmp/custom-dir');
+  assert.equal(resolveArchiveDir({ reports: {} }), defaultArchiveDir(), 'reports.dir 缺失 → 默认');
+  assert.equal(resolveArchiveDir({}), defaultArchiveDir(), '无 reports → 默认');
+  assert.equal(resolveArchiveDir(undefined), defaultArchiveDir(), '无 cfg → 默认');
+  assert.equal(resolveArchiveDir({ reports: { dir: '' } }), defaultArchiveDir(), '空字符串 → 默认');
+  // 默认目录与 daily.js 一致
+  assert.ok(defaultArchiveDir().endsWith('dsh-model-router-reports'));
+});
+
+// ============================================================
+// v0.9.9.2 Task 3：loadtest 落盘
+// ============================================================
+
+test('v0.9.9.2 Task3: loadtest——跑 phase 后落盘含 kind/schemaVersion/runId', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-lt-'));
+  try {
+    const llm = probeLlm({
+      'm-free': async function* () {
+        yield { type: 'text-delta', index: 0, text: 'pong' };
+        yield finishStop;
+      },
+    });
+    const registry = { registeredPairs: () => [{ provider: 'p-a', model: 'm-free', tier: 'free' }] };
+    const runner = new LoadTestRunner({ llm, registry, log, reportDir: dir });
+
+    await runner.run('probe');
+
+    const files = readdirSync(dir).filter((n) => n.endsWith('.loadtest.json'));
+    assert.equal(files.length, 1, '落盘 1 份 loadtest 档案');
+    const raw = JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+    assert.equal(raw.kind, 'loadtest');
+    assert.equal(raw.schemaVersion, 1);
+    assert.equal(raw.runId, runner.runId);
+    assert.deepEqual(raw.phases, ['probe'], 'phases 含已完成的 phase');
+    assert.ok(raw.results.probe, 'results 含 probe 结果');
+    assert.equal(typeof raw.elapsedMs, 'number');
+    assert.ok(raw.startedAt && raw.finishedAt);
+    // 无 md（loadtest 只落 json）
+    assert.equal(readdirSync(dir).filter((n) => n.endsWith('.loadtest.md')).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.2 Task3: loadtest——多 phase 覆盖同一档案（累积不新增）', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-lt2-'));
+  try {
+    const llm = probeLlm({
+      'm-free': async function* () {
+        yield { type: 'text-delta', index: 0, text: 'pong' };
+        yield finishStop;
+      },
+    });
+    const registry = { registeredPairs: () => [{ provider: 'p-a', model: 'm-free', tier: 'free' }] };
+    const runner = new LoadTestRunner({ llm, registry, log, reportDir: dir });
+
+    await runner.run('probe');
+    await runner.run('context');
+
+    const files = readdirSync(dir).filter((n) => n.endsWith('.loadtest.json'));
+    assert.equal(files.length, 1, '仍是 1 份（覆盖写，非每 phase 一份）');
+    const raw = JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+    assert.deepEqual(raw.phases.sort(), ['context', 'probe'], '两个 phase 均累积在同一档案');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.2 Task3: loadtest——reportDir=null 不落盘且不抛错', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const llm = probeLlm({
+    'm-free': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'pong' };
+      yield finishStop;
+    },
+  });
+  const registry = { registeredPairs: () => [{ provider: 'p-a', model: 'm-free', tier: 'free' }] };
+  const runner = new LoadTestRunner({ llm, registry, log }); // 无 reportDir
+  assert.equal(runner.reportDir, null);
+  const result = await runner.run('probe');
+  assert.equal(result.phase, 'probe', '跑批仍正常返回');
+});
+
+test('v0.9.9.2 Task3: loadtest——落盘失败不阻塞跑批（reportDir 不可写）', async () => {
+  const { LoadTestRunner } = await import('../lib/loadtest.js');
+  const llm = probeLlm({
+    'm-free': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'pong' };
+      yield finishStop;
+    },
+  });
+  const registry = { registeredPairs: () => [{ provider: 'p-a', model: 'm-free', tier: 'free' }] };
+  // 用一个「父路径是文件」的非法目录 → mkdirSync 必失败
+  const runner = new LoadTestRunner({ llm, registry, log, reportDir: '/dev/null/not-a-dir' });
+  const result = await runner.run('probe');
+  assert.equal(result.phase, 'probe', '落盘失败仍返回跑批结果');
+});
+
+// ============================================================
+// v0.9.9.2 Task 4：probe 落盘
+// ============================================================
+
+test('v0.9.9.2 Task4: probe——runAll 后落盘含 kind/schemaVersion/entries', async () => {
+  const { ProbeBoard } = await import('../lib/probe.js');
+  const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pb-'));
+  try {
+    const llm = probeLlm({
+      'm-free': async function* () {
+        yield { type: 'text-delta', index: 0, text: 'pong' };
+        yield finishStop;
+      },
+    });
+    const board = new ProbeBoard(log, { timeoutMs: 2000, reportDir: dir });
+    await board.runAll(llm, [{ provider: 'p-a', model: 'm-free' }]);
+
+    const files = readdirSync(dir).filter((n) => n.endsWith('.probe.json'));
+    assert.equal(files.length, 1, '落盘 1 份 probe 档案');
+    const raw = JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+    assert.equal(raw.kind, 'probe');
+    assert.equal(raw.schemaVersion, 1);
+    assert.equal(raw.runId, board.runId);
+    assert.equal(raw.targetCount, 1);
+    assert.ok(raw.entries['p-a/m-free'], 'entries 含探测记录');
+    // _record 记录的是聚合结构（非单次 rec）：status/total/success
+    assert.equal(raw.entries['p-a/m-free'].status, 'up', '成功探测 → status=up');
+    assert.equal(raw.entries['p-a/m-free'].total, 1);
+    assert.equal(raw.entries['p-a/m-free'].success, 1);
+    // 只落 json（无 md）
+    assert.equal(readdirSync(dir).filter((n) => n.endsWith('.probe.md')).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.2 Task4: probe——多轮覆盖同一档案；reportDir=null 不落盘', async () => {
+  const { ProbeBoard } = await import('../lib/probe.js');
+  const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pb2-'));
+  try {
+    const llm = probeLlm({
+      'm-free': async function* () {
+        yield { type: 'text-delta', index: 0, text: 'pong' };
+        yield finishStop;
+      },
+    });
+    const board = new ProbeBoard(log, { timeoutMs: 2000, reportDir: dir });
+    await board.runAll(llm, [{ provider: 'p-a', model: 'm-free' }]);
+    await board.runAll(llm, [{ provider: 'p-a', model: 'm-free' }]);
+    const files = readdirSync(dir).filter((n) => n.endsWith('.probe.json'));
+    assert.equal(files.length, 1, '多轮仍是 1 份（覆盖写，避免磁盘无界堆积）');
+
+    // 无 reportDir → 不落盘
+    const board2 = new ProbeBoard(log, { timeoutMs: 2000 });
+    assert.equal(board2.reportDir, null);
+    await board2.runAll(llm, [{ provider: 'p-a', model: 'm-free' }]);
+    assert.equal(readdirSync(dir).filter((n) => n.endsWith('.probe.json')).length, 1, 'board2 未落盘');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.2 Task4: probe——runAll 重入保护仍生效（running 时直接返回）', async () => {
+  const { ProbeBoard } = await import('../lib/probe.js');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pb3-'));
+  try {
+    const llm = probeLlm({
+      'm-free': async function* () {
+        yield { type: 'text-delta', index: 0, text: 'pong' };
+        yield finishStop;
+      },
+    });
+    const board = new ProbeBoard(log, { timeoutMs: 2000, reportDir: dir });
+    board.running = true; // 模拟进行中
+    await board.runAll(llm, [{ provider: 'p-a', model: 'm-free' }]);
+    assert.equal(llm.calls.length, 0, '重入时不发请求');
+    // 重入直接 return → 不落盘（running 仍为 true，未进 finally）
+    assert.equal(board.running, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

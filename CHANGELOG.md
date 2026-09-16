@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.9.3 (2026-09-16)
+
+> **loadtest / probe 结果落盘**（v0.9.9 收口 Task 3 + 4）。三类档案
+> （model-test / loadtest / probe）至此全部落盘，统一 `kind` + `schemaVersion`。
+> 零破坏性变更。
+
+### 改进 · `loadtest` 结果落盘（Task 3）
+
+- `LoadTestRunner` 构造新增 `reportDir`（由 `index.js` 用 `archive.resolveArchiveDir(cfg)` 注入）
+- **每个 phase 跑完落盘一次**（`run()` 的 `finally` —— 即使 phase 抛错也落盘已完成部分）
+- **实例级 `runId` + 覆盖写**：loadtest 是用户逐 phase 手动触发的（POST 逐个 phase），
+  累积成一份「完整负载测试报告」比每 phase 一份更符合直觉
+- 档案内容：`kind` / `schemaVersion` / `runId` / `startedAt` / `finishedAt` / `elapsedMs` /
+  `aborted` / `phases`（已完成列表）/ `results`（各 phase 结果）
+- **只落 json**（无 md）
+
+### 改进 · `probe` 健康快照落盘（Task 4）
+
+- `ProbeBoard` 构造新增 `reportDir`（同 Task 3 注入方式）
+- **一轮探测完成落盘一次**（`runAll()` 的 `finally`）
+- **实例级 `runId` + 覆盖写**：探测是周期高频的（默认 300s 一轮），每轮一份会**无界堆积磁盘**；
+  健康快照的价值在「当前状态」，故覆盖写
+- 档案内容：`kind` / `schemaVersion` / `runId` / `startedAt` / `finishedAt` / `elapsedMs` /
+  `targetCount` / `enabled` / `entries` / `benchmarks`
+- **只落 json**（probe 是快照数据，md 价值低 —— 方案 Open Question 3）
+
+### 新增 · `archive.resolveArchiveDir(cfg)`
+
+- 优先 `cfg.reports.dir`，否则 `~/Documents/dsh-model-router-reports`（与 `lib/daily.js:77` 一致）
+- **不依赖 `reports.enabled`** —— 那是「每日报告」开关，与档案落盘是两回事：
+  用户可能不开每日报告，但仍希望跑批结果落盘可见
+
+### 单测
+
+- 170 → **178**（+8 条）：
+  - `resolveArchiveDir` 四种入参（有 dir / 无 dir / 无 reports / 无 cfg / 空字符串）
+  - loadtest：跑 phase 后落盘含 `kind`/`schemaVersion`/`runId`；多 phase 覆盖同一档案（累积不新增）；
+    `reportDir=null` 不落盘不抛错；落盘失败不阻塞跑批
+  - probe：`runAll` 后落盘含 `kind`/`schemaVersion`/`entries`；多轮覆盖同一档案；
+    `reportDir=null` 不落盘；重入保护仍生效
+- **突变验证**（4 组全有效）：
+  - loadtest 不写 `kind` → 1 条变红
+  - loadtest 不在 `finally` 落盘 → 2 条变红
+  - probe 不写 `schemaVersion` → 1 条变红
+  - probe 每轮新 `runId`（破坏覆盖写）→ 1 条变红
+  - 还原 → 178/178
+
+### 修正的测试误判（记录）
+
+初版 probe 落盘测试断言 `entries['p/a'].ok === true` —— 实测 `undefined`。
+核实 `ProbeBoard._record`（`lib/probe.js:178`）：它把单次 rec 转成**聚合结构**
+（`{total, success, consecutiveFails, status, ttfts, ...}`），**无 `ok` 字段**。
+**是测试断言写错，非实现错** —— 改为断言 `status === 'up'` / `total === 1` / `success === 1`。
+
 ## 0.9.9.2 (2026-09-16)
 
 > **档案统一 schema + 消除三套重复实现**。新增 `lib/archive.js` 公共模块；
