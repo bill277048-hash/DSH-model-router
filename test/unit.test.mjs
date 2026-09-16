@@ -3552,3 +3552,83 @@ test('v0.9.9: normalizeState 透传 timeWindows；normalizeConfig 拒非对象',
   assert.throws(() => normalizeConfig({ timeWindows: 'bad' }), /须为对象/);
 });
 
+// ============================================================
+// v0.9.9.1 Task 2：档案统一 schema（lib/archive.js）
+// ============================================================
+
+test('v0.9.9.1: archive——archiveName 生成 <runId>.<kind>.<ext>；非法 kind 抛错', async () => {
+  const { archiveName, ARCHIVE_KINDS } = await import('../lib/archive.js');
+  assert.deepEqual(ARCHIVE_KINDS, ['model-test', 'loadtest', 'probe']);
+  assert.equal(archiveName('run-1', 'model-test', 'json'), 'run-1.model-test.json');
+  assert.equal(archiveName('run-1', 'loadtest', 'md'), 'run-1.loadtest.md');
+  assert.equal(archiveName('run-1', 'probe', 'json'), 'run-1.probe.json');
+  assert.throws(() => archiveName('run-1', 'bogus', 'json'), /kind 须为/);
+});
+
+test('v0.9.9.1: archive——kindOfFilename 反向解析（白名单外返回 null）', async () => {
+  const { kindOfFilename } = await import('../lib/archive.js');
+  assert.equal(kindOfFilename('run-1.model-test.json'), 'model-test');
+  assert.equal(kindOfFilename('run-1.loadtest.json'), 'loadtest');
+  assert.equal(kindOfFilename('run-1.probe.json'), 'probe');
+  // 非档案文件 → null（防止把 .ndjson / .report.md 当日志）
+  assert.equal(kindOfFilename('2026-09-16.ndjson'), null);
+  assert.equal(kindOfFilename('2026-09-16.report.md'), null);
+  assert.equal(kindOfFilename('run-1.model-test.md'), null, 'md 不算档案（json 才是）');
+  assert.equal(kindOfFilename('run-1.bogus.json'), null);
+});
+
+test('v0.9.9.1: archive——persistReport 落盘含 kind/schemaVersion；失败不抛错', async () => {
+  const { persistReport, KIND_SCHEMA_VERSION } = await import('../lib/archive.js');
+  const { mkdtempSync, readFileSync, rmSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-archive-test-'));
+  try {
+    // 正常落盘
+    const r = persistReport(dir, {
+      runId: 'r1', kind: 'model-test',
+      jsonBody: JSON.stringify({ kind: 'model-test', schemaVersion: KIND_SCHEMA_VERSION, runId: 'r1' }, null, 2),
+      mdBody: '# md\n',
+    }, {});
+    assert.ok(r && r.jsonTarget, '返回 jsonTarget');
+    assert.ok(r.mdTarget, '返回 mdTarget');
+    assert.ok(existsSync(r.jsonTarget), 'json 文件存在');
+    assert.ok(existsSync(r.mdTarget), 'md 文件存在');
+    const raw = JSON.parse(readFileSync(r.jsonTarget, 'utf8'));
+    assert.equal(raw.kind, 'model-test');
+    assert.equal(raw.schemaVersion, 1);
+
+    // probe 类无 md
+    const r2 = persistReport(dir, { runId: 'r2', kind: 'probe', jsonBody: '{}' }, {});
+    assert.ok(r2.jsonTarget);
+    assert.equal(r2.mdTarget, undefined, 'probe 无 md');
+
+    // 参数不全 → null（不抛错）
+    assert.equal(persistReport(dir, { kind: 'model-test' }, {}), null, '缺 runId → null');
+    assert.equal(persistReport(dir, { runId: 'r3' }, {}), null, '缺 kind → null');
+    assert.equal(persistReport(dir, { runId: 'r3', kind: 'bogus', jsonBody: '{}' }, {}), null, '非法 kind → null');
+    assert.equal(persistReport(null, { runId: 'r3', kind: 'probe', jsonBody: '{}' }, {}), null, '无 dir → null');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.1: archive——writeAtomic 原子写（tmp 不残留）', async () => {
+  const { writeAtomic } = await import('../lib/archive.js');
+  const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-atomic-test-'));
+  try {
+    const target = join(dir, 'x.json');
+    writeAtomic(target, '{"a":1}', {});
+    assert.equal(readFileSync(target, 'utf8'), '{"a":1}');
+    const leftovers = readdirSync(dir).filter((n) => n.includes('.tmp-'));
+    assert.deepEqual(leftovers, [], '无 .tmp 残留');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

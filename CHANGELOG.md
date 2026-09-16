@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.9.2 (2026-09-16)
+
+> **档案统一 schema + 消除三套重复实现**。新增 `lib/archive.js` 公共模块；
+> 三类档案（model-test / loadtest / probe）落盘统一带 `kind` + `schemaVersion`。
+> 零破坏性变更（旧档案读取端自动回退 `kind='model-test'`）。
+
+### 新增 · `lib/archive.js`（档案公共模块）
+
+- `ARCHIVE_KINDS = ['model-test','loadtest','probe']` 白名单
+- `KIND_SCHEMA_VERSION = 1`
+- `archiveName(runId, kind, ext)` → `<runId>.<kind>.<ext>`（非法 kind 抛错）
+- `kindOfFilename(name)` → 反向解析（白名单外返回 `null`）
+- `writeAtomic(target, content, log)` → 原子写（.tmp + rename）
+- `persistReport(reportDir, {runId, kind, jsonBody, mdBody}, log)` → 统一落盘，
+  失败/参数不全返回 `null`（不阻塞跑批）
+
+### 修复 · 消除三套重复的原子写实现
+
+本仓库此前有**三处**独立实现同一逻辑：
+
+| 位置 | 函数 | 处置 |
+| --- | --- | --- |
+| `lib/model-test.js:657` | `writeAtomic`（私有） | 删除，改用 `archive.writeAtomic` |
+| `lib/routes.js:993` | `writeFileSyncAtomic` | 删除，改用 `archive.writeAtomic` |
+| `lib/archive.js` | `writeAtomic`（新） | 唯一实现 |
+
+同时消除 `lib/model-test.js:persistReport` 与 `lib/routes.js:persistModelTestDir`
+的**两套落盘逻辑**——现统一走 `archive.persistReport`。
+
+> **顺带修正的不一致**：原 `model-test.js:persistReport` 的 JSON 里含 `file` 字段
+> （`{...report, file: jsonTarget}`），而 `routes.js:persistModelTestDir` 不含——
+> 两条路径产出格式不一致（既有缺陷）。统一后**均不含** `file`（该字段无人消费，已 grep 确认）。
+> 注：`report.file` / `report.md` 运行时字段**仍回置**（契约不变）。
+
+### 改进 · 档案统一 schema
+
+- `model-test` 落盘顶层加 `kind: 'model-test'` + `schemaVersion: 1`
+  （两条路径：`lib/model-test.js:runReport` 与 `lib/routes.js:/model-test` 端点）
+- **向后兼容**：旧档案无 `kind` → 读取端按 `'model-test'` 处理（`kindOfFilename` 返回 `null` 时由调用方兜底）
+
+### 单测
+
+- 166 → **170**（+4 条）：
+  - `archiveName` 命名 + 非法 kind 抛错
+  - `kindOfFilename` 反向解析（`.ndjson` / `.report.md` / `.model-test.md` 均返回 `null`）
+  - `persistReport` 落盘含 `kind`/`schemaVersion`；参数不全/非法 kind 返回 `null` 不抛错；probe 类无 md
+  - `writeAtomic` 原子写（无 `.tmp` 残留）
+- **突变验证**：
+  - `kindOfFilename` 白名单失效 → 1 条变红
+  - `archiveName` 不校验 kind → 1 条变红
+  - 同时移除 `persistReport` + `archiveName` 的白名单（组合突变）→ 2 条变红
+  - 还原 → 170/170
+  - 注：单独移除 `persistReport` 白名单是**等价突变**（`archiveName` 为第二道防线）
+
 ## 0.9.9.1 (2026-09-16)
 
 > **修一个 P0 + 段列上线**。行为变更：空 `provider` / `model` 不再被
