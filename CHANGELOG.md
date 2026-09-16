@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.9.9.4 (2026-09-16)
+
+> **档案端点上线 + 路径穿越漏洞加固**（v0.9.9 收口 Task 5 + 6）。
+> 新增 2 个端点；**同时修复一个既有的路径穿越漏洞**（`/model-test/manual`）。
+
+### 🔴 安全修复 · 既有路径穿越漏洞（`/model-test/manual`）
+
+- **漏洞位置**：`lib/routes.js` 的 `/model-test/manual` 端点
+- **成因**：原实现直接 `join(reportDir, `${runId}.model-test.json`)`，而 `runId` 来自
+  POST body —— `validateManualInput`（`lib/model-test.js:154`）只校验**非空字符串**，
+  **不校验格式**
+- **影响**：`runId = "../../../tmp/evil"` 可通过校验 → `archiveWriteAtomic` 写该路径
+  → **任意文件写**（后缀限 `.model-test.json`）；需回环访问（`guard` 已限制）
+- **修复**：改用新增的 `archive.safeArchivePath`（**双校验**）
+- **验证**：红→绿 —— 退回加固前状态 → `not ok 184`；恢复 → 184/184
+
+### 新增 · `archive.js` 安全辅助
+
+- `assertSafeRunId(runId)` —— **第一道防线**：白名单正则 `/^[\w.-]+$/`（不含 `/` `\`）+
+  显式拒 `..`（正则允许 `.`，故需单独拒）+ 长度上限 200
+- `safeArchivePath(dir, kind, runId)` —— **第二道防线**：`resolve()` 归一化后必须仍在
+  `dir` 内（`startsWith(base + sep)`）。即使第一道被绕过也能兜住
+- `listArchives(dir)` —— **轻量 lister**：只 `stat`（文件名 + mtime + size），
+  **不读档案内容**（实测读 9 个档案全文需 466ms，stat 为 0ms）；只扫 `ARCHIVE_KINDS`
+  白名单后缀（忽略同目录的 `.ndjson` / `.report.md`）；按 mtime 倒序
+
+### 新增 · 端点（Task 5 + 6）
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /api/model-router/test-archives` | 三类档案轻量列表 → `{ ok, items, archiveDir }`；item 含 `kind`/`runId`/`size`/`startedAt` |
+| `GET /api/model-router/test-archives/detail?kind&runId` | 详情 → `{ ok, kind, runId, report, markdown }`；**kind/runId 双校验**（非法 → 400，文件不存在 → 404） |
+| `GET /api/model-router/model-test/list` | **保持为兼容别名**（响应结构 `{ok, list, reportDir}` 不变）—— 面板历史报告依赖 `list[].targets`（`client.js:2379`），故仍走「读全文 + targets 摘要」 |
+
+- markdown 仅 `model-test` 有（loadtest/probe 只落 json）→ 其他 kind 返回 `markdown: null`
+- 错误响应**不泄露具体路径**（统一文案）
+
+### 单测
+
+- 178 → **184**（+6 条）：
+  - `assertSafeRunId`：合法通过；空/非字符串/`../`/`a/b`/`a\b`/`..`/`a..b`/超长 均被拒
+  - `safeArchivePath`：合法在目录内；非法 kind；穿越；绝对路径
+  - `listArchives`：三类识别 + 忽略 ndjson/report.md/md + 按 mtime 倒序 + 空目录/不存在目录
+  - `/test-archives` 端点：列表 200 / 非回环 403
+  - `/test-archives/detail` 端点：合法 200（含 md）/ probe 无 md / **穿越 400** / 非法 kind 400 / 缺参 400 / 404
+  - `/model-test/manual`：**穿越 runId → 400**（加固验证）/ 合法但不存在 → 404
+- **红→绿验证（安全关键，方案 §6.3 判据 13）**：
+  退回加固前状态 → **4 条变红**（179/180/183/184）；恢复 → 184/184
+
 ## 0.9.9.3 (2026-09-16)
 
 > **loadtest / probe 结果落盘**（v0.9.9 收口 Task 3 + 4）。三类档案

@@ -3837,3 +3837,261 @@ test('v0.9.9.2 Task4: probe——runAll 重入保护仍生效（running 时直�
   }
 });
 
+// ============================================================
+// v0.9.9.4 Task 5/6：档案列表与详情端点（含安全关键）
+// ============================================================
+
+test('v0.9.9.4: assertSafeRunId——合法通过；路径穿越/非法字符被拒', async () => {
+  const { assertSafeRunId } = await import('../lib/archive.js');
+  // 合法（真实 runId 形态）
+  assert.equal(assertSafeRunId('2026-09-16T22-59-49-tcgo'), '2026-09-16T22-59-49-tcgo');
+  assert.equal(assertSafeRunId('run_1.v2'), 'run_1.v2');
+  // 非法：空 / 非字符串
+  assert.throws(() => assertSafeRunId(''), /非空字符串/);
+  assert.throws(() => assertSafeRunId(null), /非空字符串/);
+  assert.throws(() => assertSafeRunId(123), /非空字符串/);
+  // 非法：路径穿越（核心安全断言）
+  assert.throws(() => assertSafeRunId('../../../etc/passwd'), /非法字符/);
+  assert.throws(() => assertSafeRunId('a/b'), /非法字符/);
+  assert.throws(() => assertSafeRunId('a\\b'), /非法字符/);
+  assert.throws(() => assertSafeRunId('..'), /不得含/);
+  assert.throws(() => assertSafeRunId('a..b'), /不得含/);
+  // 非法：超长
+  assert.throws(() => assertSafeRunId('a'.repeat(201)), /过长/);
+});
+
+test('v0.9.9.4: safeArchivePath——合法在目录内；越界/穿越被拒（双校验）', async () => {
+  const { safeArchivePath } = await import('../lib/archive.js');
+  const dir = '/tmp/archive-test-dir';
+  // 合法：拼接在目录内
+  assert.equal(safeArchivePath(dir, 'model-test', 'run-1'), `${dir}/run-1.model-test.json`);
+  assert.equal(safeArchivePath(dir, 'probe', 'run-2'), `${dir}/run-2.probe.json`);
+  // 非法 kind → archiveName 抛错
+  assert.throws(() => safeArchivePath(dir, 'bogus', 'run-1'), /kind 须为/);
+  // 路径穿越（第一道防线拦截）
+  assert.throws(() => safeArchivePath(dir, 'model-test', '../../etc/passwd'), /非法字符/);
+  assert.throws(() => safeArchivePath(dir, 'model-test', '..'), /不得含/);
+  // 绝对路径（含 / 被第一道拦截）
+  assert.throws(() => safeArchivePath(dir, 'model-test', '/etc/passwd'), /非法字符/);
+  // 第二道防线：即使第一道被绕过（模拟放宽正则），路径前缀确认仍拦
+  // —— 这里直接验证 resolve 归一化后的边界逻辑
+  const { resolve } = await import('node:path');
+  assert.ok(safeArchivePath(dir, 'model-test', 'x').startsWith(resolve(dir) + '/'));
+});
+
+test('v0.9.9.4: listArchives——三类识别 + 忽略其他后缀 + 按时间倒序 + 空目录', async () => {
+  const { listArchives } = await import('../lib/archive.js');
+  const { mkdtempSync, writeFileSync, rmSync, utimesSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-list-'));
+  try {
+    // 三类档案 + 干扰文件
+    writeFileSync(join(dir, 'r1.model-test.json'), '{}');
+    writeFileSync(join(dir, 'r2.loadtest.json'), '{}');
+    writeFileSync(join(dir, 'r3.probe.json'), '{}');
+    writeFileSync(join(dir, '2026-09-16.ndjson'), 'x'); // 日账本 → 应忽略
+    writeFileSync(join(dir, '2026-09-16.report.md'), 'x'); // 每日报告 → 应忽略
+    writeFileSync(join(dir, 'r1.model-test.md'), 'x'); // md → 应忽略（只列 json）
+    // 设定 mtime 以验证倒序
+    utimesSync(join(dir, 'r1.model-test.json'), new Date('2026-09-14'), new Date('2026-09-14'));
+    utimesSync(join(dir, 'r2.loadtest.json'), new Date('2026-09-16'), new Date('2026-09-16'));
+    utimesSync(join(dir, 'r3.probe.json'), new Date('2026-09-15'), new Date('2026-09-15'));
+
+    const items = listArchives(dir);
+    assert.equal(items.length, 3, '只列三类档案，忽略 ndjson/report.md/md');
+    assert.deepEqual(items.map((i) => i.runId), ['r2', 'r3', 'r1'], '按 mtime 倒序');
+    assert.deepEqual(items.map((i) => i.kind), ['loadtest', 'probe', 'model-test']);
+    for (const it of items) {
+      assert.equal(typeof it.size, 'number');
+      assert.ok(it.startedAt);
+    }
+    // 空目录 / 不存在目录 → 空列表（不抛错）
+    assert.deepEqual(listArchives(mkdtempSync(join(tmpdir(), 'dsh-empty-'))), []);
+    assert.deepEqual(listArchives('/nonexistent-dir-xyz'), []);
+    assert.deepEqual(listArchives(null), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.4: /test-archives 端点——列表 200 / 非回环 403', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-ep-'));
+  try {
+    writeFileSync(join(dir, 'r1.model-test.json'), JSON.stringify({ kind: 'model-test', runId: 'r1' }));
+    writeFileSync(join(dir, 'r2.probe.json'), JSON.stringify({ kind: 'probe', runId: 'r2' }));
+    writeFileSync(join(dir, '2026-09-16.ndjson'), 'x'); // 干扰
+
+    const routes = makeStatusRoutes({
+      config: { statusPath: '/x', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '', reports: { dir } },
+      router: { snapshot() { return {}; }, recordExhausted() {} },
+      cooldown: { snapshot() { return {}; } },
+      metrics: { snapshot() { return {}; } },
+      quota: { snapshot() { return {}; } },
+      registry: null, probe: null, llm: {}, wrapperStats: {},
+      startedAt: Date.now(), saveStateFn: () => {}, log,
+    });
+    const mkReq = (method, url, remote = '127.0.0.1') => ({
+      method, url, socket: { remoteAddress: remote },
+      headers: { host: '127.0.0.1:3081' },
+      [Symbol.asyncIterator]: async function* () {},
+    });
+    const call = async (path, req) => {
+      const route = routes.find((r) => r.path === path);
+      let body;
+      const res = {
+        writeHead(code) { res.status = code; },
+        setHeader() {},
+        end(b) { body = JSON.parse(b); },
+      };
+      await route.handler(req, res);
+      return { status: res.status, body };
+    };
+
+    const P = '/api/model-router/test-archives';
+    // 列表 → 200，items 含三类且忽略 ndjson
+    let r = await call(P, mkReq('GET', P));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.items.length, 2, '只列档案（忽略 ndjson）');
+    assert.deepEqual(r.body.items.map((i) => i.kind).sort(), ['model-test', 'probe']);
+
+    // 非回环 → 403
+    r = await call(P, mkReq('GET', P, '10.0.0.5'));
+    assert.equal(r.status, 403);
+    assert.match(r.body.error, /loopback/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.4: /test-archives/detail 端点——合法 200 / 路径穿越 400（安全关键）/ 404 / 400 缺参', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-ep2-'));
+  try {
+    writeFileSync(join(dir, 'r1.model-test.json'), JSON.stringify({ kind: 'model-test', runId: 'r1', targets: [] }));
+    writeFileSync(join(dir, 'r1.model-test.md'), '# md content');
+
+    const routes = makeStatusRoutes({
+      config: { statusPath: '/x', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '', reports: { dir } },
+      router: { snapshot() { return {}; }, recordExhausted() {} },
+      cooldown: { snapshot() { return {}; } },
+      metrics: { snapshot() { return {}; } },
+      quota: { snapshot() { return {}; } },
+      registry: null, probe: null, llm: {}, wrapperStats: {},
+      startedAt: Date.now(), saveStateFn: () => {}, log,
+    });
+    const mkReq = (url) => ({
+      method: 'GET', url, socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: '127.0.0.1:3081' },
+      [Symbol.asyncIterator]: async function* () {},
+    });
+    const call = async (req) => {
+      const route = routes.find((r) => r.path === '/api/model-router/test-archives/detail');
+      let body;
+      const res = {
+        writeHead(code) { res.status = code; },
+        setHeader() {},
+        end(b) { body = JSON.parse(b); },
+      };
+      await route.handler(req, res);
+      return { status: res.status, body };
+    };
+    const D = '/api/model-router/test-archives/detail';
+
+    // 合法 → 200 + report + markdown
+    let r = await call(mkReq(`${D}?kind=model-test&runId=r1`));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.report.runId, 'r1');
+    assert.equal(r.body.markdown, '# md content');
+
+    // probe 无 md → markdown 为 null
+    writeFileSync(join(dir, 'r9.probe.json'), JSON.stringify({ kind: 'probe', runId: 'r9' }));
+    r = await call(mkReq(`${D}?kind=probe&runId=r9`));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.markdown, null, 'probe 无 md');
+
+    // 🔴 路径穿越（核心安全断言）→ 400
+    r = await call(mkReq(`${D}?kind=model-test&runId=${encodeURIComponent('../../../../etc/passwd')}`));
+    assert.equal(r.status, 400, '路径穿越必须 400');
+    assert.match(r.body.error, /非法字符|不得含|越界/);
+
+    // 非法 kind → 400
+    r = await call(mkReq(`${D}?kind=bogus&runId=r1`));
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, /kind 须为/);
+
+    // 缺参 → 400
+    r = await call(mkReq(`${D}?kind=model-test`));
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, /均为必填/);
+    r = await call(mkReq(D));
+    assert.equal(r.status, 400);
+
+    // 合法但文件不存在 → 404
+    r = await call(mkReq(`${D}?kind=model-test&runId=no-such-run`));
+    assert.equal(r.status, 404);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.9.4: /model-test/manual 路径穿越加固——runId 含 ../ → 400', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-ep3-'));
+  try {
+    const routes = makeStatusRoutes({
+      config: { statusPath: '/x', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '', reports: { dir } },
+      router: { snapshot() { return {}; }, recordExhausted() {} },
+      cooldown: { snapshot() { return {}; } },
+      metrics: { snapshot() { return {}; } },
+      quota: { snapshot() { return {}; } },
+      registry: null, probe: null, llm: {}, wrapperStats: {},
+      startedAt: Date.now(), saveStateFn: () => {}, log,
+      modelTest: { reportDir: dir },
+    });
+    const mkReq = (body) => ({
+      method: 'POST', url: '/api/model-router/model-test/manual',
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: '127.0.0.1:3081' },
+      [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body)); },
+    });
+    const call = async (req) => {
+      const route = routes.find((r) => r.path === '/api/model-router/model-test/manual');
+      let body;
+      const res = {
+        writeHead(code) { res.status = code; },
+        setHeader() {},
+        end(b) { body = JSON.parse(b); },
+      };
+      await route.handler(req, res);
+      return { status: res.status, body };
+    };
+
+    // 穿越 runId → 400（加固前会通过 validateManualInput 并尝试写越界路径）
+    let r = await call(mkReq({ runId: '../../../tmp/evil', targetKey: 'p\u0000m' }));
+    assert.equal(r.status, 400, '穿越 runId 必须 400');
+    assert.match(r.body.error, /非法字符|不得含|越界/);
+
+    // 合法 runId 但文件不存在 → 404（走通到读文件）
+    r = await call(mkReq({ runId: 'no-such-run', targetKey: 'p\u0000m' }));
+    assert.equal(r.status, 404);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
