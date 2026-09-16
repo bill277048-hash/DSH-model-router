@@ -4116,3 +4116,105 @@ test('v0.9.9.4: /model-test/manual 路径穿越加固——runId 含 ../ → 400
   }
 });
 
+// ============================================================
+// v0.9.10 Task 1：providerMeta 新增字段（rpmLimit/tpmLimit/resetPolicy/SourceUrl/notes）
+// ============================================================
+
+test('v0.9.10 Task1: providerMeta 新字段——合法 rpmLimit/tpmLimit/resetPolicy', () => {
+  // 全部合法
+  const out = normalizeConfig({
+    providerMeta: {
+      'p-a': {
+        rpmLimit: 60,
+        tpmLimit: 100000,
+        resetPolicy: { window: 'day', at: '02:00' },
+        resetPolicySourceUrl: 'https://docs.example.com/rate',
+        tpmLimitSourceUrl: 'https://docs.example.com/tpm',
+        notes: '高峰期限速',
+      },
+      'p-b': {
+        rpmLimit: 100,
+        resetPolicy: { window: 'rolling', rollingSec: 3600 },
+      },
+      'p-c': { rpmLimit: 30 },
+    },
+  });
+  assert.equal(out.providerMeta['p-a'].rpmLimit, 60);
+  assert.equal(out.providerMeta['p-a'].tpmLimit, 100000);
+  assert.deepEqual(out.providerMeta['p-a'].resetPolicy, { window: 'day', at: '02:00' });
+  assert.equal(out.providerMeta['p-a'].notes, '高峰期限速');
+  assert.deepEqual(out.providerMeta['p-b'].resetPolicy, { window: 'rolling', rollingSec: 3600 });
+  assert.equal(out.providerMeta['p-c'].rpmLimit, 30);
+  assert.equal(out.providerMeta['p-a'].quotaGroup, undefined, '旧字段未声明 → undefined（不写默认值）');
+});
+
+test('v0.9.10 Task1: providerMeta 新字段——多种非法值被拒（具体错误信息）', () => {
+  const cases = [
+    [{ 'p': { rpmLimit: 0 } }, /rpmLimit 须为正整数/],
+    [{ 'p': { rpmLimit: -1 } }, /rpmLimit 须为正整数/],
+    [{ 'p': { rpmLimit: 1.5 } }, /rpmLimit 须为正整数/],
+    [{ 'p': { rpmLimit: 'abc' } }, /rpmLimit 须为正整数/],
+    [{ 'p': { tpmLimit: 0 } }, /tpmLimit 须为正整数/],
+    [{ 'p': { resetPolicy: { window: 'bogus' } } }, /resetPolicy.window 须为/],
+    [{ 'p': { resetPolicy: { window: 'hour' } } }, /at 须为 HH:MM/],
+    [{ 'p': { resetPolicy: { window: 'hour', at: '9:00' } } }, /at 须为 HH:MM/],
+    [{ 'p': { resetPolicy: { window: 'rolling' } } }, /rollingSec 须为/],
+    [{ 'p': { resetPolicy: { window: 'rolling', rollingSec: 0 } } }, /rollingSec/],
+    [{ 'p': { resetPolicy: { window: 'rolling', rollingSec: 999999 } } }, /rollingSec/],
+    [{ 'p': { tpmLimitSourceUrl: 'javascript:alert(1)' } }, /http\(s\)/],
+    [{ 'p': { tpmLimitSourceUrl: 'file:///etc/passwd' } }, /http\(s\)/],
+    [{ 'p': { notes: 'x'.repeat(501) } }, /长度上限 500/],
+  ];
+  for (const [meta, expectedRegex] of cases) {
+    assert.throws(
+      () => normalizeConfig({ providerMeta: meta }),
+      expectedRegex,
+      JSON.stringify(meta) + ' 应被拒'
+    );
+  }
+});
+
+test('v0.9.10 Task1: 兼容旧 store——无新字段的 providerMeta 不报错', () => {
+  // 模拟 v0.9.9 旧 store（只有 quotaGroup/tier/quotaWindows/customWindows/exclude）
+  const out = normalizeConfig({
+    rules: [],
+    providerMeta: {
+      'p-a': {
+        quotaGroup: 'g1',
+        tier: 'free',
+        quotaWindows: { fiveHour: { limit: 100, used: 0 } },
+        exclude: false,
+      },
+      'p-b': { tier: 'paid-baseline' },
+    },
+  });
+  assert.equal(out.providerMeta['p-a'].quotaGroup, 'g1', '旧字段保留');
+  assert.equal(out.providerMeta['p-a'].tier, 'free', '旧字段保留');
+  assert.equal(out.providerMeta['p-a'].exclude, false, '旧字段保留');
+  assert.equal(out.providerMeta['p-a'].rpmLimit, undefined, '新字段不存在 → undefined（不报错）');
+  assert.equal(out.providerMeta['p-a'].resetPolicy, undefined);
+  assert.equal(out.providerMeta['p-b'].tier, 'paid-baseline');
+});
+
+test('v0.9.10 Task1: route hop 内联——rpmLimit/tpmLimit/resetPolicy 同样校验', () => {
+  const ok = normalizeConfig({
+    rules: [
+      {
+        route: [
+          { provider: 'p', model: 'm', rpmLimit: 60, tpmLimit: 100000, resetPolicy: { window: 'minute' } },
+        ],
+      },
+    ],
+  });
+  assert.equal(ok.rules[0].route[0].rpmLimit, 60);
+  assert.equal(ok.rules[0].route[0].tpmLimit, 100000);
+  assert.deepEqual(ok.rules[0].route[0].resetPolicy, { window: 'minute' });
+
+  assert.throws(
+    () => normalizeConfig({
+      rules: [{ route: [{ provider: 'p', model: 'm', rpmLimit: -5 }] }],
+    }),
+    /rpmLimit 须为正整数/
+  );
+});
+

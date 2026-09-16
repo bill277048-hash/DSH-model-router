@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.10 (2026-09-17)
+
+> **渠道档案 schema 一次到位 · Task 1：providerMeta 新增字段**。
+> 声明优先（OQ1 决策），实测仅作提示，**不引入 schemaVersion 递增**（迁移成本归零）。
+
+### 新增 · providerMeta 声明字段（6 个）
+
+| 字段 | 类型 | 校验 |
+| --- | --- | --- |
+| `rpmLimit` | 正整数 | >10000 警告"是不是填错单位" |
+| `tpmLimit` | 正整数 | 同上 |
+| `resetPolicy` | `{ window, at? \| rollingSec? }` | `window ∈ {minute, hour, day, rolling}`；hour/day 必填 HH:MM `at`（复用既有 `HHMM_RE`）；rolling 必填 `rollingSec`（1-86400） |
+| `resetPolicySourceUrl` | URL | 必须 `http(s)://`（拒绝 javascript:/data:/file:） |
+| `tpmLimitSourceUrl` | URL | 同上 |
+| `notes` | string | 长度上限 500（防 DoS） |
+
+- **route hop 内联**同步支持（与既有 `quotaGroup`/`tier`/`quotaWindows`/`customWindows` 同模式）
+- **既有字段 100% 保留**（quotaGroup / tier / quotaWindows / customWindows / exclude）
+
+### 新增 · 校验函数（`lib/config.js`）
+
+- `validateResetPolicy(rp, where)` —— 三种窗口分支校验
+- `validateSourceUrl(url, where)` —— 仅 http(s)://（XSS 边界）
+- `validateRateLimit(value, field, where)` —— 正整数 + 单位过大警告（返回 `{value, warn?}`）
+
+### 关键设计决策
+
+- **`validateRateLimit` 返回 `{value, warn?}`**（不直接调 log）—— **避免隐式依赖外层 log**（踩坑后修正：测试未传 log → ReferenceError）
+- **复用既有 `HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/`**（config.js:62）—— 与 `hours.start/end` 同一正则，比朴素 `/^\d{2}:\d{2}$/` 严格（拒绝 `25:00`）
+- **`version: 1` 不变**（D4 决策红利）—— 旧 store 文件 **完全兼容**，不需要 patch
+
+### 单测
+
+- 185 → **189**（+4 条）：
+  - 合法 rpmLimit/tpmLimit/resetPolicy/SourceUrl/notes 全覆盖
+  - 14 种非法值各自抛错（含具体的错误信息正则断言）
+  - **兼容旧 store**（v0.9.9 无新字段不报错）
+  - route hop 内联同样校验
+- **突变验证**（3 组全有效）：
+  - rpmLimit 不校验非正 → 2 条变红
+  - resetPolicy window 校验失效 → 1 条变红
+  - SourceUrl http(s) 校验失效 → 1 条变红
+  - 还原 → 189/189
+
+### 踩坑记录
+
+**🔴 `validateRateLimit` 隐式依赖外层 `log`**：
+初版写 `log?.warn?.(...)` 假设外层作用域有 `log`，但测试调用 `normalizeConfig({providerMeta:{...}})` 没传 `log` → `log is not defined` → ReferenceError。
+修：改为返回 `{value, warn?}`，主流程决定是否打日志——**解耦**。
+
+**🔴 Edit 工具误删半个函数**：
+中间删 `validateResetPolicy` 末尾时锚点不精准，把 `return out; }` 与后面的 `validateSourceUrl` 注释粘到了一起 → 导致 `validateResetPolicy` 提前终止、`validateSourceUrl` 缺注释。
+修：用更长的 old_string（含跨函数内容）锚定。
+
 ## 0.9.9.5 (2026-09-16)
 
 > **「测试档案」页签上线**（v0.9.9 收口 Task 7 + 8）。前端消费 v0.9.9.4 的两个端点；
