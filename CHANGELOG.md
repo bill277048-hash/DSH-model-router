@@ -2,8 +2,9 @@
 
 ## 0.9.9.1 (2026-09-16)
 
-> **修一个 P0 + 一处过度设计修正**。行为变更：空 `provider` / `model` 不再被
+> **修一个 P0 + 段列上线**。行为变更：空 `provider` / `model` 不再被
 > `normalizeTimeWindows` 放行——与 `rules[].route` 走同一校验函数（`checkProviderModel`）。
+> 「切换明细」表新增「段」列（cosmic-forging §十一 验收判据）。
 > 零破坏性变更。
 
 ### 修复 · `normalizeTimeWindows` 放行空 provider/model（P0，真 bug）
@@ -19,9 +20,17 @@
 - **影响范围**：`lib/config.js`（1 处替换）+ `test/unit.test.mjs`（v0.9.9 用例扩展为 v0.9.9.1）。
   总数 166 → 166（v0.9.9 用例被同名替换/扩展）。
 
+### 改进 · 切换明细「段」列（Task 1b，cosmic-forging §十一 验收判据）
+
+- **背景**：v0.9.9 已在 `metrics.recent[].segment` 写入了峰/谷段（wrapper 4 处采样），
+  但前端表格未渲染——半成状态。
+- **改动**：「切换日志」页签的切换明细表头 7 → 8 列（耗时与会话之间加「段」）。
+  单元格显示「峰」「谷」「—」（`segment` 为 `null` 或缺字段时显示 `—`）。
+- **保留**：既有 7 列的取值与顺序**不变**；既有 `r.sessionId` 列等。
+
 ### 未做
 
-- v0.9.9 收口的其余 6 项 Task（详见 `docs/v0.9.9-实施方案.md`）——按既定节奏分批推进。
+- v0.9.9 收口的其余 9 项 Task（详见 `docs/v0.9.9-实施方案.md`）——按既定节奏分批推进。
 
 ## 0.9.9 (2026-09-16)
 

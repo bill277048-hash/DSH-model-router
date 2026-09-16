@@ -1704,6 +1704,12 @@ window.__ModuleLoader__.load({
             g.rows.forEach(function (r) {
               var from = r.prevProvider && r.prevModel ? r.prevProvider + "/" + r.prevModel : "—";
               var to = r.provider && r.model ? r.provider + "/" + r.model : "—";
+              // v0.9.9.1 Task 1b：峰/谷段显示（"peak" / "valley" / null → "—"）。
+              // 数据源 metrics.recent[].segment（v0.9.9 已在 wrapper 4 处采样写入）。
+              // 复用既有 td 样式以保持视觉一致；列宽随 td 自动（无显式 width）。
+              var segLabel = r.segment === "peak" ? "峰"
+                : r.segment === "valley" ? "谷"
+                : "—";
               recentTableRows.push(h("tr", { key: "r-" + r.seq },
                 h("td", { style: styles.td }, fmtLogTime(r.ts)),
                 h("td", { style: styles.td }, h("span", { style: styles.mono }, from)),
@@ -1713,6 +1719,7 @@ window.__ModuleLoader__.load({
                 h("td", { style: styles.td },
                   (typeof r.ttftMs === "number" ? "TTFT " + r.ttftMs + "ms" : "") +
                   (typeof r.e2eMs === "number" ? (typeof r.ttftMs === "number" ? " · " : "") + "E2E " + r.e2eMs + "ms" : "") || "—"),
+                h("td", { style: styles.td }, segLabel),
                 h("td", { style: styles.td }, r.sessionId ? "@" + r.sessionId.slice(0, 8) : "—")));
             });
           });
@@ -1730,6 +1737,8 @@ window.__ModuleLoader__.load({
                         h("th", { style: styles.th }, "结果"),
                         h("th", { style: styles.th }, "错误码"),
                         h("th", { style: styles.th }, "耗时"),
+                        // v0.9.9.1 Task 1b：峰/谷段列（cosmic-forging §十一 验收判据）。
+                        h("th", { style: styles.th }, "段"),
                         h("th", { style: styles.th }, "会话"))),
                     h("tbody", null, recentTableRows)))
           );
