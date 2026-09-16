@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.9.11 (2026-09-17)
+
+> **v0.9.10 Task 2：路由节流（按声明 rpmLimit；不读 observed）**。
+> 声明优先（OQ1 决策）：路由用 `providerMeta[provider].rpmLimit` 限速，**不读** observed。
+
+### 新增 · 路由节流（`lib/router.js`）
+
+- `Router` 构造新增 `metrics` 参数（注入式，避免隐式依赖）
+- `candidatesForRule` 末尾（**最后一道过滤**）调用 `throttleByDeclared(chain)`
+- `throttleByDeclared(chain)` 判定规则：
+  - 数据源：`metrics.snapshot().recent`（近 60s 滚动窗口）
+  - 阈值：`recentCount >= declared * 0.9`（90% 软上限，OQ7 默认）
+  - 优先级：route hop 内联 `rpmLimit` > `providerMeta[provider].rpmLimit`（与既有 v0.8.0 A-2 一致）
+  - **声明为 null**（未声明）→ 不节流
+  - **metrics 未注入 / snapshot 抛错**→ 不阻塞（容错优先）
+
+### 关键设计决策
+
+- **末尾过滤**（在 healthReorder / contextReorder / dedupeByQuotaGroup 之后）→ 保证上游已清理的链不会被重新插入
+- **只做 RPM 节流**——TPM 节流**待 Task 3** 提供 token 用量数据后启用（当前 `metrics.recent` 仅有请求计数）
+- **容错优先**——metrics 缺失 / snapshot 抛错均不阻塞路由（fail-open）
+
+### 单测
+
+- 189 → **196**（+7 条）：
+  - 未声明 rpmLimit → 不过滤
+  - 达 90% 软上限 → 跳过该 hop
+  - 超过 60s 窗口的采样不计入
+  - route hop 内联 rpmLimit 优先于 providerMeta
+  - metrics 未注入 → 不过滤（容错）
+  - metrics.snapshot() 抛错 → 不阻塞（容错）
+  - `candidatesForRule` 端到端集成
+- **突变验证**（3 组全有效）：
+  - 阈值改 0（永远不节流）→ 4 条变红
+  - 去掉 60s 窗口过滤 → 1 条变红
+  - 优先级反转（hop 内联 → providerMeta）→ 1 条变红
+  - 还原 → 196/196
+
+### 踩坑记录
+
+🔴 **`Metrics.sample()` 不接受 `ts` 参数**：
+初版测试用 `sample({ts: ...})` 模拟历史采样，但 `metrics.js:66` 写死
+`new Date().toISOString()`——参数 ts **不生效**。
+**修测试**：删 ts 参数；用 `r._now = sampleNow + 30_000` 让窗口基准后移，
+让 sample ts（在 now 之前 30s）落入 60s 窗口内。
+
+🔴 **同名冲突**：
+- `Router` 已在 line 15 import → 不要重复
+- `makeRouter` 已有 → 用 `makeRouterT2` 区分
+
 ## 0.9.10 (2026-09-17)
 
 > **渠道档案 schema 一次到位 · Task 1：providerMeta 新增字段**。

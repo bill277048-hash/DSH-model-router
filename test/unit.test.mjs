@@ -4218,3 +4218,138 @@ test('v0.9.10 Task1: route hop 内联——rpmLimit/tpmLimit/resetPolicy 同样�
   );
 });
 
+// ============================================================
+// v0.9.10 Task 2：路由节流（按声明 rpmLimit；不读 observed）
+// ============================================================
+// Router 已 import（line 15）；Metrics 检查是否已 import
+import { Metrics } from '../lib/metrics.js';
+
+// 构造一个最小化的 fake registry（Router 在节流路径不读 registry，但构造期要非 null）
+const fakeRegistry = { registeredPairs: () => [] };
+
+function makeRouterT2(cfg, metrics, now = null) {
+  const r = new Router(cfg, fakeRegistry, null, metrics);
+  if (now) r._now = now;
+  return r;
+}
+
+function makeMetricsWith(samples) {
+  const m = new Metrics();
+  for (const s of samples) m.sample(s);
+  return m;
+}
+
+test('v0.9.10 Task2: throttleByDeclared——未声明 rpmLimit → 不过滤', () => {
+  // 三个候选 provider 都没声明 rpmLimit
+  const r = makeRouterT2({ rules: [{ route: [{ provider: 'a', model: 'A' }, { provider: 'b', model: 'B' }] }] });
+  const chain = [
+    { provider: 'a', model: 'A' },
+    { provider: 'b', model: 'B' },
+  ];
+  // metrics 注入大量采样，但因声明为 null → 不节流
+  const samples = Array.from({ length: 100 }, () => ({ provider: 'a', model: 'A', outcome: 'committed' }));
+  const m = makeMetricsWith(samples);
+  r.metrics = m;
+  const out = r.throttleByDeclared(chain);
+  assert.equal(out.length, 2, '未声明 → 不节流');
+});
+
+test('v0.9.10 Task2: throttleByDeclared——达到 90% 软上限 → 跳过该 hop', () => {
+  // 注意：Metrics.sample() 内部用 new Date() 而非参数 ts，
+  // 因此 sample 的时间戳就是「调用 sample 的时间」，不是参数里的 ts。
+  // 测试里把 r._now 设为调用时刻附近的某个值，让窗口基准与 sample ts 对齐。
+  // 声明 rpmLimit=10，过去 60s 内 provider 'a' 已用 9 次（9 >= 10*0.9=9）→ 跳过
+  // 但 provider 'b' 只用 3 次 → 保留
+  const m = new Metrics();
+  const now = new Date('2026-09-17T12:00:00.000Z');
+  // 先注入未来时间，再让 sample 调用——但 Date.now() 无法 mock
+  // 改方案：先 sample，再把 r._now 设为 sample 后的 30s 之前
+  // 这样 sample ts - nowTs ≈ 30s（在 60s 窗口内）→ 9 次被计入
+  for (let i = 0; i < 9; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed' });
+  for (let i = 0; i < 3; i++) m.sample({ provider: 'b', model: 'B', outcome: 'committed' });
+  // 把 r._now 设为 sample 后 30s（这样 sample ts = now - 30s，在窗口内）
+  const r = makeRouterT2({
+    rules: [{ route: [{ provider: 'a', model: 'A' }, { provider: 'b', model: 'B' }] }],
+    providerMeta: { 'a': { rpmLimit: 10 }, 'b': { rpmLimit: 10 } },
+  });
+  // sample ts 是 Date.now()——但我们不知道当前时间是多少；用 sample 后立刻取
+  const sampleNow = Date.now();
+  // 让 r._now 比 sampleNow 晚 30s → 窗口基准 = sampleNow + 30s；
+  // sample ts = sampleNow；diff = 30s → 在 60s 窗口内
+  r._now = new Date(sampleNow + 30_000);
+  r.metrics = m;
+  const out = r.throttleByDeclared([
+    { provider: 'a', model: 'A' },
+    { provider: 'b', model: 'B' },
+  ]);
+  assert.deepEqual(out.map((h) => h.provider), ['b'], 'a 被节流跳过，b 保留');
+});
+
+test('v0.9.10 Task2: throttleByDeclared——超过 60s 窗口的采样不计入', () => {
+  const m = new Metrics();
+  for (let i = 0; i < 9; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed' });
+  const sampleNow = Date.now();
+  // 让 r._now = sampleNow + 70s → sample ts = sampleNow；diff = 70s > 60s → 窗口外
+  const r = makeRouterT2({
+    rules: [{ route: [{ provider: 'a', model: 'A' }] }],
+    providerMeta: { 'a': { rpmLimit: 10 } },
+  });
+  r._now = new Date(sampleNow + 70_000);
+  r.metrics = m;
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A' }]);
+  assert.equal(out.length, 1, '窗口外的采样不计入');
+});
+
+test('v0.9.10 Task2: throttleByDeclared——route hop 内联 rpmLimit 优先于 providerMeta', () => {
+  const m = new Metrics();
+  for (let i = 0; i < 12; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed' });
+  const sampleNow = Date.now();
+  const r = makeRouterT2({
+    rules: [{ route: [{ provider: 'a', model: 'A', rpmLimit: 50 }] }], // 内联限 50
+    providerMeta: { 'a': { rpmLimit: 10 } }, // providerMeta 限 10
+  });
+  r._now = new Date(sampleNow + 30_000);
+  r.metrics = m;
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A', rpmLimit: 50 }]);
+  assert.equal(out.length, 1, 'route hop 内联 rpmLimit 优先（更宽松）');
+});
+
+test('v0.9.10 Task2: throttleByDeclared——metrics 未注入 → 不过滤（容错）', () => {
+  const r = makeRouterT2({
+    rules: [{ route: [{ provider: 'a', model: 'A' }] }],
+    providerMeta: { 'a': { rpmLimit: 10 } },
+  });
+  // r.metrics = null（默认）
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A' }]);
+  assert.equal(out.length, 1, 'metrics 缺失时不阻塞（与未声明同语义）');
+});
+
+test('v0.9.10 Task2: throttleByDeclared——metrics.snapshot() 抛错 → 不阻塞', () => {
+  const r = makeRouterT2({
+    rules: [{ route: [{ provider: 'a', model: 'A' }] }],
+    providerMeta: { 'a': { rpmLimit: 10 } },
+  });
+  r.metrics = { snapshot() { throw new Error('mock crash'); } };
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A' }]);
+  assert.equal(out.length, 1, 'snapshot 抛错时不阻塞（容错优先）');
+});
+
+test('v0.9.10 Task2: candidatesForRule 末尾调用 throttleByDeclared（端到端）', () => {
+  // 端到端：candidatesForRule 返回前过滤；声明 rpmLimit=10，sampleNow 注入足够多
+  // （a 9 次，b 3 次）→ a 被节流
+  const m = new Metrics();
+  for (let i = 0; i < 9; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed' });
+  for (let i = 0; i < 3; i++) m.sample({ provider: 'b', model: 'B', outcome: 'committed' });
+  const sampleNow = Date.now();
+  const cfg = {
+    rules: [{ route: [
+      { provider: 'a', model: 'A' },
+      { provider: 'b', model: 'B' },
+    ] }],
+    providerMeta: { 'a': { rpmLimit: 10 }, 'b': { rpmLimit: 10 } },
+  };
+  const r = makeRouterT2(cfg, m, new Date(sampleNow + 30_000));
+  const out = r.candidatesForRule(cfg.rules[0]);
+  assert.deepEqual(out.map((h) => h.provider), ['b'], '端到端：a 被节流，b 保留');
+});
+
