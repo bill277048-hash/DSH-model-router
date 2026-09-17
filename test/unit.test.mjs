@@ -3400,8 +3400,9 @@ test('v0.9.9.5 Task7/8: client——archives 页签 / ArchivesPanel / 详情渲�
   for (const k of ['model-test', 'loadtest', 'probe']) {
     assert.ok(src.includes(`"${k}"`), `kind ${k} 出现`);
   }
-  // 命名消歧（方案 §6-2）：抽屉标题改为「窗口限额档案」，与「测试档案」页签区分
-  assert.ok(src.includes('窗口限额档案 · '), 'ArchiveDrawer 标题已消歧');
+  // 命名消歧（方案 §6-2）：抽屉标题与「测试档案」页签区分。
+  // v0.9.10 Task5：抽屉内容扩为「限额声明 + 窗口上限」两块 → 标题改为「渠道限额档案」
+  assert.ok(src.includes('渠道限额档案 · '), 'ArchiveDrawer 标题已消歧');
   assert.equal(src.includes('模型档案 · '), false, '旧「模型档案」标题已移除');
   // XSS 边界：全文件无 HTML 直通
   assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '不引入 HTML 直通');
@@ -4766,6 +4767,138 @@ test('v0.9.10 Task4: /status——无声明字段时不产生 warn（无可比�
   assert.equal(m.conflicts, undefined, '无 rpmLimit/tpmLimit → 无可比对象 → 无冲突');
   assert.equal(m.quotaGroup, 'g1', '其他声明字段保留');
   assert.ok(m.observed, 'observed 仍回显');
+});
+
+// ============================================================
+// v0.9.10 Task 5：UI 编辑器（渠道限额档案抽屉的声明编辑区）
+// ============================================================
+
+/**
+ * 极简 React 运行时：渲染 client.js 的面板，并**真实调用函数组件**
+ * （ArchiveDrawer 等子组件若不调用，其内容永远不会出现在树上）。
+ * hook 按 useState 出现顺序编号（useRef/useEffect/useCallback 不占号）。
+ */
+function renderClientPanel({ status, activeTab = 'models', archProvider = null }) {
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  let hookIdx = 0;
+  let overrides = new Map();
+  let roots = [];
+  function h(tag, props, ...children) {
+    const flat = [];
+    for (const c of children.flat(Infinity)) if (c != null && c !== false) flat.push(c);
+    if (typeof tag === 'function') return tag(Object.assign({}, props, { children: flat }));
+    const node = { tag, props: props || {}, children: flat };
+    roots.push(node);
+    return node;
+  }
+  const react = {
+    createElement: h,
+    useState(init) { const i = hookIdx++; return [overrides.has(i) ? overrides.get(i) : init, () => {}]; },
+    useRef(init) { return { current: init }; },
+    useEffect() {},          // 空操作（client 内的 effect 只做取数，不影响断言）
+    useCallback(fn) { return fn; },
+  };
+  let factory = null;
+  const win = { __ModuleLoader__: { load({ factory: f }) { factory = f; } } };
+  const req = (n) => { if (n === 'react') return react; throw new Error('unexpected require: ' + n); };
+  new Function('window', 'require', src)(win, req);
+  const mod = factory(req);
+  let Panel = null;
+  // client 内有「单次挂载」守卫（CLAIM_KEY）——同一进程内二次 apply 会被跳过，
+  // 故每次渲染前重置，保证 Panel 被重新注册。
+  globalThis.__dsh_model_router_panel_mounted__ = false;
+  mod.apply({ effect() {}, slots: { inject(_n, fn) { fn(); }, register(_m, c) { Panel = c; return () => {}; } } });
+  // 第一次：探 hook 顺序；第二次：注入 overrides 正式渲染
+  hookIdx = 0; roots = []; Panel();
+  hookIdx = 0; overrides = new Map(); roots = [];
+  overrides.set(0, status);        // status
+  overrides.set(2, { propose: false, rules: [], timeZone: 'Asia/Shanghai', mode: 'balanced', timeWindows: null, dirty: false, syncedAt: 'server' }); // edit
+  overrides.set(6, activeTab);     // activeTab
+  overrides.set(12, archProvider); // archProvider
+  Panel();
+  const nodes = [];
+  (function walk(list) {
+    for (const n of list) if (n && typeof n === 'object' && n.tag) { nodes.push(n); walk(n.children || []); }
+  })(roots);
+  const strings = [];
+  (function collect(list) {
+    for (const c of list) {
+      if (typeof c === 'string') strings.push(c);
+      else if (c && typeof c === 'object' && c.children) collect(c.children);
+    }
+  })(roots);
+  return { nodes, strings, has: (t) => strings.some((s) => s.includes(t)) };
+}
+
+const T5_PROVIDER = 'apikey-202606301659';
+const t5Status = {
+  version: '0.9.15',
+  config: {
+    propose: false, rules: [], providerMeta: {
+      [T5_PROVIDER]: {
+        rpmLimit: 60, tpmLimit: 100000,
+        resetPolicy: { window: 'day', at: '02:00' },
+        tpmLimitSourceUrl: 'https://docs.example.com/tpm',
+        notes: '高峰期限速',
+        observed: {
+          lastUpdatedAt: new Date().toISOString(),
+          rateLimited429Count: 5, quotaExhausted429Count: 1, accountTpm429Count: 0,
+          sampleSize: 20, estimatedRpm: 20, estimatedTpm: 20000,
+        },
+        conflicts: [{ field: 'rpmLimit', declared: 60, observed: 20, severity: 'warn', message: '实际限额可能低于声明' }],
+      },
+    },
+    fallbackPolicy: {}, probe: {}, timeZone: 'Asia/Shanghai', mode: 'balanced',
+    storePath: '/tmp/x', reports: {}, registryRefreshSec: 300, timeWindows: null,
+  },
+  registry: { providers: [{ provider: T5_PROVIDER, models: [{ id: 'deepseek-v4-flash' }] }] },
+  wrapper: {}, cooldown: {}, metrics: { recent: [] }, quota: {}, quotaWindows: {},
+};
+
+test('v0.9.10 Task5: 抽屉渲染——声明编辑区 + 实测区 + 冲突徽章（真实渲染，非源码断言）', () => {
+  const r = renderClientPanel({ status: t5Status, activeTab: 'models', archProvider: T5_PROVIDER });
+  const inputs = r.nodes.filter((n) => n.tag === 'input');
+  const selects = r.nodes.filter((n) => n.tag === 'select');
+  const btnText = r.nodes.filter((n) => n.tag === 'button')
+    .flatMap((b) => b.children.filter((c) => typeof c === 'string')).join('|');
+
+  assert.ok(r.has('渠道限额档案 · ' + T5_PROVIDER), '抽屉已渲染');
+  assert.ok(r.has('限额声明（RPM / TPM / 重置）'), '声明区标题');
+  assert.ok(r.has('实测仅作提示，不会自动覆盖声明'), '声明优先提示文案');
+  assert.ok(inputs.some((n) => n.props.value === '60'), 'RPM 回显');
+  assert.ok(inputs.some((n) => n.props.value === '100000'), 'TPM 回显');
+  assert.ok(selects.some((n) => n.children.filter((c) => c.tag === 'option').length === 5), '重置下拉 5 选项');
+  assert.ok(inputs.some((n) => n.props.value === '02:00'), 'resetPolicy.at 回显');
+  assert.ok(inputs.some((n) => n.props.value === 'https://docs.example.com/tpm'), '来源 URL 回显');
+  assert.ok(inputs.some((n) => n.props.value === '高峰期限速'), '备注回显');
+  assert.ok(btnText.includes('保存声明'), '保存声明按钮');
+  assert.ok(r.has('实际限额可能低于声明'), '冲突徽章文案');
+  assert.ok(r.has('实测（仅参考，不参与路由决策）'), '实测区标题');
+  assert.ok(r.has('429：速率 5 / 配额 1 / 账号级 0'), '实测 429 计数');
+  assert.ok(r.has('20 req/min') && r.has('20000 tokens/min'), '实测速率');
+  assert.ok(r.has('窗口上限（5h / 1 周 / 自定义）'), '窗口区标题（既有功能保留）');
+  // OQ1 决策：声明优先 → 不得有「采纳实测」按钮
+  assert.equal(btnText.includes('采纳'), false, '不得有「采纳实测」按钮（OQ1）');
+});
+
+test('v0.9.10 Task5: 抽屉渲染——无声明/无实测时优雅降级（不抛错、无徽章）', () => {
+  const bare = JSON.parse(JSON.stringify(t5Status));
+  bare.config.providerMeta = { [T5_PROVIDER]: {} }; // 只有 provider 键，无任何声明
+  const r = renderClientPanel({ status: bare, activeTab: 'models', archProvider: T5_PROVIDER });
+  assert.ok(r.has('渠道限额档案 · ' + T5_PROVIDER), '抽屉仍渲染');
+  assert.equal(r.has('实际限额可能低于声明'), false, '无 conflicts → 无徽章');
+  assert.equal(r.has('实测（仅参考，不参与路由决策）'), false, '无 observed → 不显示实测区');
+  const inputs = r.nodes.filter((n) => n.tag === 'input');
+  assert.ok(inputs.some((n) => n.props.value === ''), '输入框为空串（未声明）');
+});
+
+test('v0.9.10 Task5: stripDerivedMeta——源码断言（派生字段不回传）', () => {
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  assert.ok(/function stripDerivedMeta\(/.test(src), 'stripDerivedMeta 存在');
+  assert.ok(src.includes('k === "observed" || k === "conflicts"'), '剥离 observed/conflicts');
+  assert.ok(src.includes('stripDerivedMeta(st.providerMeta)'), '既有保存路径已接入');
+  assert.ok(src.includes('stripDerivedMeta((props.status || {}).config'), '声明保存路径已接入');
+  assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '不引入 HTML 直通');
 });
 
 test('v0.9.10 Task4: 回传安全——normalizeConfig 丢弃派生字段（不污染 config）', async () => {

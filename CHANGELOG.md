@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.9.16 (2026-09-17)
+
+> **v0.9.10 Task 5：UI 编辑器**。渠道限额档案抽屉新增「限额声明」编辑区 +
+> 「实测」只读区 + 冲突徽章。**无「采纳实测」按钮**（OQ1：声明优先）。
+
+### 新增 · 渠道限额档案抽屉（`client.js`）
+
+抽屉由「窗口限额档案」改名为 **「渠道限额档案」**（内容扩为两块）：
+
+| 区块 | 内容 |
+| --- | --- |
+| **① 限额声明（可编辑）** | RPM 输入框 / TPM 输入框 / 重置规则下拉（未声明·每分钟·每小时·每日·自定义滚动）+ 条件输入（`HH:MM` 或滚动秒）/ TPM 来源 URL / 重置规则来源 URL / 备注 → **保存声明** |
+| **② 实测（只读）** | 近 60s 采样数 · 三类 429 计数 · 估算 rpm/tpm · 更新时刻 |
+| **③ 冲突徽章** | `warn`（黄底）/ `info`（灰底），文案来自服务端 `conflicts[].message` |
+| **④ 窗口上限（既有）** | 5h / 1 周 / 自定义窗口 + 「重置已用」（**原有功能，未改动**） |
+
+### 新增 · 辅助函数
+
+- `declFromMeta(meta)` —— providerMeta 声明字段 → 编辑态（字符串，便于输入框绑定）；
+  缺失字段 → 空串（输入框显示占位符）
+- `stripDerivedMeta(pm)` —— 回传前剥离服务端**派生**字段（`observed`/`conflicts`）。
+  虽然 `normalizeConfig` 会安全丢弃（v0.9.15 已测），但显式剥离让客户端意图明确，
+  也避免请求体膨胀。**既有保存路径也已接入**
+- `CONFLICT_STYLE` —— 冲突严重性 → 徽章配色
+
+### 关键设计决策
+
+- **饿汉式初始化**（`useState(declFromMeta(liveMeta))` 而非 `useEffect` 延迟初始化）：
+  抽屉关闭即卸载（`archProvider` 置 null → 条件渲染移除），每次打开都是新挂载
+  → `useState` 初始化器必然按当前 status 跑一遍。既简单，也天然避免
+  「刷新 status 覆盖用户正在编辑的内容」
+- **声明保存走 `POST /state`**（不是 `/quota/sync` —— 那是窗口上限）
+- **空串 = 删除该声明**（清空输入框即取消声明）
+- **resetPolicy 按窗口类型只保留对应字段**：hour/day 只留 `at`，rolling 只留 `rollingSec`
+- **无「采纳实测」按钮**（OQ1 决策）——单测显式断言其不存在
+
+### 单测
+
+- 222 → **225**（+3 条）：
+  - **抽屉真实渲染**（新增 `renderClientPanel` harness，16 项断言）：声明区标题 /
+    优先提示文案 / RPM+TPM+at+URL+备注回显 / 重置下拉 5 选项 / 保存按钮 /
+    冲突徽章 / 实测区 / 窗口区保留 / **无「采纳实测」按钮**
+  - 优雅降级：无声明无实测时不抛错、无徽章、输入框为空串
+  - `stripDerivedMeta` 源码断言（含既有路径已接入）
+- **突变验证**（3 组全有效）：
+  - 加「采纳实测」按钮（违反 OQ1）→ 1 条变红
+  - 去掉冲突徽章渲染 → 1 条变红
+  - 去掉实测区渲染 → 1 条变红
+  - 还原 → 225/225
+- 8 页签 mock 渲染复跑：全部无抛错
+
+### 测试基建（新）
+
+`renderClientPanel({status, activeTab, archProvider})` —— 极简 React 运行时，
+**真实调用函数组件**（`ArchiveDrawer`/`ArchivesPanel`/`ModelTestPanel` 等子组件）。
+
+> ⚠ **关键**：此前 mock 的 `h()` 只把函数组件当「节点」记录、**不调用它**，
+> 导致子组件内容永远不在渲染树上（断言全 ✗）。修法是 `if (typeof tag === 'function') return tag(props)`。
+> 另需重置 `globalThis.__dsh_model_router_panel_mounted__`（client 的单次挂载守卫会让
+> 第二次 `apply()` 直接返回，`Panel` 保持 null）。
+
 ## 0.9.15 (2026-09-17)
 
 > **v0.9.10 Task 4：冲突呈现**。`/status` 的 `providerMeta[provider]` 附加

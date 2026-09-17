@@ -1972,6 +1972,9 @@ window.__ModuleLoader__.load({
         children.push(h(ArchiveDrawer, {
           key: "arch",
           provider: archProvider,
+          // v0.9.10 Task 5：传入 status —— 声明字段（providerMeta）与派生字段
+          // （observed/conflicts）都在 status.config.providerMeta[provider] 里
+          status: status,
           onClose: function () { setArchProvider(null); },
           onSaved: function () { refresh(); }
         }));
@@ -2145,11 +2148,13 @@ window.__ModuleLoader__.load({
             r0.route = removed;
             if (rules.length === 0) rules.push(r0); else rules[0] = r0;
           }
-          var body = { rules: rules, providerMeta: st.providerMeta };
+          // v0.9.10 Task 5：回传前剥离服务端派生字段（observed/conflicts）
+          var body = { rules: rules, providerMeta: stripDerivedMeta(st.providerMeta) };
           if (action === "exclude") {
             var pm = Object.assign({}, (st.providerMeta || {})[tr.provider] || {});
+            delete pm.observed; delete pm.conflicts; // 派生字段不参与编辑
             pm.exclude = true;
-            body.providerMeta = Object.assign({}, st.providerMeta || {});
+            body.providerMeta = Object.assign({}, stripDerivedMeta(st.providerMeta));
             body.providerMeta[tr.provider] = pm;
           }
           // 剥离每次都要同步的无关字段避免被回写（timeZone/mode 保持服务端现值）
@@ -2620,12 +2625,122 @@ window.__ModuleLoader__.load({
     //   provider  要编辑的供应商 id（顶层仅在非空时才渲染本组件）
     //   onClose   关闭抽屉（顶层把 archProvider 置 null）
     //   onSaved   保存成功后通知顶层 refresh() 拉全量 status（含 quotaWindows，供窗口限额栏目同步）
+    /**
+     * v0.9.10 Task 5：剥离服务端**派生**字段（observed/conflicts）后再回传。
+     *
+     * 虽然 normalizeConfig 只提取白名单字段、派生字段会被安全丢弃（v0.9.15 已测），
+     * 但**显式剥离**让客户端意图明确——避免把只读数据当可写数据传回去，
+     * 也避免无谓的请求体膨胀。
+     */
+    function stripDerivedMeta(pm) {
+      if (!pm || typeof pm !== "object") return pm;
+      var out = {};
+      Object.keys(pm).forEach(function (p) {
+        var m = pm[p];
+        if (!m || typeof m !== "object") { out[p] = m; return; }
+        var clean = {};
+        Object.keys(m).forEach(function (k) {
+          if (k === "observed" || k === "conflicts") return; // 服务端派生，不回传
+          clean[k] = m[k];
+        });
+        out[p] = clean;
+      });
+      return out;
+    }
+
+    /**
+     * v0.9.10 Task 5：把 providerMeta[provider] 的声明字段转成编辑态（字符串便于输入框绑定）。
+     * 缺失字段 → 空串（输入框显示占位符，保存时空串 = 删除该声明）。
+     */
+    function declFromMeta(meta) {
+      var m = meta || {};
+      var rp = m.resetPolicy || {};
+      return {
+        rpmLimit: m.rpmLimit == null ? "" : String(m.rpmLimit),
+        tpmLimit: m.tpmLimit == null ? "" : String(m.tpmLimit),
+        resetWindow: rp.window || "",
+        resetAt: rp.at || "",
+        resetRollingSec: rp.rollingSec == null ? "" : String(rp.rollingSec),
+        tpmLimitSourceUrl: m.tpmLimitSourceUrl || "",
+        resetPolicySourceUrl: m.resetPolicySourceUrl || "",
+        notes: m.notes || "",
+      };
+    }
+
+    /** v0.9.10 Task 5：冲突严重性 → 徽章配色（info 中性 / warn 警示 / critical 危险） */
+    var CONFLICT_STYLE = {
+      info: { color: "#57606a", background: "#f6f8fa", border: "1px solid #d0d7de" },
+      warn: { color: "#9a6700", background: "#fff8c5", border: "1px solid #d4a72c" },
+      critical: { color: "#c42b1c", background: "#ffebe9", border: "1px solid #ff8182" },
+    };
+
     function ArchiveDrawer(props) {
       var provider = props.provider;
       var sWin = useState(null); var archWin = sWin[0]; var setArchWin = sWin[1];
       var sErr = useState(""); var archErr = sErr[0]; var setArchErr = sErr[1];
       var sBusy = useState(false); var archBusy = sBusy[0]; var setArchBusy = sBusy[1];
       var sSaved = useState(false); var archSaved = sSaved[0]; var setArchSaved = sSaved[1];
+      // 该 provider 的声明 + 派生字段（均来自 /status）
+      var liveMeta = (((props.status || {}).config || {}).providerMeta || {})[provider] || {};
+      var observed = liveMeta.observed || null;
+      var conflicts = Array.isArray(liveMeta.conflicts) ? liveMeta.conflicts : [];
+
+      // v0.9.10 Task 5：限额声明编辑态。
+      // **饿汉式初始化**（而非 useEffect 延迟初始化）：抽屉关闭即卸载（archProvider 置 null
+      // → 条件渲染移除），每次打开都是新挂载 → useState 初始化器必然按当前 status 跑一遍。
+      // 这样也避免「刷新 status 覆盖用户正在编辑的内容」的问题。
+      var sDecl = useState(declFromMeta(liveMeta));
+      var decl = sDecl[0]; var setDecl = sDecl[1];
+      var sDeclErr = useState(""); var declErr = sDeclErr[0]; var setDeclErr = sDeclErr[1];
+      var sDeclSaved = useState(false); var declSaved = sDeclSaved[0]; var setDeclSaved = sDeclSaved[1];
+      var sDeclBusy = useState(false); var declBusy = sDeclBusy[0]; var setDeclBusy = sDeclBusy[1];
+
+      function setDeclField(field, value) {
+        setDecl(function (cur) { return Object.assign({}, cur || {}, { [field]: value }); });
+      }
+
+      /** 保存声明 → POST /state（providerMeta[provider] 合并；剥离派生字段） */
+      function saveDecl() {
+        if (!decl) return;
+        setDeclBusy(true);
+        setDeclErr("");
+        setDeclSaved(false);
+        var meta = Object.assign({}, liveMeta);
+        delete meta.observed; delete meta.conflicts; // 派生字段不回传
+        // 数值字段：空串 → 删除（未声明）
+        ["rpmLimit", "tpmLimit"].forEach(function (k) {
+          if (decl[k] === "" || decl[k] == null) delete meta[k];
+          else meta[k] = Number(decl[k]);
+        });
+        // resetPolicy：window 必填；按窗口类型只保留对应字段
+        if (!decl.resetWindow) {
+          delete meta.resetPolicy;
+        } else {
+          var rp = { window: decl.resetWindow };
+          if (decl.resetWindow === "hour" || decl.resetWindow === "day") {
+            if (decl.resetAt) rp.at = decl.resetAt;
+          } else if (decl.resetWindow === "rolling") {
+            if (decl.resetRollingSec !== "" && decl.resetRollingSec != null) rp.rollingSec = Number(decl.resetRollingSec);
+          }
+          meta.resetPolicy = rp;
+        }
+        // 字符串字段：空串 → 删除
+        ["tpmLimitSourceUrl", "resetPolicySourceUrl", "notes"].forEach(function (k) {
+          if (!decl[k]) delete meta[k]; else meta[k] = decl[k];
+        });
+        var pm = Object.assign({}, stripDerivedMeta((props.status || {}).config && props.status.config.providerMeta));
+        pm[provider] = meta;
+        fetch(API.state, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ providerMeta: pm }),
+        }).then(function (r) { return r.json(); }).then(function (b) {
+          setDeclBusy(false);
+          if (!b || !b.ok) { setDeclErr((b && b.error) || "保存失败"); return; }
+          setDeclSaved(true);
+          if (props.onSaved) props.onSaved();
+        }).catch(function () { setDeclBusy(false); setDeclErr("请求失败"); });
+      }
 
       // 拉取该 provider 的窗口声明（原 ModelTestPanel.openArchive 的取数部分）
       var load = useCallback(function () {
@@ -2766,7 +2881,88 @@ window.__ModuleLoader__.load({
       } else {
         archBody = h("div", { style: styles.meta }, "加载窗口信息…");
       }
-      archRows.push(h("div", { key: "arch-windows" }, archBody));
+      // ---- v0.9.10 Task 5：限额声明编辑区（OQ1：声明优先；实测仅提示，不自动覆盖） ----
+      archRows.push(
+        h("div", { key: "decl-title", style: styles.sectionTitle }, "限额声明（RPM / TPM / 重置）"),
+        h("div", { key: "decl-hint", style: styles.meta },
+          "声明值直接参与路由节流（近 60s 达到 90% 即避让该渠道）。实测仅作提示，不会自动覆盖声明。"));
+      // decl 由饿汉式初始化（见上），正常恒非 null；此分支是防御性兜底
+      // （若上游 status 结构意外变化导致 declFromMeta 返回空）。
+      if (!decl) {
+        archRows.push(h("div", { key: "decl-loading", style: styles.meta }, "加载声明…"));
+      } else {
+        var lbl = Object.assign({}, styles.meta, { width: "52px", display: "inline-block" });
+        archRows.push(
+          h("div", { key: "decl-rpm", style: styles.row },
+            h("span", { style: lbl }, "RPM"),
+            h("input", { style: archInputStyle, type: "number", min: "1", placeholder: "每分钟请求数",
+              value: decl.rpmLimit, onChange: function (e) { setDeclField("rpmLimit", e.target.value); } }),
+            h("span", { style: styles.meta }, "/min")),
+          h("div", { key: "decl-tpm", style: styles.row },
+            h("span", { style: lbl }, "TPM"),
+            h("input", { style: archInputStyle, type: "number", min: "1", placeholder: "每分钟 token 数",
+              value: decl.tpmLimit, onChange: function (e) { setDeclField("tpmLimit", e.target.value); } }),
+            h("span", { style: styles.meta }, "/min")),
+          h("div", { key: "decl-reset", style: styles.row },
+            h("span", { style: lbl }, "重置"),
+            h("select", { style: archInputStyle, value: decl.resetWindow,
+              onChange: function (e) { setDeclField("resetWindow", e.target.value); } },
+              h("option", { value: "" }, "未声明"),
+              h("option", { value: "minute" }, "每分钟滚动"),
+              h("option", { value: "hour" }, "每小时"),
+              h("option", { value: "day" }, "每日"),
+              h("option", { value: "rolling" }, "自定义滚动窗口")),
+            (decl.resetWindow === "hour" || decl.resetWindow === "day")
+              ? h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), placeholder: "HH:MM",
+                  value: decl.resetAt, onChange: function (e) { setDeclField("resetAt", e.target.value); } })
+              : null,
+            decl.resetWindow === "rolling"
+              ? h("input", { style: Object.assign({}, archInputStyle, { width: "130px" }), type: "number", min: "1", max: "86400",
+                  placeholder: "秒（1-86400）", value: decl.resetRollingSec,
+                  onChange: function (e) { setDeclField("resetRollingSec", e.target.value); } })
+              : null),
+          h("div", { key: "decl-src", style: styles.row },
+            h("span", { style: lbl }, "来源"),
+            h("input", { style: Object.assign({}, archInputStyle, { width: "175px" }), placeholder: "TPM 来源 URL",
+              value: decl.tpmLimitSourceUrl, onChange: function (e) { setDeclField("tpmLimitSourceUrl", e.target.value); } }),
+            h("input", { style: Object.assign({}, archInputStyle, { width: "175px" }), placeholder: "重置规则来源 URL",
+              value: decl.resetPolicySourceUrl, onChange: function (e) { setDeclField("resetPolicySourceUrl", e.target.value); } })),
+          h("div", { key: "decl-notes", style: styles.row },
+            h("span", { style: lbl }, "备注"),
+            h("input", { style: Object.assign({}, archInputStyle, { width: "380px" }), placeholder: "任意说明（≤500 字）",
+              value: decl.notes, onChange: function (e) { setDeclField("notes", e.target.value); } })),
+          h("div", { key: "decl-actions", style: styles.row },
+            h("button", { style: styles.button, disabled: declBusy, onClick: saveDecl },
+              declBusy ? "保存中…" : "保存声明")),
+          declErr ? h("div", { key: "decl-err", style: { color: "#c42b1c", margin: "4px 0" } }, declErr) : null,
+          declSaved ? h("div", { key: "decl-ok", style: { color: "#1a7f37", margin: "4px 0" } }, "声明已保存并即时生效") : null
+        );
+        // 冲突徽章（OQ1：声明优先 → 只提示，不提供自动采用入口）
+        conflicts.forEach(function (c, ci) {
+          var st = CONFLICT_STYLE[c.severity] || CONFLICT_STYLE.info;
+          archRows.push(h("div", { key: "decl-cf-" + ci, style: Object.assign({}, st, {
+            borderRadius: "6px", padding: "4px 8px", fontSize: "12px", margin: "4px 0"
+          }) }, (c.severity === "warn" ? "⚠ " : "ⓘ ") + c.message));
+        });
+      }
+      // ---- 实测（只读，仅参考） ----
+      if (observed) {
+        archRows.push(
+          h("div", { key: "obs-title", style: Object.assign({}, styles.meta, { marginTop: "8px", fontWeight: 600 }) },
+            "实测（仅参考，不参与路由决策）"),
+          h("div", { key: "obs-429", style: styles.meta },
+            "近 60s 采样 " + observed.sampleSize + " 次 · 429：速率 " + (observed.rateLimited429Count || 0) +
+            " / 配额 " + (observed.quotaExhausted429Count || 0) + " / 账号级 " + (observed.accountTpm429Count || 0)),
+          h("div", { key: "obs-rate", style: styles.meta },
+            "估算 " + (observed.estimatedRpm != null ? observed.estimatedRpm : "—") + " req/min" +
+            (observed.estimatedTpm != null ? " · " + observed.estimatedTpm + " tokens/min" : " · 无 token 数据") +
+            (observed.lastUpdatedAt ? " · 更新于 " + new Date(observed.lastUpdatedAt).toLocaleTimeString() : ""))
+        );
+      }
+
+      archRows.push(
+        h("div", { key: "win-title", style: styles.sectionTitle }, "窗口上限（5h / 1 周 / 自定义）"),
+        h("div", { key: "arch-windows" }, archBody));
       archRows.push(
         archErr ? h("div", { key: "arch-err", style: { color: "#c42b1c", margin: "6px 0" } }, archErr) : null,
         archSaved ? h("div", { key: "arch-ok", style: { color: "#1a7f37", margin: "6px 0" } }, "已保存并即时生效") : null,
@@ -2776,8 +2972,8 @@ window.__ModuleLoader__.load({
 
       return h("div", { key: "arch-overlay", style: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.35)", zIndex: 50, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 16px", overflow: "auto" } },
         h("div", { style: { background: "#fff", border: "1px solid #d0d7de", borderRadius: "10px", maxWidth: "620px", width: "100%", padding: "18px 20px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" } },
-          h("div", { style: styles.sectionTitle }, "窗口限额档案 · " + provider),
-          h("div", { style: styles.meta }, "窗口限额：某窗口耗尽后 wrapper 主动避让、不打上游；未声明 = 不限制，声明后耗尽即避让。「重置已用」清零 used 并重算 resetAt。"),
+          h("div", { style: styles.sectionTitle }, "渠道限额档案 · " + provider),
+          h("div", { style: styles.meta }, "两块内容：① 限额声明（RPM/TPM/重置）参与路由节流；② 窗口上限（5h/1周/自定义）耗尽后 wrapper 主动避让、不打上游。「重置已用」清零 used 并重算 resetAt。"),
           archRows));
     }
 
