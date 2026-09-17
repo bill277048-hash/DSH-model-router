@@ -17,3 +17,9 @@ DSH-model-router-v*.zip
 # 本机 Info-ZIP（Apple 版）在目标文件名含非 ASCII 时（如「…部署包.zip」）
 # 会创建 ziXXXXXX 形式的临时文件且不自动清理。打包后请随手 rm，勿入库。
 zi??????
+
+# v0.9.14 新发现：`zip -r ... lib` 会在**被压缩目录内**留下 XXXXXXXX 形式的
+# 临时副本（内容 = 被压缩文件本身，如 lib/XXMH38nm = metrics.js 的副本）。
+# 两次踩坑（v0.9.10 / v0.9.14）都导致 `git add -A` 误入库。
+# 打包后清理：`find . -name 'XX??????' -not -path './node_modules/*' -delete`
+XX??????

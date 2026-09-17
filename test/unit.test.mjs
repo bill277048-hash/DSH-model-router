@@ -4510,3 +4510,112 @@ test('v0.9.10 Task2: candidatesForRule 末尾调用 throttleByDeclared（端到�
   assert.deepEqual(out.map((h) => h.provider), ['b'], '端到端：a 被节流，b 保留');
 });
 
+// ============================================================
+// v0.9.10 Task 3c：wrapper 传 tokens + observedOf 实时计算
+// ============================================================
+
+import { usageTokens } from '../lib/quota.js';
+
+test('v0.9.10 Task3c: usageTokens——四项相加；全 0 退回 totalTokens；非法 → 0', () => {
+  // 四项相加
+  assert.equal(usageTokens({ inputTokens: 10, outputTokens: 5 }), 15);
+  assert.equal(usageTokens({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 3, cacheWriteTokens: 2 }), 20);
+  // 四项全 0 → 退回 totalTokens
+  assert.equal(usageTokens({ inputTokens: 0, outputTokens: 0, totalTokens: 99 }), 99);
+  assert.equal(usageTokens({ totalTokens: 42 }), 42);
+  // 缺失/非法 → 0
+  assert.equal(usageTokens(null), 0);
+  assert.equal(usageTokens(undefined), 0);
+  assert.equal(usageTokens({}), 0);
+  assert.equal(usageTokens('abc'), 0);
+  assert.equal(usageTokens({ inputTokens: 'x', outputTokens: 'y' }), 0);
+  // 负数不产生负总数（Number 转换后相加可能为负 → 归 0）
+  assert.equal(usageTokens({ inputTokens: -10, outputTokens: 5 }), 0, '负总数 → 0');
+});
+
+test('v0.9.10 Task3c: wrapper——committed 流的 usage 进入 metrics.tokens', async () => {
+  const { Metrics } = await import('../lib/metrics.js');
+  const m = new Metrics();
+  const deps = makeDeps({ deps: { metrics: m } });
+  const wrapper = createStreamWrapper(deps);
+  const primary = (async function* () {
+    yield { type: 'text-delta', index: 0, text: 'hi' };
+    yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } };
+    yield finishStop;
+  })();
+  await drain(wrapper.call({ stream() {} }, { provider: 'p-a', model: 'm-1' }, () => primary));
+  const recent = m.snapshot().recent;
+  const rec = recent.find((r) => r.outcome === 'committed');
+  assert.ok(rec, 'committed 采样存在');
+  assert.equal(rec.tokens, 15, 'usage 10+5 → tokens=15');
+  // recentTokenSum 也能查到
+  assert.equal(m.recentTokenSum('p-a', 60_000), 15);
+});
+
+test('v0.9.10 Task3c: wrapper——无 usage 的流 → tokens 为 null（不污染聚合）', async () => {
+  const { Metrics } = await import('../lib/metrics.js');
+  const m = new Metrics();
+  const deps = makeDeps({ deps: { metrics: m } });
+  const wrapper = createStreamWrapper(deps);
+  const primary = (async function* () {
+    yield { type: 'text-delta', index: 0, text: 'hi' };
+    yield finishStop; // 无 usage 分片
+  })();
+  await drain(wrapper.call({ stream() {} }, { provider: 'p-a', model: 'm-1' }, () => primary));
+  const rec = m.snapshot().recent.find((r) => r.outcome === 'committed');
+  assert.equal(rec.tokens, null, '无 usage → null');
+  assert.equal(m.aggregates.get('p-a/m-1').tokensSum, 0, '聚合不累加');
+});
+
+test('v0.9.10 Task3c: observedOf——三类 429 计数 + 速率折算', () => {
+  const m = new Metrics();
+  const now = new Date();
+  const mk = (errorCode, tokens) => ({ provider: 'a', model: 'A', outcome: errorCode ? 'failed' : 'committed', errorCode, tokens });
+  // 10 次采样：1 速率 + 2 配额 + 3 账号级 + 4 成功（其中 4 次有 token）
+  m.sample(mk('RATE_LIMITED'));
+  m.sample(mk('QUOTA_EXHAUSTED'));
+  m.sample(mk('QUOTA_EXHAUSTED'));
+  m.sample(mk('ACCOUNT_TPM_LIMITED'));
+  m.sample(mk('ACCOUNT_TPM_LIMITED'));
+  m.sample(mk('ACCOUNT_TPM_LIMITED'));
+  for (let i = 0; i < 4; i++) m.sample(mk(null, 100));
+  const obs = m.observedOf('a', 60_000, now);
+  assert.ok(obs, '有采样 → 非 null');
+  assert.equal(obs.rateLimited429Count, 1);
+  assert.equal(obs.quotaExhausted429Count, 2);
+  assert.equal(obs.accountTpm429Count, 3);
+  assert.equal(obs.sampleSize, 10);
+  // 60s 窗口 → 10 次/分钟
+  assert.equal(obs.estimatedRpm, 10);
+  // 400 tokens / 1 分钟
+  assert.equal(obs.estimatedTpm, 400);
+  assert.ok(obs.lastUpdatedAt);
+});
+
+test('v0.9.10 Task3c: observedOf——无采样 → null（区别于全 0）', () => {
+  const m = new Metrics();
+  assert.equal(m.observedOf('a'), null, '空 ring → null');
+  m.sample({ provider: 'b', model: 'B', outcome: 'committed' });
+  assert.equal(m.observedOf('a'), null, '无该 provider → null');
+  assert.ok(m.observedOf('b'), '有该 provider → 非 null');
+  assert.equal(m.observedOf(null), null, 'provider=null → null');
+});
+
+test('v0.9.10 Task3c: observedOf——窗口外采样不计入', () => {
+  const m = new Metrics();
+  m.sample({ provider: 'a', model: 'A', outcome: 'failed', errorCode: 'RATE_LIMITED' });
+  // 基准推到 100s 后 → sample 在 100s 前，超出 60s 窗口
+  const future = new Date(Date.now() + 100_000);
+  assert.equal(m.observedOf('a', 60_000, future), null, '窗口外 → null');
+  assert.ok(m.observedOf('a', 200_000, future), '宽窗口 → 非 null');
+});
+
+test('v0.9.10 Task3c: observedOf——无 token 采样时不产生 estimatedTpm', () => {
+  const m = new Metrics();
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed' }); // 无 tokens
+  const obs = m.observedOf('a', 60_000);
+  assert.equal(obs.sampleSize, 1);
+  assert.equal(obs.estimatedRpm, 1);
+  assert.equal(obs.estimatedTpm, undefined, '无 token 数据 → 不产生 estimatedTpm');
+});
+

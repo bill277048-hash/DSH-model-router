@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.9.14 (2026-09-17)
+
+> **v0.9.10 Task 3c：wrapper 真传 tokens + observed 实时计算**。
+> 打通「usage → metrics.tokens → observed」链路；observed **不持久化**（实时算）。
+
+### 改动 · `lib/wrapper/index.js`
+
+- `metaFields` 新增 `get tokens()` —— 由 `lastUsage` 实时转换（**单点改动覆盖 7 处 sample**）
+  - 用 **getter** 而非静态值：`{...metaFields}` 的 spread 在**各 sample 时刻**求值，
+    此时 `for await` 已填充 `lastUsage`（若用静态值会在收集 usage 前就固定为 null）
+- `let lastUsage` 声明**上移**到 `metaFields` 之前（供 getter 闭包引用）
+- 新增 `import { usageTokens } from '../quota.js'`
+
+### 新增 · `usageTokens(usage)`（`lib/quota.js` 导出）
+
+- 从 usage 分片提取 token 总数：`input + output + cacheRead + cacheWrite`，
+  四项全 0/缺失时退回 `totalTokens`
+- **唯一实现**：`QuotaLedger.record` 也改用它（消除内联重复）
+
+### 新增 · `Metrics.observedOf(provider, windowMs, now)`（`lib/metrics.js`）
+
+从 ring **实时计算** observed 快照（供 Task 4 冲突呈现消费）：
+
+```js
+{
+  lastUpdatedAt,                 // 窗口内最新采样时刻
+  rateLimited429Count,           // 三类 429 计数（依赖 Task 3a 的细分）
+  quotaExhausted429Count,
+  accountTpm429Count,
+  sampleSize,                    // 窗口内采样数（可信度参考）
+  estimatedRpm,                  // sampleSize / 窗口分钟数
+  estimatedTpm,                  // tokensSum / 窗口分钟数（无 token 数据时不产生）
+}
+```
+
+**窗口内无采样 → 返回 `null`**（区别于「全 0」——后者会被误读为「观测到 0 次限流」）。
+
+### 关键设计决策
+
+- **observed 不持久化**（偏离方案 §4.2 原设计）：observed 只是「最近观测」的只读投影，
+  重启后由新采样自然重建。持久化会引入 store 白名单 + 回放冲突等复杂度，且与
+  OQ1「声明优先、实测仅提示」的定位不符。**与 D8「conflicts 实时计算」保持一致**。
+- **getter 而非静态字段**：spread 时求值 → 自动取最新 `lastUsage`，零调用点改动
+- **外层 6 处 sample 不传 tokens**（passthrough/gate/catch/末）—— 那些路径本就没有
+  真实上游 usage（透传不主动收集），保持 `null` 是正确语义
+
+### 单测
+
+- 206 → **213**（+7 条）：
+  - `usageTokens`：四项相加 / 全 0 退回 totalTokens / 非法 → 0 / 负总数 → 0
+  - wrapper 集成：committed 流的 usage → `metrics.tokens=15`
+  - wrapper 集成：无 usage 的流 → `tokens=null`（不污染聚合）
+  - `observedOf`：三类 429 计数 + 速率折算（10 次/分钟、400 tokens/分钟）
+  - `observedOf`：无采样 → `null`
+  - `observedOf`：窗口外不计入
+  - `observedOf`：无 token 采样时不产生 `estimatedTpm`
+- **突变验证**（3 组全有效）：
+  - getter 改静态 null → 1 条变红
+  - `estimatedRpm` 错折算（/1000）→ 2 条变红
+  - `usageTokens` 忽略 cache tokens → 1 条变红
+  - 还原 → 213/213
+
 ## 0.9.13 (2026-09-17)
 
 > **v0.9.10 Task 3b：token 用量采集（metrics 接口扩展）**。
