@@ -1,6 +1,6 @@
 # @botton/dsh-model-router
 
-DSH 多供应商模型路由插件（v0.9.16）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告（结构化 + Markdown）** + **模型全自动测试（独立 phase + 退避 + 短路）** + **模型档案窗口限额（5h / 1周 / 自定义）** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板 + **诊断页签（按 seqId 分组的切换明细）** + **凭据失败黄条** + **match 收紧密（allowLegacyMatch）** + **free-tier 跨请求节流** + **context 窗口感知重排** + **每日报告一键启用与生成 toast**。
+DSH 多供应商模型路由插件（v0.9.17）：规则路由 + 首 token 前无感故障切换 + cooldown 熔断 + 用量记账 + **每日 API 报告（结构化 + Markdown）** + **模型全自动测试（独立 phase + 退避 + 短路）** + **模型档案窗口限额（5h / 1周 / 自定义）** + **面板信息分级** + **Windows 适配** + 状态接口 + WebUI 面板 + **诊断页签（按 seqId 分组的切换明细）** + **凭据失败黄条** + **match 收紧密（allowLegacyMatch）** + **free-tier 跨请求节流** + **context 窗口感知重排** + **每日报告一键启用与生成 toast**。
 
 - 兼容：dsh ≥ 0.1.1-rc.1，Node ≥ 22.19，零第三方运行时依赖
 - 许可证：Apache-2.0
@@ -151,6 +151,29 @@ curl --noproxy '*' -s -X POST 'http://127.0.0.1:3081/api/model-router/quota/rese
 - **语义边界**：不否决用户手工写进 `rule.route` 的条目，也不否决当前会话 seed——
   即「别再自动选它」，而非「全局禁用该 provider」
 - 面板「模型测试」页签的「排除」按钮即写此字段
+
+**`providerMeta` 限额声明字段**（v0.9.10 / v0.9.16；方向性方案 §6-A 阶段 A 落地）：
+
+| 字段 | 类型 | 语义 | 进路由 |
+| --- | --- | --- | --- |
+| `rpmLimit` | 正整数 | 每分钟请求上限 | ✓ 节流（90% 软上限） |
+| `tpmLimit` | 正整数 | 每分钟 token 上限 | ✓（待 Task 3c 提供 token 数据） |
+| `resetPolicy.window` | `minute` \| `hour` \| `day` \| `rolling` | 上游限额重置窗口 | ✗（仅声明）|
+| `resetPolicy.at` | `HH:MM` | hour/day 时必填 | ✗ |
+| `resetPolicy.rollingSec` | 1-86400 | rolling 时必填 | ✗ |
+| `tpmLimitSourceUrl` | http(s) URL | TPM 依据链接 | ✗（仅声明）|
+| `resetPolicySourceUrl` | http(s) URL | 重置规则依据链接 | ✗ |
+| `notes` | ≤500 字 | 备注 | ✗ |
+
+- **声明优先（OQ1）**：路由节流只用声明值，不读 observed。
+  实测仅作提示（`/status` 与抽屉冲突徽章）
+- **route hop 内联支持**：在 `rules[].route[].hop` 里也写 `rpmLimit`/`tpmLimit`/`resetPolicy`，
+  优先级 > `providerMeta[provider].*`（与既有 `quotaGroup`/`tier` 一致）
+- **拒绝非 http(s) URL**：`javascript:` / `data:` / `file:` 一律 400（XSS 边界）
+- **面板入口**：切换日志 / 模型测试 的「档案」按钮 → 抽屉「**渠道限额档案**」→
+  ① 限额声明（RPM/TPM/重置/来源/备注）② 实测（近 60s 三类 429 + 估算速率）③ 冲突徽章
+- **回传安全**：抽屉把 `/status` 的 providerMeta 原样回传时，`normalizeConfig` 自动丢弃
+  派生字段（`observed`/`conflicts`），无污染
 
 **按需负载测试**（手动触发，复用 probe 原语；默认只测 free tier，不烧付费 token）：
 

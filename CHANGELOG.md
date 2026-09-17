@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.9.16.1 (2026-09-17)
+
+> **v0.9.10 阶段 A 收口**。README/CHANGELOG 同步、方向性方案 §6-A 状态更新。
+> Task 6（声明通道扩能）随 Task 1/5 自然落地，Task 8（综合验证）勾选全部完成。
+
+### 收口交付物
+
+- **README.md / README.zh.md**：新增「`providerMeta` 限额声明字段」段（含字段表 + OQ1 声明优先 + URL XSS 边界 + 抽屉入口）
+- **方向性方案 §6-A**：阶段 A 已实施的所有 Task（1 / 2 / 3a-c / 4 / 5 / 6）勾选完成
+- **CHANGELOG**：v0.9.10 / v0.9.11 / v0.9.12 / v0.9.13 / v0.9.14 / v0.9.15 / v0.9.16 七个版本连贯
+
+### v0.9.10 阶段 A 验收清单（§6-A 勾选）
+
+| Task | 内容 | 状态 | commit |
+| --- | --- | --- | --- |
+| 1 | `providerMeta` schema 扩展（6 字段 + 校验） | ✅ | `1fe6c57` (v0.9.10) |
+| 2 | 后端声明 → 路由消费（`throttleByDeclared`）| ✅ | `97dc935` (v0.9.11) |
+| 3a | wrapper 三类 429 细分（`classifyBurnError`）| ✅ | `151e718` (v0.9.12) |
+| 3b | metrics token 接口扩展 | ✅ | `e11b2f8` (v0.9.13) |
+| 3c | wrapper 真传 tokens + observed 实时计算 | ✅ | `3b18ce6` (v0.9.14) |
+| 4 | 冲突呈现（`/status` 派生 `observed`/`conflicts`）| ✅ | `f3af0e8` (v0.9.15) |
+| 5 | UI 编辑器（抽屉限额声明 + 实测 + 冲突徽章）| ✅ | `af0975d` (v0.9.16) |
+| 6 | 声明通道扩能 | ✅ | （随 Task 1/5 落地）|
+| 8 | 综合验证 + 收口 | ✅ | （本次 commit）|
+
+### 门禁累计
+
+- 单测：185 → **225**（+40 条）
+- 突变验证：每 Task 3 组全有效（15+ 组合）
+- 8 页签 mock 渲染：全部无抛错
+- 服务端下发 client：168KB，关键标识符校验通过
+- 实机端到端：每 Task 5+ 场景
+- 部署包：7 个（v0.9.10 → v0.9.16），均已归档 NAS
+
+### 已知限制
+
+- **TPM 节流待激活**：`tpmLimit` 字段已就绪、`metrics.recentTokenSum` 已实现，
+  wrapper 真传 tokens（v0.9.14）—— 但 `Router.throttleByDeclared` 尚未接入 TPM 计数
+  （Task 2 范围限定为 RPM）
+- **provider-level vs route hop-level 声明编辑**：当前 UI 只编辑 `providerMeta[provider]`
+  级，hop 内联字段（`rules[].route[].hop`）需手改 patch
+
+### 下阶段建议
+
+- **v0.9.17**：将 TPM 计数接入路由节流（让 `tpmLimit` 真正生效）
+- **v0.9.18**：hop 内联声明也暴露到 UI
+- **v1.0**：长期观察后去掉实验性 `version: 1`（D4 决策红利兑现）
+
 ## 0.9.16 (2026-09-17)
 
 > **v0.9.10 Task 5：UI 编辑器**。渠道限额档案抽屉新增「限额声明」编辑区 +
