@@ -5418,3 +5418,47 @@ test('v0.9.20 P0: 装配守卫——index.js 向 ModelTestRunner 注入 archiveD
     '旧「仅 daily 存在时打日志」已移除（改为无条件打 reportDir）');
 });
 
+
+// ============================================================
+// v0.9.21 bis：Metrics.snapshot 不再截断到 50 条（节流数据源修复）
+// ============================================================
+// 缺陷：snapshot.recent = recent.slice(-50)，ring 上限 200。在「单 provider 60s 内
+// >50 次」场景下，路由层读到的样本数永远 ≤50 → RPM/TPM 节流阈值判定偏低，
+// 可能在确实超限的情况下「未触发节流」（v0.9.18/19 实装节流后此路径成为隐患）。
+// 实机项目 (b) 复现：注入 60 次/30s + `_now` 推 30s，节流未触发（54→50 后 50<54 不达阈值）。
+
+test('v0.9.21 bis: Metrics.snapshot.recent 完整透传 ring（节流数据源无截断）', async () => {
+  const { Metrics } = await import('../lib/metrics.js');
+  const m = new Metrics();
+  // 注入 100 次单 provider sample（远 > 旧 50 截断）
+  for (let i = 0; i < 100; i++) {
+    m.sample({ provider: 'p', model: 'm', outcome: 'committed', tokens: 1000 });
+  }
+  const s = m.snapshot();
+  assert.equal(s.recent.length, 100, 'snapshot 不再截断到 50（实测 100 全在）');
+  // 仍受 ring 上限约束（≤200）—— 注入 250 个 sample 应只剩 200
+  for (let i = 0; i < 150; i++) {
+    m.sample({ provider: 'p', model: 'm', outcome: 'committed', tokens: 1000 });
+  }
+  assert.ok(m.ring.length <= 200, 'ring 上限 200 仍在约束');
+  assert.equal(m.snapshot().recent.length, 200, 'snapshot 透传完整 ring（200 个）');
+});
+
+test('v0.9.21 bis: 实机场景复现——60 次/30s + rpmLimit=60 应触发节流（修后）', async () => {
+  const { Router } = await import('../lib/router.js');
+  const { Metrics } = await import('../lib/metrics.js');
+  const metrics = new Metrics();
+  // 模拟真实场景：60 次/30s，rpmLimit=60 → 90% 软上限 = 54
+  for (let i = 0; i < 60; i++) {
+    metrics.sample({ provider: 'p', model: 'm', outcome: 'committed', tokens: 1000 });
+  }
+  const t0 = Date.now();
+  const r = new Router({
+    rules: [{ route: [{ provider: 'p', model: 'm' }] }],
+    providerMeta: { p: { rpmLimit: 60, tpmLimit: 100000 } },
+    timeWindows: null,
+  }, null, null, metrics);
+  r._now = new Date(t0 + 30_000);
+  const out = r.throttleByDeclared([{ provider: 'p', model: 'm' }]);
+  assert.equal(out.length, 0, '60 次/30s → RPM 60 ≥ 54（90% 软上限）→ 必跳');
+});

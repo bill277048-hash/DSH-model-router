@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.9.22 (2026-09-17)
+
+> **实机观察期发现：Metrics.snapshot 截断导致节流失效**。
+> v0.9.18 引入 RPM/TPM 节流时假设 `snapshot.recent` 是「近 60s 完整数据」，
+> 实际它被 `.slice(-50)` 截断 —— 单 provider 60s 内 > 50 次时，前 N-50 个
+> **静默丢失**，节流阈值判定**永远偏低**，**该路径下功能失效**。
+
+### 原缺陷
+
+| 路径 | 影响 |
+| --- | --- |
+| `lib/metrics.js:snapshot()` 末尾 `recent: recent.slice(-50)` | 当单 provider 60s 内 sample > 50，**最老的 N-50 个被丢弃**；`throttleByDeclared` 数到的计数 ≤ 50 |
+| `Router.throttleByDeclared` 用 `snapshot.recent` 计算 RPM/TPM | 计数偏低 → 实际超限情况下**未触发节流**（**功能失效**）|
+
+### 复现（v0.9.21 实机项目 (b)）
+
+```js
+const m = new Metrics();
+for (let i = 0; i < 60; i++) m.sample({provider: 'p', model: 'm', outcome: 'committed', tokens: 1000});
+const t0 = Date.now();
+const r = new Router({rules: [{route: [{provider:'p', model:'m'}]}], providerMeta: {p: {rpmLimit: 60, tpmLimit: 100000}}, timeWindows: null}, null, null, m);
+r._now = new Date(t0 + 30_000);
+r.throttleByDeclared([{provider: 'p', model: 'm'}]);  // 修复前：返回 1（保留），修复后：返回 []（跳过）
+```
+
+60 次请求（>= 60*0.9 = 54）本应触发节流，但 snapshot 只截到 50，路由层数 50 < 54 → **未跳过**。
+
+### 修复
+
+`lib/metrics.js:snapshot()`：
+```diff
+- return { recent: recent.slice(-50), byRoute, sessionIds, sessions };
++ return { recent, byRoute, sessionIds, sessions };  // 完整透传
+```
+
+**风险评估**：
+- `ring` 上限仍为 `RING_CAPACITY = 200`（`sample` 内的 `shift()` 不变）
+- 5s 轮询拉一次最坏 200 条 ≈ **2KB/s** 传输（远低于任何带宽阈值）
+- 面板只显示「最近 N 条」，数据多了只是浪费轮询带宽，不致功能错
+
+**修法选择理由**（详见 `[v0.9.9-审核摘要.md](docs/v0.9.9-审核摘要.md)`）：
+- ✅ **ring 全量**（改 1 行）：最小改动 + 零行为退化
+- ❌ 节流改读 ring（需新 public `iterRecent`）：暴露内部结构
+- ❌ 专用滚动 RPM 聚合：结构改动大、新环形聚合
+
+### 单测
+
+- 253 → **255**（+2 条）：
+  - **Metrics.snapshot.recent 完整透传 ring**（100 个 sample 实测全部保留）
+  - **实机场景复现**：60 次/30s + `rpmLimit=60` 必跳（**修复前 fail → 修复后 pass**）
+- 既有 v0.9.21 测试全部保留（恢复自 HEAD，未提交改动已恢复）
+
+### 突变验证（2 组全有效）
+
+- 退回 `recent.slice(-50)` → 1 红
+- 去掉 `ring.shift()`（ring 上限失控）→ 1 红（实测 ring > 200 时仍受 cap 约束）
+- 还原 → 255/255
+
 ## 0.9.21 (2026-09-17)
 
 > **v0.9.9 审核报告剩余项收口**（I3 / S1 / S2 / S3 / S4）。
