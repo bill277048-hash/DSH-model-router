@@ -3927,7 +3927,9 @@ test('v0.9.9.4: listArchives——三类识别 + 忽略其他后缀 + 按时间�
     assert.deepEqual(items.map((i) => i.kind), ['loadtest', 'probe', 'model-test']);
     for (const it of items) {
       assert.equal(typeof it.size, 'number');
-      assert.ok(it.startedAt);
+      // v0.9.20 P2：字段名由 startedAt 改为 mtime（它是文件写入时刻，不是报告开始时间）
+      assert.ok(it.mtime, 'mtime 存在');
+      assert.equal(it.startedAt, undefined, '不再暴露易误解的 startedAt');
     }
     // 空目录 / 不存在目录 → 空列表（不抛错）
     assert.deepEqual(listArchives(mkdtempSync(join(tmpdir(), 'dsh-empty-'))), []);
@@ -5105,5 +5107,195 @@ test('v0.9.10 Task4: 回传安全——normalizeConfig 丢弃派生字段（不�
   assert.equal(m.rpmLimit, 100, '声明字段保留');
   assert.equal(m.observed, undefined, 'observed 被丢弃（不在白名单）');
   assert.equal(m.conflicts, undefined, 'conflicts 被丢弃');
+});
+
+// ============================================================
+// v0.9.20 P0（修复 C1）：model-test 档案落盘与 reports.enabled 解耦
+// ============================================================
+// 原缺陷：`ModelTestRunner.reportDir` 只读 `daily.reportDir`，而 `daily` 仅在
+// `cfg.reports.enabled === true` 时创建（index.js）→ **默认配置下 model-test
+// 跑批静默不落盘**，与 v0.9.9.3 声明的「档案落盘不依赖 reports.enabled」矛盾。
+
+test('v0.9.20 P0: ModelTestRunner.reportDir——显式注入优先于 daily', () => {
+  const explicit = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {}, reportDir: '/a' });
+  assert.equal(explicit.reportDir, '/a', '显式注入生效');
+  const legacy = new ModelTestRunner({ llm: {}, registry: null, daily: { reportDir: '/d' }, log: {} });
+  assert.equal(legacy.reportDir, '/d', '兼容：未传 reportDir 时回退 daily');
+  const both = new ModelTestRunner({ llm: {}, registry: null, daily: { reportDir: '/d' }, log: {}, reportDir: '/a' });
+  assert.equal(both.reportDir, '/a', '两者都在时显式优先');
+});
+
+test('v0.9.20 P0: reports.enabled=false（daily=null）时 reportDir 仍可用 —— C1 回归守卫', () => {
+  // 修复后：显式注入 → 可用
+  const fixed = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {}, reportDir: '/archive' });
+  assert.equal(fixed.reportDir, '/archive', 'daily=null 时仍能落盘');
+  // 反例（原 bug 形态）：未注入且 daily=null → null，证明该测试真的在测这条路径
+  const broken = new ModelTestRunner({ llm: {}, registry: null, daily: null, log: {} });
+  assert.equal(broken.reportDir, null, '未注入且无 daily → null（原 bug 形态）');
+});
+
+test('v0.9.20 P0: runReport——daily=null 仍落盘 json + md（真实集成，非源码断言）', async () => {
+  const { runReport } = await import('../lib/model-test.js');
+  const { mkdtempSync, readdirSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'mt-c1-'));
+  try {
+    // 探针立即失败（AUTH 是 probe 相的短路码）→ 跑批快速结束
+    const llm = {
+      stream: () => (async function* () {
+        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', message: 'no cred' } } };
+      })(),
+    };
+    const report = await runReport({
+      llm, registry: null, daily: null, log: {},
+      targets: [{ provider: 'p', model: 'm' }],
+      phases: ['probe'],
+      reportDir: dir,
+    });
+    assert.ok(report.runId, 'runId 已生成');
+    const jsons = readdirSync(dir).filter((n) => n.endsWith('.model-test.json'));
+    const mds = readdirSync(dir).filter((n) => n.endsWith('.model-test.md'));
+    assert.equal(jsons.length, 1, 'daily=null 仍落盘 json（C1 已修）');
+    assert.equal(mds.length, 1, 'md 也落盘');
+    const parsed = JSON.parse(readFileSync(join(dir, jsons[0]), 'utf8'));
+    assert.equal(parsed.kind, 'model-test', '统一 schema：kind');
+    assert.equal(parsed.schemaVersion, 1, '统一 schema：schemaVersion');
+    assert.equal(parsed.runId, report.runId, 'runId 一致');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.20 P0: runReport——未传 reportDir 且 daily=null → 不落盘但不抛错（旁路容错）', async () => {
+  const { runReport } = await import('../lib/model-test.js');
+  const warns = [];
+  const llm = {
+    stream: () => (async function* () {
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', message: 'no cred' } } };
+    })(),
+  };
+  const report = await runReport({
+    llm, registry: null, daily: null,
+    log: { warn: (m) => warns.push(String(m)) },
+    targets: [{ provider: 'p', model: 'm' }],
+    phases: ['probe'],
+  });
+  assert.ok(report.runId, '报告仍返回（落盘是旁路，不阻塞跑批）');
+  assert.ok(warns.some((w) => w.includes('档案目录不可用')), '有 warn 提示（不静默）');
+});
+
+// ============================================================
+// v0.9.20 P1（修复 I1）：writeAtomic 失败路径清理 tmp
+// ============================================================
+// 原缺陷：v0.9.9.2 统一原子写时漏掉 `unlinkSync(tmp)`，失败时残留 `.tmp-*`
+// （对照 daily.js 的同款实现一直有清理）。且既有测试
+// `writeAtomic 原子写（tmp 不残留）` **只覆盖成功路径** —— rename 成功后 tmp
+// 自然消失，断言恒真，恰好漏掉真正会残留的失败路径。
+
+test('v0.9.20 P1: writeAtomic 失败路径也清理 tmp（补齐「tmp 不残留」的承诺）', async () => {
+  const { writeAtomic } = await import('../lib/archive.js');
+  const { mkdtempSync, readdirSync, rmSync, mkdirSync, chmodSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-atomic-fail-'));
+  try {
+    // 场景 1：rename 失败（target 是已存在的目录）—— tmp 已创建成功
+    const blocked = join(dir, 'blocked');
+    mkdirSync(blocked);
+    assert.throws(() => writeAtomic(blocked, 'x', {}), '失败路径应抛错');
+    let leftovers = readdirSync(dir).filter((n) => n.includes('.tmp-'));
+    assert.deepEqual(leftovers, [], 'rename 失败后不残留 .tmp（I1 已修）');
+
+    // 场景 2：writeFileSync 就失败（父目录不存在）—— tmp 根本没创建
+    // 清理逻辑须容错（unlinkSync 会 ENOENT），不得因此掩盖原始错误
+    const missing = join(dir, 'no-such-dir', 'x.json');
+    assert.throws(() => writeAtomic(missing, 'x', {}), '写入失败应抛错');
+    leftovers = readdirSync(dir).filter((n) => n.includes('.tmp-'));
+    assert.deepEqual(leftovers, [], '写入阶段失败也不残留 .tmp');
+
+    // 场景 3：**清理错误不得掩盖原始错误**（判别式断言）
+    // 只读目录：writeFileSync 失败于 EACCES，而 unlinkSync 因文件不存在失败于 ENOENT。
+    // 若清理未包 try/catch，抛出的会是 ENOENT（掩盖了真正的 EACCES）——此断言即可捕获。
+    const roDir = join(dir, 'readonly');
+    mkdirSync(roDir);
+    chmodSync(roDir, 0o555);
+    try {
+      let thrown = null;
+      try { writeAtomic(join(roDir, 'x.json'), 'x', {}); } catch (e) { thrown = e; }
+      assert.ok(thrown, '只读目录写入应抛错');
+      assert.equal(thrown.code, 'EACCES', '抛出的是**原始**写入错误（未被清理的 ENOENT 掩盖）');
+    } finally {
+      chmodSync(roDir, 0o755); // 恢复可写，否则 rmSync 清不掉
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.20 P1: writeAtomic 成功路径仍正常（无回归）', async () => {
+  const { writeAtomic } = await import('../lib/archive.js');
+  const { mkdtempSync, readdirSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-atomic-ok-'));
+  try {
+    const target = join(dir, 'x.json');
+    writeAtomic(target, '{"a":1}', {});
+    assert.equal(readFileSync(target, 'utf8'), '{"a":1}');
+    assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.tmp-')), [], '成功路径无残留');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================
+// v0.9.20 P2（修复 I2）：listArchives 的 startedAt → mtime（消除同名异义）
+// ============================================================
+// 原缺陷：字段名叫 `startedAt` 但装的是**文件 mtime**，而详情视图的 `startedAt`
+// 是**报告自身字段** → 列表按 mtime 排序（重写档案后旧跑批跳到顶部）、
+// 且点进详情显示的时间与列表不同。
+
+test('v0.9.20 P2: listArchives 返回文件 mtime 而非报告内 startedAt（判别式断言）', async () => {
+  const { listArchives } = await import('../lib/archive.js');
+  const { mkdtempSync, writeFileSync, rmSync, utimesSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-p2-'));
+  try {
+    // 刻意让「报告内 startedAt」与「文件 mtime」不同
+    const reportStartedAt = '2020-01-01T00:00:00.000Z';
+    const fileMtime = new Date('2026-09-16T12:00:00.000Z');
+    const f = join(dir, 'r1.model-test.json');
+    writeFileSync(f, JSON.stringify({ runId: 'r1', startedAt: reportStartedAt }));
+    utimesSync(f, fileMtime, fileMtime);
+
+    const items = listArchives(dir);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].mtime, fileMtime.toISOString(), '返回的是文件 mtime');
+    assert.notEqual(items[0].mtime, reportStartedAt, '不是报告内的 startedAt（证明不读内容）');
+    assert.equal(items[0].startedAt, undefined, '不再暴露易误解的 startedAt 字段');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.20 P2: client 档案列表读 it.mtime + 表头「写入时间」（源码断言）', () => {
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('it.mtime ? new Date(it.mtime)'), '列表读 it.mtime');
+  assert.equal(/it\.startedAt/.test(src), false, '列表不再读 it.startedAt（已无同名异义）');
+  assert.ok(src.includes('"写入时间"'), '表头标注「写入时间」（不再是含糊的「时间」）');
+  assert.ok(src.includes('按写入时间倒序'), '提示文案同步澄清');
+  // 详情视图仍用报告自身 startedAt（语义不同，刻意保留）
+  assert.ok(src.includes('rep.startedAt'), '详情视图保留 rep.startedAt（报告自身开始时间）');
+});
+
+test('v0.9.20 P0: 装配守卫——index.js 向 ModelTestRunner 注入 archiveDir（源码断言）', () => {
+  const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8');
+  // 精确断言构造块内含 reportDir: archiveDir（与 probe / loadtest 同源）
+  assert.ok(/new ModelTestRunner\(\{[\s\S]{0,400}?reportDir: archiveDir,/.test(src),
+    'index.js 向 ModelTestRunner 注入 archiveDir（与 probe/loadtest 同源）');
+  assert.equal(/if \(daily\) log\.info\(`model-test ready/.test(src), false,
+    '旧「仅 daily 存在时打日志」已移除（改为无条件打 reportDir）');
 });
 

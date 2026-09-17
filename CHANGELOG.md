@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.9.20 (2026-09-17)
+
+> **v0.9.9 系列代码审核后的修复**（P0 / P1 / P2）。
+> 审核报告见 `docs/v0.9.9-代码审核报告.md`（1 Critical + 3 Important + 4 Suggestion）。
+
+### P0（Critical）· `model-test` 档案落盘与 `reports.enabled` 解耦
+
+**原缺陷**：`ModelTestRunner.reportDir` 只读 `daily.reportDir`，而 `daily` 仅在
+`cfg.reports.enabled === true` 时创建（`index.js`）→ **默认配置下 model-test 跑批
+静默不落盘**（仅一条 `log.warn`），与 v0.9.9.3 声明的「档案落盘不依赖
+`reports.enabled`」**直接矛盾**；v0.9.9.5 的「测试档案」页签对 model-test 恒为空。
+
+`probe` / `loadtest` 一直走 `archiveDir`（无条件），**只有 model-test 漏了**。
+
+**修复**：
+- `lib/index.js`：向 `ModelTestRunner` 注入 `reportDir: archiveDir`（与 probe/loadtest 同源）
+- `lib/model-test.js`：构造函数接受 `reportDir`；`get reportDir()` 改为
+  **显式注入优先 → `daily` 兜底**（兼容旧调用方）
+- `lib/model-test.js:runReport`：落盘改用 `runner.reportDir`（不再直接读 `daily`）
+
+### P1（Important）· `writeAtomic` 失败路径清理 tmp
+
+**原缺陷**：`lib/archive.js:writeAtomic` 失败时只 `throw` 不清理 → 残留 `.tmp-*`
+（含报告内容）。对照 `lib/daily.js` 的同款实现**一直有** `unlinkSync(tmp)` 清理 ——
+v0.9.9.2 统一原子写时**漏掉了这一步**，属重构引入的**功能倒退**。
+
+**修复**：`catch` 内补 `try { unlinkSync(tmp); } catch {}`
+（清理失败仅忽略，**不得掩盖原始写盘错误**）。
+
+### P2（Important）· `listArchives` 的 `startedAt` → `mtime`
+
+**原缺陷**：字段名叫 `startedAt` 但装的是**文件 mtime**，而详情视图的 `startedAt`
+是**报告自身字段** → 列表按 mtime 排序（经 `POST /model-test/manual` 重写档案后
+mtime 变新，**旧跑批会「跳」到列表顶部**），且点进详情显示的时间与列表不同。
+
+**修复**：`lib/archive.js` 字段重命名为 `mtime`；`client.js` 列表读 `it.mtime`、
+表头由含糊的「时间」改为「**写入时间**」、提示文案同步澄清。详情视图的
+`rep.startedAt`（报告自身开始时间）**刻意保留**——两者语义不同，现在名字也不再混淆。
+
+### 单测
+
+- 235 → **244**（+9 条）：
+  - P0：`reportDir` 显式优先 / `daily` 兜底 / 两者都在时显式优先（3 条）
+  - P0：**`daily=null` 时仍落盘 json+md 的真实集成测试**（非源码断言，含反例）
+  - P0：未传 `reportDir` 且 `daily=null` → 不落盘但不抛错 + 有 warn（旁路容错）
+  - P0：`index.js` 装配守卫（源码断言）
+  - P1：**失败路径也清理 tmp**（3 场景，含「清理错误不得掩盖原始错误」的判别式断言）
+  - P1：成功路径无回归
+  - P2：**返回 mtime 而非报告内 `startedAt`** 的判别式断言
+  - P2：client 读 `it.mtime` + 表头「写入时间」（源码断言）
+- 既有测试更新：`listArchives` 用例的 `startedAt` 断言改为 `mtime`
+- **突变验证**（10 组全有效）：
+  - P0（4 组）：getter 忽略显式注入 → 3 红；`index.js` 去掉 `reportDir` → 1 红；
+    `runReport` 不透传 → 1 红；`runReport` 退回读 `daily` → 1 红
+  - P1（3 组）：去掉 `unlinkSync` → 1 红；清理无 try/catch → 1 红；
+    清理放 `throw` 之后（死代码）→ 1 红
+  - P2（3 组）：字段退回 `startedAt` → 2 红；client 读 `startedAt` → 1 红；
+    表头退回「时间」→ 1 红
+  - 还原 → 244/244
+
+### 未修（Suggestion 级，留待后续）
+
+- **I3** 两套时间机制端点语义不一致（`inTimeWindow` 含端点 vs `segmentOf` 半开）—— 已确认，属刻意/未文档化，待补注释
+- **S1** `localHHMM` 未显式 `hourCycle: 'h23'`（当前 Node 实测无问题，属可移植性隐患）
+- **S2** `routes.js` 函数内 `require()` 与顶部 `import` 混用（非 bug，风格）
+- **S3** 「消除三套重复原子写」的文档声明与实际不符（实际仍有 4 处）
+- **S4** 两套档案列表器并存，`/model-test/list` 仍读全文
+
 ## 0.9.19 (2026-09-17)
 
 > **hop 内联声明 UI**。v0.9.18/v0.9.19 路线图第二步：「切换规则」页签的每个候选行

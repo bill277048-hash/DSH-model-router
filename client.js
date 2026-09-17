@@ -2505,7 +2505,7 @@ window.__ModuleLoader__.load({
       children.push(
         h("div", { key: "arch-head", style: styles.row },
           h("span", { style: styles.meta },
-            "三类档案（模型测试 / 负载测试 / 健康探测）· 按时间倒序 · 点行查看详情"),
+            "三类档案（模型测试 / 负载测试 / 健康探测）· 按写入时间倒序 · 点行查看详情"),
           h("button", { style: styles.button, disabled: busy, onClick: load },
             busy ? "加载中…" : "刷新"))
       );
@@ -2522,7 +2522,9 @@ window.__ModuleLoader__.load({
             onClick: function () { openDetail(it.kind, it.runId); }
           },
             h("td", { style: styles.td }, h("span", { style: styles.mono }, it.runId)),
-            h("td", { style: styles.td }, it.startedAt ? new Date(it.startedAt).toLocaleString() : "—"),
+            // v0.9.20 P2：字段由 startedAt 改为 mtime（列表只 stat 不读内容，
+            // 拿到的是文件写入时刻，不是报告自身开始时间——见 archive.js 注释）
+            h("td", { style: styles.td }, it.mtime ? new Date(it.mtime).toLocaleString() : "—"),
             h("td", { style: styles.td }, fmtBytes(it.size)));
         });
         children.push(
@@ -2535,7 +2537,7 @@ window.__ModuleLoader__.load({
                   h("thead", null,
                     h("tr", null,
                       h("th", { style: styles.th }, "runId"),
-                      h("th", { style: styles.th }, "时间"),
+                      h("th", { style: styles.th }, "写入时间"),
                       h("th", { style: styles.th }, "大小"))),
                   h("tbody", null, rows)))
         );
