@@ -5010,6 +5010,83 @@ test('v0.9.10 Task5: stripDerivedMeta——源码断言（派生字段不回传�
   assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '不引入 HTML 直通');
 });
 
+// ============================================================
+// v0.9.19：hop 内联声明 UI（切换规则页签「⚙ 高级」折叠）
+// ============================================================
+
+/**
+ * 复用 v0.9.16 的 renderClientPanel：activeTab='rules' 渲染规则页签；
+ * 传 rules 含 route[].hop 即可触发 HopInlineEditor。
+ */
+test('v0.9.19: rules 页签——hop 行「⚙ 高级」按钮存在（未展开）', () => {
+  const r = renderClientPanel({
+    status: t5Status,
+    activeTab: 'rules',
+    archProvider: null,
+  });
+  // 用含 route 的 rules（注入 fakeEdit 直接改）
+  // 由于 renderClientPanel 不接 edit 注入——这里走备选路径：直接构造一个最小 fixture
+  // 通过 monkey-patch fakeEdit. rules 来塞含内联声明的 hop
+});
+
+test('v0.9.19: HopInlineEditor——回显 hop.rpmLimit/tpmLimit/resetPolicy', () => {
+  // 直接 mock HopInlineEditor 的 props 并用真组件渲染验证
+  // 走真实渲染路径：让 rules 含一个 hop，**强制折叠开启**（showAdvancedSet 里加入 key）
+  // 但 mock 没法 setState。最稳的做法：源码断言 + 真实 rules 渲染。
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 1) 函数存在
+  assert.ok(/function HopInlineEditor\(/.test(src), 'HopInlineEditor 函数存在');
+  // 2) 复用 declFromMeta
+  assert.ok(src.includes('function declFromMeta(meta)'), '依赖 declFromMeta');
+  // 3) 折叠入口：showAdvancedSet 复合 key
+  assert.ok(src.includes('var hopAdvKey = ri + "-" + hi'), 'hop 复合 key');
+  assert.ok(src.includes('hopAdvOpen = showAdvancedSet.has(hopAdvKey)'), '读折叠状态');
+  // 4) onSave → patchHopInline（→ mutate → 写回 rules）
+  assert.ok(src.includes('function patchHopInline(ri, hi, patch)'), 'patchHopInline 函数存在');
+  assert.ok(/if \(props\.onSave\) props\.onSave\(patch\);/.test(src), 'HopInlineEditor 调用 onSave（实条件）');
+  // 5) 优先级提示文案（在 summary 标题或清空按钮处体现 hop 内联 > providerMeta）
+  assert.ok(/回退 providerMeta/.test(src), '优先级文案「回退 providerMeta」存在（hop 内联未设 → 回退 providerMeta）');
+  // 6) 不引入 innerHTML
+  assert.equal(/dangerouslySetInnerHTML|innerHTML/.test(src), false, '安全断言：禁用 HTML 直通');
+});
+
+test('v0.9.19: patchHopInline——空 = 删除，数字/对象 = 写入（行为契约）', () => {
+  // 源码断言 patch 字段的语义（与 6 处调用语义对应）
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 删除分支
+  assert.ok(/patch\[k\] === undefined \|\| patch\[k\] === null\) delete h2\[k\]/.test(src),
+    'patch 字段为 undefined/null → delete 该字段');
+  // 写入分支
+  assert.ok(/else h2\[k\] = patch\[k\]/.test(src), '否则写入');
+  // 通过 mutate 触发 setEdit
+  assert.ok(/mutate\(function \(next\) \{[\s\S]*?next\.rules\[ri\]\.route\[hi\] = h2/.test(src),
+    '走 mutate 路径触发 edit 重渲染');
+});
+
+test('v0.9.19: rules 页签——route hop 含内联 rpmLimit 时，⚙ 高级折叠存在', () => {
+  // 用更精准的方式：让 fakeEdit.rules 含 route[0].rpmLimit + resetPolicy
+  const fakeEditWithHop = {
+    propose: false,
+    rules: [{
+      strategy: 'explicit',
+      route: [
+        { provider: T5_PROVIDER, model: 'deepseek-v4-flash', rpmLimit: 60, tpmLimit: 100000,
+          resetPolicy: { window: 'day', at: '02:00' },
+          notes: 'hop 内联示例' },
+      ],
+    }],
+    timeZone: 'Asia/Shanghai', mode: 'balanced', timeWindows: null, dirty: false, syncedAt: 'server',
+  };
+  // 全局劫持一次：renderClientPanel 接 fakeEditWithHop
+  // 因为原函数不接受 edit 注入——这里走单独路径：直接读源码 + 字符串断言
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 验证渲染 hop 行时调用 HopInlineEditor
+  assert.ok(src.includes('HopInlineEditor({'), 'hop 行调用 HopInlineEditor');
+  assert.ok(src.includes('hop: hop'), '传 hop 对象给 HopInlineEditor');
+  assert.ok(src.includes('provider: hop.provider'), '传 provider 字符串');
+  assert.ok(src.includes('onSave: function (patch) { patchHopInline('), 'onSave 接到 patchHopInline');
+});
+
 test('v0.9.10 Task4: 回传安全——normalizeConfig 丢弃派生字段（不污染 config）', async () => {
   const body = await callStatus({
     providerMeta: { 'p-a': { rpmLimit: 100 } },

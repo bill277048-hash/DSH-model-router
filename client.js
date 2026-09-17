@@ -776,6 +776,19 @@ window.__ModuleLoader__.load({
       function removeHop(ri, hi) {
         mutate(function (next) { next.rules[ri].route.splice(hi, 1); });
       }
+      // v0.9.19：hop 内联声明字段写入。patch 字段：
+      //   - rpmLimit / tpmLimit / notes → undefined=删除，数字=写入
+      //   - resetPolicy → null=删除，{window,...}=写入
+      function patchHopInline(ri, hi, patch) {
+        mutate(function (next) {
+          var h2 = Object.assign({}, next.rules[ri].route[hi]);
+          for (var k in patch) {
+            if (patch[k] === undefined || patch[k] === null) delete h2[k];
+            else h2[k] = patch[k];
+          }
+          next.rules[ri].route[hi] = h2;
+        });
+      }
       function addHop(ri, provider, model) {
         if (!provider || !model) return;
         mutate(function (next) {
@@ -1272,6 +1285,9 @@ window.__ModuleLoader__.load({
                           var reg = registry.providers.find(function (x) { return x.provider === hop.provider; });
                           var known = !!reg && !reg.dormant;
                           var label = reg ? providerLabel(reg) : hop.provider;
+                          // v0.9.19：hop 内联声明折叠按钮（与抽屉共享 declFromMeta + CONFLICT_STYLE）
+                          var hopAdvKey = ri + "-" + hi;
+                          var hopAdvOpen = showAdvancedSet.has(hopAdvKey);
                           return h("div", { key: "h" + hi, style: styles.row },
                             h("span", { style: styles.mono },
                               (hi === 0 ? "① 首选 " : "   ↑" + (hi + 1) + " ") + label + " / " + hop.model),
@@ -1282,7 +1298,16 @@ window.__ModuleLoader__.load({
                               disabled: hi === (rule.route || []).length - 1,
                               onClick: function () { moveHop(ri, hi, 1); } }, "↓"),
                             h("button", { style: styles.button,
-                              onClick: function () { removeHop(ri, hi); } }, "移除"));
+                              onClick: function () { toggleAdvanced(hopAdvKey); } },
+                              hopAdvOpen ? "⚙ 收起" : "⚙ 高级"),
+                            h("button", { style: styles.button,
+                              onClick: function () { removeHop(ri, hi); } }, "移除"),
+                            hopAdvOpen ? HopInlineEditor({
+                              key: "hopedit-" + ri + "-" + hi,
+                              hop: hop,
+                              provider: hop.provider,
+                              onSave: function (patch) { patchHopInline(ri, hi, patch); },
+                            }) : null);
                         })),
                       // 行 5：追加候选（v0.9.4 UX 清理：作用域已废除，全量列出）
                       (function () {
@@ -2665,6 +2690,87 @@ window.__ModuleLoader__.load({
         resetPolicySourceUrl: m.resetPolicySourceUrl || "",
         notes: m.notes || "",
       };
+    }
+
+    /**
+     * v0.9.19：hop 内联声明编辑器（路由 hop 行高级折叠里的子组件）。
+     * 复用 declFromMeta（结构与 providerMeta 声明一致）。
+     *
+     * **重要**：hop 内联字段不进 observed/conflicts（实测是 provider 级）——
+     * 故本组件不显示实测区，只显示声明输入。
+     *
+     * 优先级（v0.9.10）：hop 内联 > providerMeta[provider]。当 hop 声明存在时，
+     * providerMeta 同字段被 hop 覆盖。
+     */
+    function HopInlineEditor(props) {
+      var hop = props.hop || {};
+      var sE = useState(declFromMeta(hop));
+      var edit = sE[0]; var setEdit = sE[1];
+      function setField(field, value) {
+        setEdit(function (cur) { return Object.assign({}, cur || {}, { [field]: value }); });
+      }
+      function save() {
+        if (!edit) return;
+        var patch = {};
+        ["rpmLimit", "tpmLimit"].forEach(function (k) {
+          if (edit[k] === "" || edit[k] == null) return; // 空 = 不动 hop 内联字段
+          patch[k] = Number(edit[k]);
+        });
+        if (edit.resetWindow) {
+          var rp = { window: edit.resetWindow };
+          if (edit.resetWindow === "hour" || edit.resetWindow === "day") {
+            if (edit.resetAt) rp.at = edit.resetAt;
+          } else if (edit.resetWindow === "rolling") {
+            if (edit.resetRollingSec !== "" && edit.resetRollingSec != null) rp.rollingSec = Number(edit.resetRollingSec);
+          }
+          patch.resetPolicy = rp;
+        } else {
+          patch.resetPolicy = null; // 显式清空 hop 内联 resetPolicy
+        }
+        if (edit.notes) patch.notes = edit.notes;
+        if (props.onSave) props.onSave(patch);
+      }
+      function clear() {
+        // 清空 hop 内联所有声明字段（回退到 providerMeta 兜底）
+        if (props.onSave) props.onSave({ rpmLimit: undefined, tpmLimit: undefined, resetPolicy: undefined, notes: undefined });
+      }
+      var hasInline = hop.rpmLimit != null || hop.tpmLimit != null ||
+                       (hop.resetPolicy && hop.resetPolicy.window) || hop.notes;
+      return h("details", { open: true, style: Object.assign({}, styles.fold, { marginLeft: "20px", padding: "6px 10px" }) },
+        h("summary", { style: styles.meta }, "⚙ 内联声明 " + (hasInline ? "（已设）" : "（未设；回退 providerMeta）")),
+        h("div", { style: styles.row },
+          h("span", { style: Object.assign({}, styles.meta, { width: "60px" }) }, "RPM"),
+          h("input", { style: archInputStyle, type: "number", min: "1", placeholder: "每分钟请求数（优先于 providerMeta）",
+            value: edit.rpmLimit, onChange: function (e) { setField("rpmLimit", e.target.value); } })),
+        h("div", { style: styles.row },
+          h("span", { style: Object.assign({}, styles.meta, { width: "60px" }) }, "TPM"),
+          h("input", { style: archInputStyle, type: "number", min: "1", placeholder: "每分钟 token 数",
+            value: edit.tpmLimit, onChange: function (e) { setField("tpmLimit", e.target.value); } })),
+        h("div", { style: styles.row },
+          h("span", { style: Object.assign({}, styles.meta, { width: "60px" }) }, "重置"),
+          h("select", { style: archInputStyle, value: edit.resetWindow,
+            onChange: function (e) { setField("resetWindow", e.target.value); } },
+            h("option", { value: "" }, "未声明"),
+            h("option", { value: "minute" }, "每分钟滚动"),
+            h("option", { value: "hour" }, "每小时"),
+            h("option", { value: "day" }, "每日"),
+            h("option", { value: "rolling" }, "自定义滚动")),
+          (edit.resetWindow === "hour" || edit.resetWindow === "day")
+            ? h("input", { style: Object.assign({}, archInputStyle, { width: "90px" }), placeholder: "HH:MM",
+                value: edit.resetAt, onChange: function (e) { setField("resetAt", e.target.value); } })
+            : null,
+          edit.resetWindow === "rolling"
+            ? h("input", { style: Object.assign({}, archInputStyle, { width: "130px" }), type: "number", min: "1", max: "86400",
+                placeholder: "秒（1-86400）", value: edit.resetRollingSec,
+                onChange: function (e) { setField("resetRollingSec", e.target.value); } })
+            : null),
+        h("div", { style: styles.row },
+          h("span", { style: Object.assign({}, styles.meta, { width: "60px" }) }, "备注"),
+          h("input", { style: Object.assign({}, archInputStyle, { width: "380px" }), placeholder: "≤500 字",
+            value: edit.notes, onChange: function (e) { setField("notes", e.target.value); } })),
+        h("div", { style: styles.row },
+          h("button", { style: styles.button, onClick: save }, "💾 保存到规则"),
+          hasInline ? h("button", { style: styles.button, onClick: clear }, "🗑 清空内联（回退 providerMeta）") : null));
     }
 
     /** v0.9.10 Task 5：冲突严重性 → 徽章配色（info 中性 / warn 警示 / critical 危险） */

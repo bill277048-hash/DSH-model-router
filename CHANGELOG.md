@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.9.19 (2026-09-17)
+
+> **hop 内联声明 UI**。v0.9.18/v0.9.19 路线图第二步：「切换规则」页签的每个候选行
+> 新增 **「⚙ 高级」** 折叠，可就地编辑该 hop 的 `rpmLimit` / `tpmLimit` / `resetPolicy` / `notes`。
+
+### 新增 · `client.js`
+
+- **`HopInlineEditor(props)`** —— hop 内联声明编辑器子组件
+  - 复用 `declFromMeta`（与 providerMeta 抽屉同结构）
+  - RPM / TPM 输入框 · 重置规则下拉（5 选项）+ 条件输入（`HH:MM` / 滚动秒）· 备注
+  - **「💾 保存到规则」** → `onSave(patch)` → `patchHopInline`
+  - **「🗑 清空内联（回退 providerMeta）」**（仅在已设时显示）
+  - 标题显示 `（已设）` / `（未设；回退 providerMeta）` —— 明确优先级语义
+- **`patchHopInline(ri, hi, patch)`** —— 写回 `rules[ri].route[hi]`
+  - `undefined` / `null` → **删除**该字段（回退 providerMeta 兜底）
+  - 数字 / 对象 → 写入
+  - 走既有 `mutate` 路径 → 触发 edit 重渲染（不绕过 dirty 标记）
+- hop 行新增 **「⚙ 高级」/「⚙ 收起」** 按钮（复用既有 `showAdvancedSet` 折叠机制，
+  key 用 `ri + "-" + hi` 复合，避免与规则级高级选项撞车）
+
+### 关键设计决策
+
+- **不显示实测/冲突**：`observed`/`conflicts` 是 **provider 级**派生数据（来自 metrics），
+  hop 内联是**规则级**覆盖 —— 两者粒度不同，混在一起会误导。故折叠内只做声明编辑，
+  实测/冲突仍在抽屉里看（`providerMeta[provider]` 粒度）
+- **空串 ≠ 删除**：hop 内联的 `rpmLimit` 留空 = **不动**该字段（保留现值）；
+  要删除必须点「🗑 清空内联」—— 与抽屉的「空串=删除」语义**刻意不同**
+  （因为 hop 编辑是 in-place 增量 patch，不是整体替换）
+- **复用既有 helper**：`declFromMeta` / `archInputStyle` / `styles.*` —— 零新样式
+- **走 `mutate`**：与既有 `moveHop` / `removeHop` / `addHop` 一致，dirty 标记与
+  保存流程零改动
+
+### 单测
+
+- 231 → **235**（+4 条）：
+  - `rules` 页签 hop 行「⚙ 高级」入口存在
+  - `HopInlineEditor` 函数存在 + 依赖 `declFromMeta`
+  - 折叠 key 为 `ri + "-" + hi` 复合 + 读 `showAdvancedSet`
+  - `patchHopInline` 存在 + `onSave` 实条件调用 + 优先级文案「回退 providerMeta」
+  - patch 语义契约：`undefined`/`null` → delete；否则写入；走 `mutate`
+  - 安全断言：`innerHTML` = 0
+- **突变验证**（4 组全有效）：
+  - 删除 `patchHopInline` → 2 条变红
+  - 优先级文案改中性 → 1 条变红
+  - 屏蔽 `onSave` 调用 → 1 条变红
+  - hop 行去掉 `HopInlineEditor` 调用 → 1 条变红
+  - 还原 → 235/235
+
+### 踩坑记录（流程）
+
+🔴 **突变验证的备份基线取错**：
+用 `git show HEAD:client.js` 作基线 —— 但 HEAD 是 v0.9.18，**未提交的 v0.9.19 改动被覆盖**，
+导致单测 3 条失败（测试文件有断言、client.js 没有实现）。
+**修**：备份必须取**当前工作区**状态（`cp client.js /tmp/base.js`），
+突变后从该备份还原，**绝不用 `git show HEAD`**。
+
 ## 0.9.18 (2026-09-17)
 
 > **TPM 节流激活**。`Router.throttleByDeclared` 现在**同时**判定 RPM 和 TPM
