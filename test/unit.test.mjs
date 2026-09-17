@@ -5462,3 +5462,166 @@ test('v0.9.21 bis: 实机场景复现——60 次/30s + rpmLimit=60 应触发节
   const out = r.throttleByDeclared([{ provider: 'p', model: 'm' }]);
   assert.equal(out.length, 0, '60 次/30s → RPM 60 ≥ 54（90% 软上限）→ 必跳');
 });
+
+// ============================================================
+// v0.9.23 B-b：listRunJson 重访阈值运行时告警（替代 flaky 的时间断言）
+// ============================================================
+// 背景（v0.9.21 S4）：/model-test 的 listRunJson 每份档案读全文，开销**线性增长**。
+// 原「何时该重访」只写在注释里 → 依赖有人记得读。
+// 现改为越过 LIST_REVISIT_THRESHOLD(150) 时主动 warn（正常零噪音）。
+//
+// 为什么不用「耗时 < N ms」断言：时间断言依赖机器负载（**flaky**），
+// 且本仓库已知沙箱 I/O 虚高 ~35 倍（skill §F）→ 时限无法同时做到不假红且有意义。
+// 故改用**确定性**的「是否告警」+「返回条数正确」断言。
+
+const mkModelTestReq = () => ({
+  method: 'GET',
+  url: '/api/model-router/model-test',
+  socket: { remoteAddress: '127.0.0.1' },
+  headers: { host: '127.0.0.1:3081' },
+  [Symbol.asyncIterator]: async function* () {},
+});
+
+const mkModelTestRes = () => {
+  const res = { writeHead(code) { res.status = code; }, setHeader() {}, end(b) { res.body = JSON.parse(b); } };
+  return res;
+};
+
+async function callModelTest(dir, log) {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const routes = makeStatusRoutes({
+    config: { statusPath: '/x', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '', reports: { dir } },
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { snapshot() { return {}; } },
+    quota: { snapshot() { return {}; } },
+    registry: null, probe: null, llm: {}, wrapperStats: {},
+    startedAt: Date.now(), saveStateFn: () => {}, log,
+    daily: { reportDir: dir }, reporter: {},
+    modelTest: { reportDir: dir, snapshot: () => ({ running: false, aborted: false, last: null }) },
+  });
+  const route = routes.find((r) => r.path === '/api/model-router/model-test');
+  const res = mkModelTestRes();
+  await route.handler(mkModelTestReq(), res);
+  return res;
+}
+
+test('v0.9.23 B-b: listRunJson 越界告警——151 份档案触发 warn 且返回完整列表', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-thr-'));
+  try {
+    const COUNT = 151; // > LIST_REVISIT_THRESHOLD(150)
+    for (let i = 0; i < COUNT; i++) {
+      writeFileSync(
+        join(dir, 'r' + String(i).padStart(3, '0') + '.model-test.json'),
+        JSON.stringify({ kind: 'model-test', runId: 'r' + i, startedAt: '2026-09-16T00:00:00.000Z', targets: [] }),
+      );
+    }
+    const warns = [];
+    const log = { warn: (m) => warns.push(String(m)), info: () => {}, error: () => {} };
+    const res = await callModelTest(dir, log);
+
+    assert.equal(res.status, 200, '端点 200');
+    assert.equal(res.body.list.length, COUNT, '返回全部 ' + COUNT + ' 份（不因告警而截断）');
+    const hit = warns.find((w) => w.includes('重访阈值'));
+    assert.ok(hit, '越界时应有重访告警');
+    assert.ok(hit.includes(String(COUNT)), '告警带上实际档案数');
+    assert.ok(/耗时 \d+ms/.test(hit), '告警带上实测耗时（供决策）');
+    assert.ok(hit.includes('轻量列表 + 点行惰性取详情'), '告警给出建议方向');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.23 B-b: listRunJson 未越界不告警（正常情况零噪音）', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-nothr-'));
+  try {
+    for (let i = 0; i < 10; i++) {
+      writeFileSync(
+        join(dir, 'r' + i + '.model-test.json'),
+        JSON.stringify({ kind: 'model-test', runId: 'r' + i, startedAt: '2026-09-16T00:00:00.000Z', targets: [] }),
+      );
+    }
+    const warns = [];
+    const log = { warn: (m) => warns.push(String(m)), info: () => {}, error: () => {} };
+    const res = await callModelTest(dir, log);
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.list.length, 10);
+    assert.equal(warns.filter((w) => w.includes('重访阈值')).length, 0, '10 份 < 150 → 不告警');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.24: /model-test 不再要求 daily/reporter（C1 读取路径残留已清）', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-gate-'));
+  try {
+    writeFileSync(
+      join(dir, 'r1.model-test.json'),
+      JSON.stringify({ kind: 'model-test', runId: 'r1', startedAt: '2026-09-16T00:00:00.000Z', targets: [] }),
+    );
+    const routes = makeStatusRoutes({
+      config: { statusPath: '/x', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '', reports: { dir } },
+      router: { snapshot() { return {}; }, recordExhausted() {} },
+      cooldown: { snapshot() { return {}; } },
+      metrics: { snapshot() { return {}; } },
+      quota: { snapshot() { return {}; } },
+      registry: null, probe: null, llm: {}, wrapperStats: {},
+      startedAt: Date.now(), saveStateFn: () => {}, log: { warn() {}, info() {}, error() {} },
+      // ★ 刻意不传 daily / reporter（等价 reports.enabled=false）
+      modelTest: { reportDir: dir, snapshot: () => ({ running: false, aborted: false, last: null }) },
+    });
+    const req = {
+      method: 'GET', url: '/api/model-router/model-test',
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: '127.0.0.1:3081' },
+      [Symbol.asyncIterator]: async function* () {},
+    };
+    const route = routes.find((r) => r.path === '/api/model-router/model-test');
+    const res = { writeHead(c) { res.status = c; }, setHeader() {}, end(b) { res.body = JSON.parse(b); } };
+    await route.handler(req, res);
+
+    assert.equal(res.status, 200, 'daily/reporter 缺失时仍 200（旧行为是 503）');
+    assert.equal(res.body.list.length, 1, '能列出已落盘的档案');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.9.24: /model-test 在 modelTest.reportDir 不可用时仍 503（守卫生效）', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const routes = makeStatusRoutes({
+    config: { statusPath: '/x', rules: [], fallbackPolicy: {}, probe: {}, timeZone: null, storePath: '', reports: {} },
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { snapshot() { return {}; } },
+    quota: { snapshot() { return {}; } },
+    registry: null, probe: null, llm: {}, wrapperStats: {},
+    startedAt: Date.now(), saveStateFn: () => {}, log: { warn() {}, info() {}, error() {} },
+    modelTest: { reportDir: null, snapshot: () => ({ running: false, aborted: false, last: null }) },
+  });
+  const req = {
+    method: 'GET', url: '/api/model-router/model-test',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3081' },
+    [Symbol.asyncIterator]: async function* () {},
+  };
+  const route = routes.find((r) => r.path === '/api/model-router/model-test');
+  const res = { writeHead(c) { res.status = c; }, setHeader() {}, end(b) { res.body = JSON.parse(b); } };
+  await route.handler(req, res);
+
+  assert.equal(res.status, 503, 'reportDir 不可用 → 503（不是静默返空）');
+});
