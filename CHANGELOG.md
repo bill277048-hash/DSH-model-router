@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.9.18 (2026-09-17)
+
+> **TPM 节流激活**。`Router.throttleByDeclared` 现在**同时**判定 RPM 和 TPM
+> （两者各自独立——任一超限即跳过，覆盖「RPM 没超但 TPM 超了仍放行」的盲点）。
+
+### 改动 · `lib/router.js`
+
+- `throttleByDeclared(chain)` 接入 `metrics.recentTokenSum(provider, 60_000, now)`（v0.9.13 实现）
+- 同一 hop **同时**评估：
+  - `recentCount >= rpmLimit * 0.9` → 跳过
+  - `recentTokenSum >= tpmLimit * 0.9` → 跳过
+  - 各自独立，**任一**超限即跳过该 hop
+- 窗口边界用 `>=`（与 v0.9.13 metrics.recentTokenSum 对齐）
+- TPM 抛错（含 helper 缺失）→ 容错（按 0 tokens 计算，不阻塞）
+- route hop 内联 `tpmLimit` 优先于 `providerMeta.tpmLimit`（与 rpmLimit 一致）
+
+### 单测
+
+- 225 → **231**（+6 条）：
+  - TPM 达 90% 软上限 → 跳过
+  - RPM + TPM 各自独立，任一超限即跳过（a: TPM 超；b: RPM 超；c: 健康）
+  - 未声明 tpmLimit → 仅按 RPM 节流
+  - route hop 内联 tpmLimit 优先于 providerMeta
+  - `recentTokenSum` 抛错/缺失 → 容错（0 tokens）
+  - `candidatesForRule` 端到端 TPM 节流
+- **突变验证**（3 组全有效）：
+  - 阈值改 1.0（永远达 100% 才节流）→ 2 条变红
+  - 去掉 TPM 节流分支 → 3 条变红
+  - 变量名错配（tpmDeclared 读 rpmLimit）→ 4 条变红
+  - 还原 → 231/231
+
+### 关键设计决策
+
+- **RPM 与 TPM 各自独立**：不共享阈值（90% 都是 0.9，但彼此不耦合）
+- **复用 v0.9.13 的 `recentTokenSum`**：不重新实现 token 计数（单一数据源）
+- **末尾过滤**：位置不变（在 healthReorder / contextReorder / dedupeByQuotaGroup 之后）
+- **容错优先**：TPM 计算抛错 → 按 0 tokens（与 v0.9.11 RPM 路径一致）
+
 ## 0.9.16.1 (2026-09-17)
 
 > **v0.9.10 阶段 A 收口**。README/CHANGELOG 同步、方向性方案 §6-A 状态更新。

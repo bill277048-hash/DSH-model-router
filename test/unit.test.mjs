@@ -4512,6 +4512,115 @@ test('v0.9.10 Task2: candidatesForRule 末尾调用 throttleByDeclared（端到�
 });
 
 // ============================================================
+// v0.9.18：TPM 节流激活（复用 metrics.recentTokenSum）
+// ============================================================
+
+test('v0.9.18: throttleByDeclared——TPM 达 90% 软上限 → 跳过', () => {
+  // 声明 tpmLimit=100，a 累计 tokens=100（100 >= 100*0.9=90）→ 跳过
+  // b 累计 tokens=50 → 保留
+  const m = new Metrics();
+  for (let i = 0; i < 10; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 10 });
+  for (let i = 0; i < 10; i++) m.sample({ provider: 'b', model: 'B', outcome: 'committed', tokens: 5 });
+  const sampleNow = Date.now();
+  const cfg = {
+    rules: [{ route: [{ provider: 'a', model: 'A' }, { provider: 'b', model: 'B' }] }],
+    providerMeta: { 'a': { tpmLimit: 100 }, 'b': { tpmLimit: 100 } },
+  };
+  const r = makeRouterT2(cfg, m, new Date(sampleNow + 30_000));
+  const out = r.throttleByDeclared([
+    { provider: 'a', model: 'A' },
+    { provider: 'b', model: 'B' },
+  ]);
+  assert.deepEqual(out.map((h) => h.provider), ['b'], 'a TPM 超限 → 跳过；b 保留');
+});
+
+test('v0.9.18: throttleByDeclared——RPM + TPM 各自独立，任一超限即跳过', () => {
+  const m = new Metrics();
+  // a：RPM 健康（5 次，未超 10*0.9=9），但 TPM 超限（100 tokens >= 100*0.9=90）→ 跳过
+  // b：RPM 超限（10 次 >= 10*0.9=9），TPM 健康（30 tokens）→ 跳过
+  // c：两者都健康 → 保留
+  for (let i = 0; i < 5; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 20 });
+  for (let i = 0; i < 10; i++) m.sample({ provider: 'b', model: 'B', outcome: 'committed', tokens: 3 });
+  for (let i = 0; i < 3; i++) m.sample({ provider: 'c', model: 'C', outcome: 'committed', tokens: 10 });
+  const sampleNow = Date.now();
+  const cfg = {
+    rules: [{ route: [
+      { provider: 'a', model: 'A' }, { provider: 'b', model: 'B' }, { provider: 'c', model: 'C' },
+    ] }],
+    providerMeta: {
+      'a': { rpmLimit: 10, tpmLimit: 100 },
+      'b': { rpmLimit: 10, tpmLimit: 100 },
+      'c': { rpmLimit: 10, tpmLimit: 100 },
+    },
+  };
+  const r = makeRouterT2(cfg, m, new Date(sampleNow + 30_000));
+  const out = r.throttleByDeclared([
+    { provider: 'a', model: 'A' }, { provider: 'b', model: 'B' }, { provider: 'c', model: 'C' },
+  ]);
+  assert.deepEqual(out.map((h) => h.provider), ['c'], '仅 c 保留（a: TPM 超；b: RPM 超；c: 健康）');
+});
+
+test('v0.9.18: throttleByDeclared——未声明 tpmLimit → 仅按 RPM 节流', () => {
+  // 只声明 rpmLimit，未声明 tpmLimit → tokens 不参与节流
+  const m = new Metrics();
+  for (let i = 0; i < 5; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 100000 });
+  const sampleNow = Date.now();
+  const cfg = {
+    rules: [{ route: [{ provider: 'a', model: 'A' }] }],
+    providerMeta: { 'a': { rpmLimit: 10 } }, // 仅 rpmLimit
+  };
+  const r = makeRouterT2(cfg, m, new Date(sampleNow + 30_000));
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A' }]);
+  assert.equal(out.length, 1, '未声明 tpmLimit → tokens 巨大也不节流');
+});
+
+test('v0.9.18: throttleByDeclared——hop 内联 tpmLimit 优先于 providerMeta', () => {
+  // hop 内联 tpmLimit=100（更宽松），providerMeta.tpmLimit=10（更严）→ 按内联判
+  const m = new Metrics();
+  for (let i = 0; i < 10; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 8 });
+  // 实际 tokens=80：按内联 100（100*0.9=90）未超；按 providerMeta 10（10*0.9=9）已超
+  // 期望：使用内联（更宽松），保留
+  const sampleNow = Date.now();
+  const cfg = {
+    rules: [{ route: [{ provider: 'a', model: 'A', tpmLimit: 100 }] }], // 内联更宽松
+    providerMeta: { 'a': { tpmLimit: 10 } }, // providerMeta 更严
+  };
+  const r = makeRouterT2(cfg, m, new Date(sampleNow + 30_000));
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A', tpmLimit: 100 }]);
+  assert.equal(out.length, 1, 'route hop 内联 tpmLimit 优先（更宽松）');
+});
+
+test('v0.9.18: throttleByDeclared——recentTokenSum 抛错 → 容错（按 0 tokens）', () => {
+  const cfg = {
+    rules: [{ route: [{ provider: 'a', model: 'A' }] }],
+    providerMeta: { 'a': { tpmLimit: 100 } },
+  };
+  const r = makeRouterT2(cfg, {}, new Date()); // 无 recentTokenSum 方法
+  const out = r.throttleByDeclared([{ provider: 'a', model: 'A' }]);
+  assert.equal(out.length, 1, 'recentTokenSum 缺失 → 容错（tokens=0，不节流）');
+});
+
+test('v0.9.18: candidatesForRule 端到端——TPM 节流真正生效', () => {
+  // 与 Task 2 端到端对照：现在用 tokens 而不是 requests 触发
+  const m = new Metrics();
+  // a: 5 次（rpm 健康）+ 100 tokens/次 × 5 = 500 tokens（tpmLimit=500，超 90%=450）
+  for (let i = 0; i < 5; i++) m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 100 });
+  // b: 3 次 × 50 tokens = 150 tokens（tpmLimit=500，未超）
+  for (let i = 0; i < 3; i++) m.sample({ provider: 'b', model: 'B', outcome: 'committed', tokens: 50 });
+  const sampleNow = Date.now();
+  const cfg = {
+    rules: [{ route: [
+      { provider: 'a', model: 'A' },
+      { provider: 'b', model: 'B' },
+    ] }],
+    providerMeta: { 'a': { tpmLimit: 500 }, 'b': { tpmLimit: 500 } },
+  };
+  const r = makeRouterT2(cfg, m, new Date(sampleNow + 30_000));
+  const out = r.candidatesForRule(cfg.rules[0]);
+  assert.deepEqual(out.map((h) => h.provider), ['b'], '端到端：a TPM 超限被跳过');
+});
+
+// ============================================================
 // v0.9.10 Task 3c：wrapper 传 tokens + observedOf 实时计算
 // ============================================================
 
