@@ -4219,6 +4219,88 @@ test('v0.9.10 Task1: route hop 内联——rpmLimit/tpmLimit/resetPolicy 同样�
 });
 
 // ============================================================
+// v0.9.10 Task 3a：wrapper 三类 429 细分（classifyBurnError）
+// ============================================================
+
+import { classifyBurnError } from '../lib/wrapper/index.js';
+
+test('v0.9.10 Task3a: classifyBurnError——速率类（RATE_LIMITED）', () => {
+  const cases = [
+    ['RATE_LIMIT', 'RATE_LIMITED', 'rateLimited'],
+    ['rate_limit', 'RATE_LIMITED', 'rateLimited'], // 大小写
+    ['RATE_LIMITED', 'RATE_LIMITED', 'rateLimited'],
+    ['429001', 'RATE_LIMITED', 'rateLimited'], // HTTP 错误码
+    ['inference exceeds tpm', 'RATE_LIMITED', 'rateLimited'],
+    ['InferencE Exceeds Rpm', 'RATE_LIMITED', 'rateLimited'], // 混合大小写
+    ['TPM rate limit exceeded', 'RATE_LIMITED', 'rateLimited'],
+    ['RPM rate limit exceeded', 'RATE_LIMITED', 'rateLimited'],
+  ];
+  for (const [input, expectedCode, expectedKind] of cases) {
+    const r = classifyBurnError(input);
+    assert.equal(r.code, expectedCode, `${input} → code=${expectedCode}（实际 ${r.code}）`);
+    assert.equal(r.kind, expectedKind, `${input} → kind=${expectedKind}（实际 ${r.kind}）`);
+  }
+});
+
+test('v0.9.10 Task3a: classifyBurnError——配额类（QUOTA_EXHAUSTED）', () => {
+  const cases = [
+    ['QUOTA', 'QUOTA_EXHAUSTED', 'quotaExhausted'],
+    ['QUOTA_EXCEEDED', 'QUOTA_EXHAUSTED', 'quotaExhausted'],
+    ['QUOTA_EXHAUSTED', 'QUOTA_EXHAUSTED', 'quotaExhausted'],
+    ['quota_exceeded_error', 'QUOTA_EXHAUSTED', 'quotaExhausted'], // OpenAI 风格
+    ['Quota Exceeded', 'QUOTA_EXHAUSTED', 'quotaExhausted'],
+  ];
+  for (const [input, expectedCode, expectedKind] of cases) {
+    const r = classifyBurnError(input);
+    assert.equal(r.code, expectedCode, `${input} → code=${expectedCode}`);
+    assert.equal(r.kind, expectedKind, `${input} → kind=${expectedKind}`);
+  }
+});
+
+test('v0.9.10 Task3a: classifyBurnError——账号级 TPM（ACCOUNT_TPM_LIMITED）', () => {
+  const cases = [
+    ['ModelAccountTpmRateLimitExceeded', 'ACCOUNT_TPM_LIMITED', 'accountTpm'], // OpenAI
+    ['ACCOUNT_TPM_RATE_LIMIT_EXCEEDED', 'ACCOUNT_TPM_LIMITED', 'accountTpm'], // 规范化
+    ['ACCOUNT_TPM', 'ACCOUNT_TPM_LIMITED', 'accountTpm'],
+    ['Account Tpm', 'ACCOUNT_TPM_LIMITED', 'accountTpm'],
+    ['ACCOUNTTPM', 'ACCOUNT_TPM_LIMITED', 'accountTpm'], // 无下划线
+    ['ACCOUNT-TPM', 'ACCOUNT_TPM_LIMITED', 'accountTpm'], // 短横线
+  ];
+  for (const [input, expectedCode, expectedKind] of cases) {
+    const r = classifyBurnError(input);
+    assert.equal(r.code, expectedCode, `${input} → code=${expectedCode}`);
+    assert.equal(r.kind, expectedKind, `${input} → kind=${expectedKind}`);
+  }
+});
+
+test('v0.9.10 Task3a: classifyBurnError——非三类原样返回（kind=other）', () => {
+  const cases = [
+    [null, null, 'other'],
+    [undefined, undefined, 'other'],
+    ['', '', 'other'],
+    ['TIMEOUT', 'TIMEOUT', 'other'],           // 内部 sentinel
+    ['EMPTY_RESPONSE', 'EMPTY_RESPONSE', 'other'],
+    ['STREAM_ERROR', 'STREAM_ERROR', 'other'],
+    ['CONTEXT_LENGTH', 'CONTEXT_LENGTH', 'other'], // Context 类（不细分）
+    ['TRANSPORT', 'TRANSPORT', 'other'],
+    ['SERVER', 'SERVER', 'other'],
+  ];
+  for (const [input, expectedCode, expectedKind] of cases) {
+    const r = classifyBurnError(input);
+    assert.equal(r.code, expectedCode, `${input} → code=${expectedCode}`);
+    assert.equal(r.kind, expectedKind, `${input} → kind=${expectedKind}`);
+  }
+});
+
+test('v0.9.10 Task3a: classifyBurnError——账号级 TPM 优先级高于通用 RATE_LIMIT', () => {
+  // 防御性测试：若 'ACCOUNT' 与 'RATE' 同时出现，账号级优先
+  // （OpenAI 的 ModelAccountTpmRateLimitExceeded 同时含两者 → 应归账号级）
+  const r = classifyBurnError('ModelAccountTpmRateLimitExceeded');
+  assert.equal(r.kind, 'accountTpm', '账号级 TPM 优先于通用速率');
+  assert.equal(r.code, 'ACCOUNT_TPM_LIMITED');
+});
+
+// ============================================================
 // v0.9.10 Task 2：路由节流（按声明 rpmLimit；不读 observed）
 // ============================================================
 // Router 已 import（line 15）；Metrics 检查是否已 import

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.12 (2026-09-17)
+
+> **v0.9.10 Task 3a：wrapper 三类 429 细分**。把上游错误码分成方向性方案
+> v1.3 §4.7 的三类（速率 / 配额 / 账号级 TPM），落 `metrics.errorCode`。
+> **不改**既有 failover / cooldown 路径——它们仍以原始 code 为准。
+
+### 新增 · `classifyBurnError(rawCode)`（`lib/wrapper/index.js`）
+
+| rawCode（DSH 适配器） | 落 metrics 的 code | kind | 用途 |
+| --- | --- | --- | --- |
+| `RATE_LIMIT` / `RATE_LIMITED` / `429001` / `inference exceeds tpm/rpm` | `RATE_LIMITED` | `rateLimited` | 速率限制 |
+| `QUOTA` / `QUOTA_EXCEEDED` / `quota_exceeded_error` | `QUOTA_EXHAUSTED` | `quotaExhausted` | 配额耗尽 |
+| `ModelAccountTpmRateLimitExceeded` / `ACCOUNT_TPM_*` | `ACCOUNT_TPM_LIMITED` | `accountTpm` | **账号级 TPM**（换模型无效）|
+| 其他（TIMEOUT / CONTEXT_* / TRANSPORT / 空 / null）| 原样 | `other` | 不计入 observed |
+
+- **账号级优先**：OpenAI 的 `ModelAccountTpmRateLimitExceeded` 同时含 `ACCOUNT` + `RATE` 字样，**先**匹配 `accountTpm` 分支，避免被误归 `rateLimited`
+- **大小写容错**：DSH 适配器各 upstream code 大小写/拼写可能略差异，用 `.toUpperCase() + includes` 兜底
+- **失败不阻塞**：非三类原样返回（保留可观测性）—— 不影响既有 failover 路径
+
+### 集成点 · 4 处 metrics.sample
+
+| 位置 | 原 errorCode | 新 errorCode |
+| --- | --- | --- |
+| L313（catch 分支） | `error?.code ?? 'STREAM_ERROR'` | `classifyBurnError(...).code` |
+| L348（透传 + 失败时） | `recErrorCode` | `classifyBurnError(recErrorCode).code`（**仅失败时**） |
+| L504（failover 信号） | `code` | `classifyBurnError(code).code` |
+| L522（已 commit 失败） | `code` | `classifyBurnError(code).code`（**仅失败时**） |
+
+**关键**：成功路径（`outcome === 'committed'`）errorCode **原样保留**（不细分）—— 只有失败路径才需要类别细分用于 observed 计数。
+
+### 单测
+
+- 196 → **201**（+5 条）：
+  - 速率类（RATE_LIMIT / RATE_LIMITED / 429001 / "inference exceeds tpm/rpm" / 大小写变体）→ 8 case
+  - 配额类（QUOTA / QUOTA_EXCEEDED / OpenAI 风格）→ 5 case
+  - 账号级（OpenAI / 规范化 / 短横线 / 无下划线）→ 6 case
+  - 非三类（null / undefined / 内部 sentinel / Context 类）→ 9 case
+  - 账号级优先级（与 RATE 同时出现时归账号级）→ 1 case
+- **突变验证**（2 组全有效）：
+  - 删除 ACCOUNT_TPM 匹配分支 → 2 条变红
+  - 删除 QUOTA_EXCEEDED → 1 条变红
+  - 还原 → 201/201
+
 ## 0.9.11 (2026-09-17)
 
 > **v0.9.10 Task 2：路由节流（按声明 rpmLimit；不读 observed）**。
