@@ -4619,3 +4619,172 @@ test('v0.9.10 Task3c: observedOf——无 token 采样时不产生 estimatedTpm'
   assert.equal(obs.estimatedTpm, undefined, '无 token 数据 → 不产生 estimatedTpm');
 });
 
+// ============================================================
+// v0.9.10 Task 4：冲突呈现（/status 派生 observed + conflicts）
+// ============================================================
+
+/** 调 /status，返回响应体（providerMeta 含派生字段） */
+async function callStatus({ providerMeta = {}, observedOf = () => null }) {
+  // 既有用例都是测试内动态 import（非顶层），故此处同样动态取
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const routes = makeStatusRoutes({
+    config: {
+      statusPath: '/api/model-router/status', rules: [], fallbackPolicy: {},
+      probe: {}, timeZone: null, storePath: '', providerMeta,
+    },
+    router: { snapshot() { return {}; }, recordExhausted() {} },
+    cooldown: { snapshot() { return {}; } },
+    metrics: { observedOf, snapshot() { return { recent: [] }; } },
+    quota: { snapshot() { return {}; } },
+    registry: null, probe: null, llm: {}, wrapperStats: {},
+    startedAt: Date.now(), saveStateFn: () => {}, log,
+  });
+  const route = routes.find((r) => r.path === '/api/model-router/status');
+  let body;
+  const res = { writeHead() {}, setHeader() {}, end(b) { body = JSON.parse(b); } };
+  await route.handler({ method: 'GET', socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:3081' } }, res);
+  return body;
+}
+
+test('v0.9.10 Task4: /status——无 observed 时不产生派生字段', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 60 } },
+    observedOf: () => null,
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.rpmLimit, 60, '声明字段保留');
+  assert.equal(m.observed, undefined, '无观测 → 无 observed');
+  assert.equal(m.conflicts, undefined, '无观测 → 无 conflicts');
+});
+
+test('v0.9.10 Task4: /status——采样不足（<10）只给 info，不给 warn', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 100 } },
+    // 9 次采样（< 10），且被限流、速率很低——但采样不足 → 只 info
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 3, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 9, estimatedRpm: 9,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts.length, 1);
+  assert.equal(m.conflicts[0].severity, 'info', '采样不足 → info');
+  assert.equal(m.conflicts[0].field, 'sampleSize');
+  assert.match(m.conflicts[0].message, /9 次采样/);
+});
+
+test('v0.9.10 Task4: /status——被限流且速率显著低于声明 → warn（虚标）', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 100 } },
+    // 20 次采样，其中 5 次限流；速率 20/min 远低于声明 100（20 < 100*0.8=80）→ warn
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 5, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 20, estimatedRpm: 20,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts.length, 1);
+  assert.equal(m.conflicts[0].severity, 'warn');
+  assert.equal(m.conflicts[0].field, 'rpmLimit');
+  assert.equal(m.conflicts[0].declared, 100);
+  assert.equal(m.conflicts[0].observed, 20);
+  assert.match(m.conflicts[0].message, /实际限额可能低于声明/);
+});
+
+test('v0.9.10 Task4: /status——速率接近声明（>=80%）→ 不产生 warn', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 100 } },
+    // 速率 85/min >= 100*0.8=80 → 声明基本准确，不算虚标
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 5, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 85, estimatedRpm: 85,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts, undefined, '接近声明 → 无冲突');
+  assert.ok(m.observed, '但 observed 仍回显（供面板展示实测）');
+});
+
+test('v0.9.10 Task4: /status——未被限流时即使速率低也不告警', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 100 } },
+    // 速率极低但 0 次限流 → 只是没跑满，不是虚标
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 0, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 15, estimatedRpm: 15,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts, undefined, '无限流 → 无冲突（低速率是正常的没跑满）');
+});
+
+test('v0.9.10 Task4: /status——TPM 冲突（有 token 数据时）', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { tpmLimit: 100000 } },
+    // 被限流，且 tokens 用量 20000/min < 100000*0.8=80000 → warn
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 3, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 20, estimatedRpm: 20, estimatedTpm: 20000,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts.length, 1);
+  assert.equal(m.conflicts[0].field, 'tpmLimit');
+  assert.equal(m.conflicts[0].declared, 100000);
+  assert.equal(m.conflicts[0].observed, 20000);
+});
+
+test('v0.9.10 Task4: /status——RPM+TPM 双冲突可同时出现', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 100, tpmLimit: 100000 } },
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 3, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 20, estimatedRpm: 20, estimatedTpm: 20000,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts.length, 2, 'RPM + TPM 两条');
+  assert.deepEqual(m.conflicts.map((c) => c.field).sort(), ['rpmLimit', 'tpmLimit']);
+});
+
+test('v0.9.10 Task4: /status——无声明字段时不产生 warn（无可比对象）', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { quotaGroup: 'g1' } }, // 只声明 quotaGroup，无 rpm/tpm
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 5, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 20, estimatedRpm: 20,
+    }),
+  });
+  const m = body.config.providerMeta['p-a'];
+  assert.equal(m.conflicts, undefined, '无 rpmLimit/tpmLimit → 无可比对象 → 无冲突');
+  assert.equal(m.quotaGroup, 'g1', '其他声明字段保留');
+  assert.ok(m.observed, 'observed 仍回显');
+});
+
+test('v0.9.10 Task4: 回传安全——normalizeConfig 丢弃派生字段（不污染 config）', async () => {
+  const body = await callStatus({
+    providerMeta: { 'p-a': { rpmLimit: 100 } },
+    observedOf: () => ({
+      lastUpdatedAt: new Date().toISOString(),
+      rateLimited429Count: 5, quotaExhausted429Count: 0, accountTpm429Count: 0,
+      sampleSize: 20, estimatedRpm: 20,
+    }),
+  });
+  // 模拟面板：把 /status 的 providerMeta（含派生字段）原样回传 POST /state
+  const roundTripped = normalizeConfig({
+    rules: [],
+    providerMeta: body.config.providerMeta,
+  });
+  const m = roundTripped.providerMeta['p-a'];
+  assert.equal(m.rpmLimit, 100, '声明字段保留');
+  assert.equal(m.observed, undefined, 'observed 被丢弃（不在白名单）');
+  assert.equal(m.conflicts, undefined, 'conflicts 被丢弃');
+});
+

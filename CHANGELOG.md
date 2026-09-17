@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.15 (2026-09-17)
+
+> **v0.9.10 Task 4：冲突呈现**。`/status` 的 `providerMeta[provider]` 附加
+> **派生**字段 `observed`（近 60s 实测）与 `conflicts`（声明 vs 实测差异）。
+
+### 新增 · `lib/routes.js`
+
+- `computeConflicts(declared, observed)` —— 判定声明是否「虚标」
+- `serializeProviderMeta(pm, metrics)` —— 给每个 provider 附加派生字段
+- 常量 `CONFLICT_MIN_SAMPLES = 10`、`CONFLICT_RATIO = 0.8`
+
+### 判定语义（关键设计）
+
+**不是**「实测用量 < 声明限额」就算冲突 —— 那只是**正常的没跑满**。
+
+真正的冲突信号：**已经被限流，但速率仍显著低于声明** → 说明上游实际限额低于声明
+（方向性方案 v1.3 §4.7「声明值虚标」）。
+
+| 条件 | 结果 |
+| --- | --- |
+| `sampleSize < 10` | `info`（「采样不足，暂不判定」）—— **不产生 warn** |
+| `rateLimited429Count == 0` | 无冲突（低速率 = 没跑满，正常） |
+| `rateLimited429Count > 0` 且 `estimatedRpm < rpmLimit × 0.8` | **warn**（RPM 虚标） |
+| `rateLimited429Count > 0` 且 `estimatedTpm < tpmLimit × 0.8` | **warn**（TPM 虚标） |
+| `rateLimited429Count > 0` 但速率 ≥ 声明 × 0.8 | 无冲突（声明基本准确） |
+
+- 无 `rpmLimit`/`tpmLimit` 声明 → 无可比对象 → 无 warn（但 `observed` 仍回显）
+- RPM + TPM 可**同时**产生两条 warn
+
+### 派生字段不写回 config
+
+- 每次 GET `/status` **现算**（与 D8「conflicts 实时计算」一致）
+- **回传安全**：面板把 `providerMeta`（含派生字段）原样 POST 回 `/state` 时，
+  `normalizeConfig` 只提取白名单字段 → `observed`/`conflicts` 被**安全丢弃**，无污染
+  （单测已覆盖此路径）
+
+### 单测
+
+- 213 → **222**（+9 条）：
+  - 无 observed → 无派生字段
+  - 采样不足（<10）→ 只 info，不 warn
+  - 被限流 + 速率显著低于声明 → warn（含 message 断言）
+  - 速率接近声明（≥80%）→ 无 warn（但 observed 仍回显）
+  - 未被限流 → 即使速率低也不告警
+  - TPM 冲突（有 token 数据时）
+  - RPM + TPM 双冲突同时出现
+  - 无声明字段 → 无可比对象 → 无 warn
+  - **回传安全**：`normalizeConfig` 丢弃派生字段
+- **突变验证**（3 组全有效）：
+  - 去掉「必须被限流」门槛 → 1 条变红
+  - 阈值改 0（永远判冲突）→ 3 条变红
+  - 去掉采样不足门槛 → 1 条变红
+  - 还原 → 222/222
+
 ## 0.9.14 (2026-09-17)
 
 > **v0.9.10 Task 3c：wrapper 真传 tokens + observed 实时计算**。
