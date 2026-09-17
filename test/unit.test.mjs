@@ -4219,6 +4219,81 @@ test('v0.9.10 Task1: route hop 内联——rpmLimit/tpmLimit/resetPolicy 同样�
 });
 
 // ============================================================
+// v0.9.10 Task 3b：token 用量采集（metrics.recent.tokens + recentTokenSum）
+// ============================================================
+
+test('v0.9.10 Task3b: sample——接受 tokens 字段；非数字/null 不存', () => {
+  const m = new Metrics();
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 100 });
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 50 });
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: null });
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 'abc' });
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: -5 }); // 负值：合法数字但聚合条件拒收
+  const snap = m.snapshot();
+  // ring 5 条都写入（tokens=null 落 null；其他落值）
+  assert.equal(snap.recent.length, 5);
+  assert.equal(snap.recent[0].tokens, 100, '正整数落 ring');
+  assert.equal(snap.recent[2].tokens, null, 'null 落 null');
+  assert.equal(snap.recent[3].tokens, 'abc', '字符串原样落（不校验，仅累加时拒）');
+  // aggregate tokensSum 只累计合法数字
+  const agg = m.aggregates.get('a/A');
+  assert.equal(agg.tokensSum, 150, '只累加 100+50；-5 拒收（设计：负数是 sentinel）');
+  assert.equal(agg.tokensN, 2, '只记 2 次');
+});
+
+test('v0.9.10 Task3b: recentTokenSum——60s 窗口内的 token 总和', () => {
+  const m = new Metrics();
+  // sample 时刻真实（无法 mock；ring 时间是 Date.now()）
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 100 });
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 200 });
+  m.sample({ provider: 'b', model: 'B', outcome: 'committed', tokens: 999 });
+  // 默认 now=Date.now()，所有 sample 都在 0 秒前 → 全部计入
+  const sum = m.recentTokenSum('a', 60_000);
+  assert.equal(sum, 300, '仅 a 渠道的 token 总和');
+  // 60s 之外的窗口 → 0
+  const sumFar = m.recentTokenSum('a', 0);
+  assert.equal(sumFar, 0, 'windowMs=0 排除所有采样');
+});
+
+test('v0.9.10 Task3b: recentTokenSum——窗口基准可注入', () => {
+  const m = new Metrics();
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 100 });
+  // 注入「未来」基准：100 秒后 → sample 在基准前 100s，
+  // windowMs=200s 包含 → 应计入
+  const future = new Date(Date.now() + 100_000);
+  assert.equal(m.recentTokenSum('a', 200_000, future), 100, '未来基准，宽窗口内');
+  // windowMs=50s 但基准未来 100s → sample 在基准前 100s，超 50s 窗口 → 0
+  assert.equal(m.recentTokenSum('a', 50_000, future), 0, '未来基准，窄窗口外');
+  // 不注入（默认 Date.now()）→ sample 在基准 0s 之前，windowMs=60s 包含
+  assert.equal(m.recentTokenSum('a', 60_000), 100, '默认基准，包含当前时刻采样');
+});
+
+test('v0.9.10 Task3b: recentTokenSum——空 / null / 异常输入容错', () => {
+  const m = new Metrics();
+  m.sample({ provider: 'a', model: 'A', outcome: 'committed', tokens: 100 });
+  assert.equal(m.recentTokenSum('zzz', 60_000), 0, '无该 provider → 0');
+  assert.equal(m.recentTokenSum('a', 60_000, null), 100, 'now=null → fallback Date.now()（已含当前）');
+  assert.equal(m.recentTokenSum(null, 60_000), 0, 'provider=null → 0');
+  // tokens 字段缺失的 sample：直接跳过
+  const m2 = new Metrics();
+  m2.sample({ provider: 'a', model: 'A', outcome: 'committed' });
+  assert.equal(m2.recentTokenSum('a', 60_000), 0, 'tokens 缺字段 → 不计入');
+});
+
+test('v0.9.10 Task3b: 既有 sample 调用零回归（不传 tokens 字段）', () => {
+  // v0.9.9.5 / v0.9.10 / v0.9.11 / v0.9.12 既有 caller：sample({...}) 不含 tokens
+  const m = new Metrics();
+  for (let i = 0; i < 10; i++) {
+    m.sample({ provider: 'a', model: 'A', outcome: 'committed' });
+  }
+  // 零回归
+  assert.equal(m.aggregates.get('a/A').tokensSum, 0);
+  assert.equal(m.aggregates.get('a/A').tokensN, 0);
+  assert.equal(m.recentTokenSum('a', 60_000), 0);
+  assert.equal(m.snapshot().recent[0].tokens, undefined, 'tokens 缺字段 → ring 落 undefined（原样）');
+});
+
+// ============================================================
 // v0.9.10 Task 3a：wrapper 三类 429 细分（classifyBurnError）
 // ============================================================
 

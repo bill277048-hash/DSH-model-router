@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.9.13 (2026-09-17)
+
+> **v0.9.10 Task 3b：token 用量采集（metrics 接口扩展）**。
+> wrapper 暂不传 tokens（待下次小迭代）；本轮只让 metrics「接住即存」+ 暴露查询方法。
+
+### 改动 · `lib/metrics.js`
+
+- `sample(s)` 接受 `s.tokens` 字段（**原样存**到 `rec.tokens`，便于面板/调试）
+  - 聚合累加条件：`Number.isFinite(s.tokens) && s.tokens >= 0`（负数与 null/undefined 跳过）
+- `aggregateOf` 新增字段 `tokensSum` / `tokensN`
+- 新增 `recentTokenSum(provider, windowMs=60_000, now=new Date())` 查询方法
+  - 滑动窗口内某 provider 的 token 总用量
+  - 驱动后续 Task 2 的 TPM 节流（当前 RPM 节流已就绪等数据）
+  - 驱动 Task 4 的 `observed.estimatedTpm` 字段
+  - `now` 可注入（单测）；空/null provider → 0；nowMs-t>=windowMs 跳过（含边界）
+- **零回归**：既有 201 个 caller 不传 tokens → ring 落 undefined、聚合 tokensSum=0
+
+### 关键设计决策
+
+- **wrapper 本轮不传 tokens**（避免 8 处 sample 全改）：Task 3b 范围 = metrics 接口扩展；
+  wrapper 真传等下次小迭代（`lastUsage` 已在 L261/564 捕获，直接传即可）
+- **tokens 落 ring 原样**（不限数字）：方便面板/调试显示「我看到了什么」
+  - **聚合时再校验**——Number.isFinite + >=0 才计入（防 NaN/字符串/负数污染）
+- **边界用 `>=` 而非 `>`**：让 `windowMs=0` 真正排除全部
+- **失败不阻塞**（与 Task 2 一致）：样本数 0 → 0，不抛错
+
+### 单测
+
+- 201 → **206**（+5 条）：
+  - sample 接受 tokens 字段；非数字/null 不存聚合
+  - recentTokenSum 60s 窗口内 token 总和
+  - 窗口基准可注入（未来/默认）
+  - 空/null/异常输入容错
+  - 既有 sample 调用零回归（不传 tokens）
+- **突变验证**（3 组全有效）：
+  - recentTokenSum 窗口比较失效 → 3 条变红
+  - 聚合条件永远假 → 1 条变红
+  - provider 不匹配过滤失效 → 2 条变红
+  - 还原 → 206/206
+
+### 踩坑（已入 CHANGELOG）
+
+🔴 **`>=` vs `>` 边界**：
+初版用 `>`，单测「windowMs=0 排除全部」失败——`0 > 0` 为 false，包含边界。
+改 `>=` → 修。
+
+🔴 **测试期望写反**（L192）：
+我注入 `past = now - 1000s`，期望「窗口外」——但 `nowMs - t = (T0-1000s) - T0 = -1000s`，`>= 60_000` 为 false → **包含**。
+正确测试应是「未来基准 + 窄窗口」或「默认基准 + 宽窗口」。
+
+🔴 **`Number.isFinite` vs 原样保留**：
+初版把 `tokens: Number.isFinite(s.tokens) ? s.tokens : null` ——非数字归 null。
+但 L194 测试期望「缺字段 → null」——两者一致？实际是「`s.tokens` 是 `'abc'` 时」期望**原样落**。
+决策：**ring 原样落**（便于调试），**聚合时再校验**——更符合 DSH 模块边界（metrics 不该改 caller 传的值）。
+
 ## 0.9.12 (2026-09-17)
 
 > **v0.9.10 Task 3a：wrapper 三类 429 细分**。把上游错误码分成方向性方案
