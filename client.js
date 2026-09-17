@@ -275,8 +275,9 @@ window.__ModuleLoader__.load({
     /** 指定时区当前时刻（Intl/ICU 确定性换算，不依赖 IP 地理位置——VPN 不影响） */
     function fmtNowInTz(tz) {
       try {
+        // v0.9.21：hourCycle:"h23" —— 纯显示用途（不参与比较），但避免午夜显示成 "24:00:00"
         return new Intl.DateTimeFormat("zh-CN", {
-          timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+          timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
         }).format(new Date());
       } catch (e) { return "?"; }
     }
@@ -1100,7 +1101,10 @@ window.__ModuleLoader__.load({
             if (!editTW.enabled) return null;
             var ps = editTW.peakStart, vs = editTW.valleyStart;
             if (typeof ps !== "string" || typeof vs !== "string") return null;
-            var opts = { hour: "2-digit", minute: "2-digit", hour12: false };
+            // v0.9.21：显式 hourCycle:"h23" —— 与 lib/router.js:localHHMM 同口径。
+            // 前端是独立 bundle，无法 import 后端模块，故此处必须自行钉死：
+            // 该值参与字符串比较，若 ICU 选 h24 产出 "24:00" 会误判峰谷段。
+            var opts = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
             if (cfgTz) opts.timeZone = cfgTz;
             var t = new Intl.DateTimeFormat("en-GB", opts).format(new Date());
             var inPeak = (ps <= vs) ? (t >= ps && t < vs) : (t >= ps || t < vs);

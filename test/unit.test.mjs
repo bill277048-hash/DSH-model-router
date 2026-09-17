@@ -5290,6 +5290,125 @@ test('v0.9.20 P2: client 档案列表读 it.mtime + 表头「写入时间」（�
   assert.ok(src.includes('rep.startedAt'), '详情视图保留 rep.startedAt（报告自身开始时间）');
 });
 
+// ============================================================
+// v0.9.21 S1：localHHMM 显式 hourCycle:'h23'（消除 h24 溢出隐患）
+// ============================================================
+// 原隐患：`hour12: false` 不指定 `hourCycle` 时，ICU 可能选 h24（1-24）→ 午夜产出
+// "24:00"，破坏依赖「HH:MM 零填充有序」的字符串比较。当前 Node/V8 + en-GB 实测
+// 返回 "00:00"（无实际 bug），但插件分发到其他 Node/ICU 构建时不能保证。
+
+test('v0.9.21 S1: localHHMM 全时段恒为合法 h23 值（绝不出现 "24:00"）', async () => {
+  const { localHHMM } = await import('../lib/router.js');
+  // 跨多个时区 × 一天内多个整点（含各时区的当地午夜）
+  const zones = ['Asia/Shanghai', 'UTC', 'America/New_York', 'Europe/London', null];
+  for (const tz of zones) {
+    for (let h = 0; h < 24; h++) {
+      const t = new Date(Date.UTC(2026, 8, 17, h, 0, 0));
+      const s = localHHMM(tz, t);
+      assert.match(s, /^\d{2}:\d{2}$/, `格式须为 HH:MM（实际 ${JSON.stringify(s)}，tz=${tz}）`);
+      assert.ok(s < '24:00', `不得出现 h24 的 "24:00"（实际 ${s}，tz=${tz}）`);
+      assert.ok(s >= '00:00', `不得小于 "00:00"（实际 ${s}）`);
+    }
+  }
+});
+
+test('v0.9.21 S1: 午夜判段正确（h24 会让 peak 22:00→valley 00:00 在午夜误判 peak）', async () => {
+  const { localHHMM, Router } = await import('../lib/router.js');
+  const midnight = new Date('2026-09-17T00:00:00+08:00');
+  assert.equal(localHHMM('Asia/Shanghai', midnight), '00:00', '午夜 = "00:00"（h23）');
+  const r = new Router({
+    rules: [],
+    timeWindows: { enabled: true, peakStart: '22:00', valleyStart: '00:00', peak: { route: [] }, valley: { route: [] } },
+  });
+  assert.equal(r.segmentOfNow(midnight), 'valley', '午夜判 valley（若 h24 产出 24:00 会误判 peak）');
+});
+
+test('v0.9.21 S1: 全库不再使用含糊的 hour12:false（口径统一为 hourCycle）', () => {
+  for (const f of ['../lib/router.js', '../lib/daily.js', '../lib/routes.js', '../client.js']) {
+    const src = readFileSync(new URL(f, import.meta.url), 'utf8');
+    // 去掉注释行后再断言，避免注释里的说明文字造成误判
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.equal(/hour12\s*:/.test(code), false, `${f} 代码中不应再有 hour12:（改用 hourCycle）`);
+  }
+});
+
+test('v0.9.21 S1: daily._localHHMM 委托 router.localHHMM（消除重复实现）', () => {
+  const dsrc = readFileSync(new URL('../lib/daily.js', import.meta.url), 'utf8');
+  assert.ok(dsrc.includes("import { localHHMM } from './router.js'"), 'daily 从 router 引入 localHHMM');
+  assert.ok(dsrc.includes('return localHHMM(this.timeZone, now);'), '委托调用（不再自带 Intl 选项）');
+  const rsrc = readFileSync(new URL('../lib/router.js', import.meta.url), 'utf8');
+  assert.ok(rsrc.includes("hourCycle: 'h23'"), 'router 显式 h23（唯一实现）');
+});
+
+// ============================================================
+// v0.9.21 I3：两套时间机制的端点语义「刻意不同」已被文档化 + 行为固化
+// ============================================================
+// inTimeWindow 含结束端点（<=），segmentOf 半开（<）。t 恰为 valleyStart 时：
+// 规则时段窗仍命中，但段已切 valley。此前无任何说明，维护者易误判为 bug。
+
+test('v0.9.21 I3: 端点语义差异被固化——t=valleyStart 时规则窗命中但段已切', async () => {
+  const { inTimeWindow, Router } = await import('../lib/router.js');
+  const atValleyStart = new Date('2026-09-17T22:00:00+08:00');
+  // 规则时段窗 [09:00, 22:00] 含端点 → 命中
+  assert.equal(inTimeWindow({ start: '09:00', end: '22:00' }, 'Asia/Shanghai', atValleyStart), true,
+    'inTimeWindow 含结束端点（<=）');
+  // 段判定半开 [09:00, 22:00) → 22:00 已属 valley
+  const r = new Router({
+    rules: [],
+    timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00', peak: { route: [] }, valley: { route: [] } },
+  });
+  assert.equal(r.segmentOfNow(atValleyStart), 'valley', 'segmentOf 半开（<），22:00 已切 valley');
+  // 22:00 前 1 分钟两者一致
+  const before = new Date('2026-09-17T21:59:00+08:00');
+  assert.equal(inTimeWindow({ start: '09:00', end: '22:00' }, 'Asia/Shanghai', before), true);
+  assert.equal(r.segmentOfNow(before), 'peak', '21:59 两者一致（peak + 命中）');
+});
+
+test('v0.9.21 I3: 端点语义差异已在源码中显式说明（防后续误「修」）', () => {
+  const src = readFileSync(new URL('../lib/router.js', import.meta.url), 'utf8');
+  assert.ok(/端点语义与 `segmentOf` 刻意不同/.test(src), 'inTimeWindow 文档标注「刻意不同」');
+});
+
+test('v0.9.21 I3: segmentOfHHMM 为共享实现（router 与 routes 同一函数）', () => {
+  const rsrc = readFileSync(new URL('../lib/router.js', import.meta.url), 'utf8');
+  const tsrc = readFileSync(new URL('../lib/routes.js', import.meta.url), 'utf8');
+  assert.ok(/export function segmentOfHHMM\(/.test(rsrc), 'router 导出 segmentOfHHMM');
+  assert.ok(rsrc.includes('return segmentOfHHMM(localHHMM(tz, now), peakStart, valleyStart);'),
+    'router.segmentOf 复用它');
+  assert.ok(tsrc.includes('segmentOfHHMM(HHMM, tw.peakStart, tw.valleyStart)'),
+    'routes.serializeTimeWindows 复用它（不再各写一份）');
+  assert.ok(tsrc.includes("import { localHHMM, segmentOfHHMM } from './router.js'"),
+    'routes 从 router 引入（router 是零 import 叶子模块，不成环）');
+});
+
+// ============================================================
+// v0.9.21 S2：routes.js 不再在函数内 require()
+// ============================================================
+
+test('v0.9.21 S2: routes.js 仅保留读 package.json 的 require，无函数内 require', () => {
+  const src = readFileSync(new URL('../lib/routes.js', import.meta.url), 'utf8');
+  const reqs = src.split('\n').filter((l) => /require\(/.test(l) && !/^\s*(\/\/|\*)/.test(l));
+  assert.equal(reqs.length, 1, `只应剩 1 处 require（读 package.json），实际 ${reqs.length}`);
+  assert.ok(reqs[0].includes("require('../package.json')"), '保留的是读 package.json');
+  // 顶部 import 已含 readdirSync / basename
+  assert.ok(/import \{[^}]*readdirSync[^}]*\} from 'node:fs'/.test(src), 'readdirSync 走顶部 import');
+  assert.ok(/import \{[^}]*basename[^}]*\} from 'node:path'/.test(src), 'basename 走顶部 import');
+});
+
+// ============================================================
+// v0.9.21 S4：两套列表器的取舍已文档化（含实测数据与重访触发条件）
+// ============================================================
+
+test('v0.9.21 S4: 两套列表器的取舍 + 实测数据 + 重访条件已写入源码', () => {
+  const src = readFileSync(new URL('../lib/routes.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('本仓库有第二个列表器'), '说明存在两个列表器');
+  assert.ok(src.includes('刻意并存'), '说明是刻意而非遗漏');
+  assert.ok(src.includes('无法合并的原因'), '说明不可合并的技术原因');
+  assert.ok(/12–17ms/.test(src), '记录实机实测开销（非沙箱虚高值）');
+  assert.ok(src.includes('何时该重访'), '给出重访触发条件');
+  assert.ok(/虚高约 35 倍/.test(src), '标注旧 466ms 数据为环境虚高');
+});
+
 test('v0.9.20 P0: 装配守卫——index.js 向 ModelTestRunner 注入 archiveDir（源码断言）', () => {
   const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8');
   // 精确断言构造块内含 reportDir: archiveDir（与 probe / loadtest 同源）

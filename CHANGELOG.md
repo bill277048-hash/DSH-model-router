@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.9.21 (2026-09-17)
+
+> **v0.9.9 审核报告剩余项收口**（I3 / S1 / S2 / S3 / S4）。
+> 至此审核报告的 **1 Critical + 3 Important + 4 Suggestion 全部处理完毕**。
+
+### S1 · `localHHMM` 显式 `hourCycle: 'h23'`（消除 h24 溢出隐患）
+
+`hour12: false` 不指定 `hourCycle` 时，ICU 可能选 **h24（1-24）** → 午夜产出
+`"24:00"`，破坏本模块依赖的「HH:MM 零填充有序」字符串比较。当前 Node/V8 + en-GB
+实测返回 `"00:00"`（**无实际 bug**），但插件要分发到其他 Node/ICU 构建。
+
+**审核时只报了 2 处，实际排查出 4 处**（含 2 处此前未发现）：
+
+| 位置 | 参与比较 | 处置 |
+| --- | --- | --- |
+| `lib/router.js:localHHMM` | ✅ | 显式 `hourCycle: 'h23'` |
+| `lib/routes.js:serializeTimeWindows` | ✅ | **改用 `router.localHHMM`（去重）** |
+| `client.js` 峰谷段现算 | ✅ | 显式 `hourCycle: "h23"`（前端独立 bundle，无法 import） |
+| `client.js:fmtNowInTz` | ❌（纯显示） | 显式 `hourCycle: "h23"`（避免显示 "24:00:00"） |
+| `lib/daily.js:_localHHMM` | ✅ | **委托 `router.localHHMM`（去重）** |
+
+去重不只是「少写几行」：`daily.tick()` 的 `hhmm < this.hour` 也依赖该口径，
+两处 `hourCycle` 一旦漂移就会出现「调度用 h24、路由用 h23」这类极难排查的边界 bug。
+`router.js` 是**零 import 的叶子模块**，故 `daily/routes → router` 不成环。
+
+### I3 · 两套时间机制端点语义「刻意不同」已文档化 + 行为固化
+
+`inTimeWindow` **含**结束端点（`<=`），`segmentOf` **半开**（`<`）。即 t 恰为
+`valleyStart` 时：规则时段窗仍命中，但段已切 valley。两者是独立特性（前者管
+「规则何时生效」，后者管「用哪条峰谷链」），各自合理 —— 但此前**无任何说明**，
+维护者易误判为 bug 而「修」坏其中一个。现已：
+
+- `inTimeWindow` 文档显式标注「**端点语义与 `segmentOf` 刻意不同**」
+- 补边界断言固化该行为（21:59 一致 / 22:00 分叉）
+- 抽出 **`segmentOfHHMM(hhmm, peakStart, valleyStart)`** 共享纯函数：
+  `router.segmentOf` 与 `routes.serializeTimeWindows` 此前各写一份同一判定
+  （后者注释还写着「与 router.segmentOf 实现对齐」——**靠人工对齐即漂移风险**）
+
+### S2 · `routes.js` 函数内 `require()` → 顶部 `import`
+
+`listRunJson` 内的 `require('node:fs'/'node:path')` 依赖 `createRequire` shim
+（那是为读 `package.json` 而设），与文件顶部既有 `import` 风格不一致且无必要。
+现改由顶部 `import { readFileSync, readdirSync } from 'node:fs'` /
+`import { join, basename } from 'node:path'` 提供；**仅保留读 `package.json` 的
+那一处 `require`**（ESM 读 JSON 需 `createRequire`）。
+
+### S3 · 修正 CHANGELOG v0.9.9.2 的过度声明
+
+原文标题「消除三套重复的原子写实现」+ 表格称 `archive.writeAtomic` 为「**唯一实现**」
+—— **不实**。本次实际只合并了**档案落盘**链路上的 2 处；仓库中仍有另外 3 处
+（`daily.js` / `store.js` / `quota.js`），各自服务不同数据域。且统一时**漏掉了**
+`daily.js` 已有的 tmp 清理（该功能倒退已于 v0.9.20 P1 补回）。
+已在原条目内加**更正块**（保留历史记录，不篡改）。
+
+### S4 · 两套列表器：**实测后判定为合理设计**，补齐文档
+
+审核时基于方案里「读全文 466ms」判断 `/model-test` 有性能问题。**实测推翻了该判断**：
+
+| 端点 | 实现 | 实机延迟（10 档案 / 173KB） |
+| --- | --- | --- |
+| `/model-test` | `listRunJson`（读全文 + targets 摘要） | 首次 84ms（冷缓存），其后 **12–17ms** |
+| `/test-archives` | `listArchives`（只 stat） | 1.5–2.4ms |
+
+**关键**：耗时几乎全在 `readFileSync`（`JSON.parse` 免费），而沙箱环境的 I/O 拦截
+把 15ms 放大到 553ms（**虚高约 35 倍**）—— 方案里的 466ms 同源虚高。
+且该端点**仅面板挂载/用户操作时调用（非轮询）**，故当前代价可接受。
+
+**不合并的技术原因**：面板历史表需 `elapsedMs` / `targetCount` / `aborted`，
+点行后还需 `targets`（verdict 表）—— 都是**内容字段**，`stat` 拿不到。
+强行改轻量会丢 3 列（UX 回归）或需新增二次请求（面板流程改动）。
+
+**处置**：不改架构，把实测数据 + 不可合并原因 + **重访触发条件**
+（档案数 ~200 份时线性外推约 300ms → 改「轻量列表 + 点行惰性取详情」）写入源码注释；
+同时更正 `archive.js` 里同样被虚高的「466ms」记录。
+
+### 单测
+
+- 244 → **253**（+9 条）：
+  - S1：全时段 × 5 时区恒为合法 h23（120 组，断言绝不出现 `"24:00"`）
+  - S1：午夜判段正确（h24 会让 peak 22:00→valley 00:00 在午夜误判 peak）
+  - S1：全库代码不再出现 `hour12:`（去注释后断言）
+  - S1：`daily._localHHMM` 委托 `router.localHHMM`
+  - I3：端点语义差异固化（21:59 一致 / 22:00 分叉）
+  - I3：源码显式标注「刻意不同」
+  - I3：`segmentOfHHMM` 为共享实现（router 与 routes 同一函数）
+  - S2：`routes.js` 仅剩 1 处 `require`（读 `package.json`）
+  - S4：取舍 + 实测数据 + 重访条件已写入源码
+- **突变验证**（5 组全有效）：
+  - router 退回 `hour12:false` → 1 红
+  - `daily` 恢复自带 Intl 实现 → 1 红
+  - `segmentOf` 退回内联判定 → 1 红
+  - routes 加回函数内 `require` → 1 红
+  - 删除列表器取舍文档 → 1 红
+  - 还原 → 253/253
+
 ## 0.9.20 (2026-09-17)
 
 > **v0.9.9 系列代码审核后的修复**（P0 / P1 / P2）。
@@ -760,13 +855,27 @@ mtime 变新，**旧跑批会「跳」到列表顶部**），且点进详情显�
 
 ### 修复 · 消除三套重复的原子写实现
 
-本仓库此前有**三处**独立实现同一逻辑：
+> **⚠ 更正（v0.9.21）**：标题与下表的「**唯一实现**」措辞**过度声明**。
+> 本次实际只合并了**档案落盘**这一条链路上的 2 处（`model-test.js` 私有 +
+> `routes.js` 副本）→ `archive.js`。仓库中**仍有另外 3 处**原子写实现，各自服务于
+> 不同数据域，本次未动：
+>
+> | 位置 | 形式 | 说明 |
+> | --- | --- | --- |
+> | `lib/daily.js` | `.tmp-<ts>-<rand>` + 清理 | 日报告落盘（**有** tmp 清理） |
+> | `lib/store.js` | `.tmp-<pid>` | 配置态持久化（确定名，自覆盖不累积） |
+> | `lib/quota.js` | `.tmp-<pid>` | 配额态持久化（同上） |
+>
+> 另：本次统一时**漏掉了** `daily.js` 已有的 tmp 清理逻辑 —— 该功能倒退已于
+> **v0.9.20（P1）** 补回。正确表述应为「**统一档案落盘链路的原子写**」。
+
+本仓库的**档案落盘**链路上此前有**两处**独立实现同一逻辑：
 
 | 位置 | 函数 | 处置 |
 | --- | --- | --- |
 | `lib/model-test.js:657` | `writeAtomic`（私有） | 删除，改用 `archive.writeAtomic` |
 | `lib/routes.js:993` | `writeFileSyncAtomic` | 删除，改用 `archive.writeAtomic` |
-| `lib/archive.js` | `writeAtomic`（新） | 唯一实现 |
+| `lib/archive.js` | `writeAtomic`（新） | 该链路的唯一实现 |
 
 同时消除 `lib/model-test.js:persistReport` 与 `lib/routes.js:persistModelTestDir`
 的**两套落盘逻辑**——现统一走 `archive.persistReport`。
