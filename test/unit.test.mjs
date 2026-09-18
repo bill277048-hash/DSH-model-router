@@ -5625,3 +5625,237 @@ test('v0.9.24: /model-test 在 modelTest.reportDir 不可用时仍 503（守卫�
 
   assert.equal(res.status, 503, 'reportDir 不可用 → 503（不是静默返空）');
 });
+
+// ============================================================
+// v0.9.24 #7（v1.0 §6-B7 / §9.2）：安全边界测试化——「不读 API Key」由测试守住
+// ============================================================
+// 设计文档 §3.2 明确：「插件只做路由与调度，不介入协议转换；**不读、不存、不转发
+// API Key**」。此前该约束**只写在文档里**，无任何测试守住（v1.0 验收差距 #7）。
+//
+// 三条测试覆盖三个面：
+//   T1 静态：源码不出现凭据读取模式（剥注释后扫描，避免 skill §E 的假阳性）
+//   T2 行为：wrapper 传给 llm.stream 的 opts 不含凭据字段，且只新增 provider/model/signal
+//   T3 行为：/status 响应不含凭据材料
+
+/** 凭据模式（用于静态/响应扫描）。注意不含 settingsNs —— 那是「命名空间名」，
+ *  只作字符串透传（lib/registry.js:120/131），不用于读取 settings 内容。 */
+const CRED_PATTERNS = [
+  ['\\.apiKey\\b', '.apiKey'],
+  ['\\.api_key\\b', '.api_key'],
+  ['\\bcredentials\\b', 'credentials'],
+  ['\\bsecret\\b', 'secret'],
+  ['\\bpassword\\b', 'password'],
+  ['\\bBearer\\b', 'Bearer'],
+  ['Authorization', 'Authorization'],
+];
+
+test('v0.9.24 #7: 源码不出现凭据读取模式（剥注释后扫描）', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  // ★ 必须剥注释：probe.js 的注释里有「复用 credentials，不存 key」这类说明文字，
+  //   不剥会把「解释不读」的注释误判为「读了」（skill §E 已踩 3 次）。
+  const strip = (s) => s.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+
+  const files = [
+    ...readdirSync('lib').filter((f) => f.endsWith('.js')).map((f) => join('lib', f)),
+    join('lib', 'wrapper', 'index.js'),
+    'client.js',
+  ];
+  const hits = [];
+  for (const f of files) {
+    const code = strip(readFileSync(f, 'utf8'));
+    for (const [re, label] of CRED_PATTERNS) {
+      if (new RegExp(re).test(code)) hits.push(f + ' → ' + label);
+    }
+  }
+  assert.deepEqual(hits, [], '不应出现凭据读取模式；命中：' + hits.join(' | '));
+  assert.ok(files.length >= 19, '扫描覆盖 lib/ + client.js（实际 ' + files.length + ' 文件）');
+});
+
+test('v0.9.24 #7: wrapper 传给 llm.stream 的 opts 不含凭据字段（行为断言）', async () => {
+  const deps = makeDeps();
+  const wrapper = createStreamWrapper(deps);
+  // 驱动一次 failover，使 llm.stream 被真实调用（makeLlm 会捕获 opts）
+  const llm = makeLlm({ streamWrapper: wrapper }, {
+    'm-2': async function* () {
+      yield { type: 'text-delta', index: 0, text: 'ok' };
+      yield finishStop;
+    },
+  });
+  const primary = (async function* () {
+    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA_EXCEEDED', message: 'q' } } };
+  })();
+  await drain(wrapper.call(llm, { provider: 'p-a', model: 'm-1' }, () => primary));
+
+  assert.ok(llm.calls.length > 0, 'llm.stream 已被调用（failover 路径）');
+  const CRED = /apikey|api_key|secret|password|credential|bearer|authorization|^token$|^key$/i;
+  for (const opts of llm.calls) {
+    const bad = Object.keys(opts).filter((k) => CRED.test(k));
+    assert.deepEqual(bad, [], 'opts 不应含凭据字段；实际 keys=' + Object.keys(opts).join(','));
+  }
+  // 正向断言：wrapper 只注入 provider / model / signal（其余字段原样透传宿主 options）
+  const keys = Object.keys(llm.calls[0]);
+  for (const k of ['provider', 'model', 'signal']) {
+    assert.ok(keys.includes(k), 'wrapper 应注入 ' + k + '；实际 keys=' + keys.join(','));
+  }
+});
+
+test('v0.9.24 #7: /status 响应不含凭据材料（行为断言）', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const config = normalizeConfig({ rules: [] });
+  const routes = makeStatusRoutes({
+    config,
+    router: { snapshot: () => ({}), recordExhausted() {} },
+    cooldown: { snapshot: () => ({}) },
+    metrics: { snapshot: () => ({ recent: [], byRoute: {}, sessionIds: [], sessions: [] }) },
+    quota: { snapshot: () => ({}) },
+    // 刻意放入「像真实」的 provider 元数据（含 settingsNs —— 它是命名空间名，非凭据）
+    registry: {
+      providers: [
+        { provider: 'apikey-demo', displayName: 'Demo', settingsNs: 'llm-demo', models: [{ id: 'm-1' }], dormant: false },
+        { provider: 'vendor-x', displayName: 'VendorX', settingsNs: 'llm-x', models: [], dormant: true },
+      ],
+      registeredPairs: () => [],
+      snapshotOut: () => ({
+        providers: [
+          { provider: 'apikey-demo', displayName: 'Demo', settingsNs: 'llm-demo', models: [{ id: 'm-1' }], dormant: false },
+          { provider: 'vendor-x', displayName: 'VendorX', settingsNs: 'llm-x', models: [], dormant: true },
+        ],
+        source: 'mock',
+      }),
+    },
+    probe: null, llm: {}, wrapperStats: {},
+    startedAt: Date.now(), saveStateFn: () => {}, log: { warn() {}, info() {}, error() {} },
+  });
+  const route = routes.find((r) => r.kind === 'exact' && r.path === config.statusPath);
+  assert.ok(route, '找到 /status 路由');
+
+  const req = {
+    method: 'GET', url: config.statusPath,
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3081' },
+    [Symbol.asyncIterator]: async function* () {},
+  };
+  const res = { writeHead(c) { res.status = c; }, setHeader() {}, end(b) { res.body = b; } };
+  await route.handler(req, res);
+
+  assert.equal(res.status, 200, '/status 200');
+  const body = String(res.body);
+  assert.ok(body.length > 0, '响应非空');
+  for (const pat of ['sk-', 'api_key', 'secret', 'password', 'Bearer', 'Authorization']) {
+    assert.equal(body.includes(pat), false, '/status 不应含凭据材料：' + pat);
+  }
+});
+
+// ============================================================
+// v1.0 #2（§6-B2 / §9.2）：配置 schema 版本化 + 迁移链
+// ============================================================
+// 原缺陷：lib/store.js 对 `version !== 1` 是**整份丢弃**（回落 patch config）而非迁移
+// → 一旦未来版本写入 version:2，老代码升级/降级时会**丢配置**。
+// 现引入 STORE_VERSION + MIGRATIONS 链 + migrateState()。
+// 迁移链当前为空（无历史版本），但**机制就位**——测试用注入的合成链验证步进逻辑。
+
+test('v1.0 #2: migrateState——同版本原样返回（零开销路径）', async () => {
+  const { migrateState, STORE_VERSION } = await import('../lib/store.js');
+  const raw = { version: STORE_VERSION, rules: [], timeZone: 'Asia/Shanghai' };
+  const out = migrateState(raw, { warn() {}, info() {} });
+  assert.equal(out, raw, '同版本应原样返回同一对象（不复制）');
+});
+
+test('v1.0 #2: migrateState——多步迁移链逐步应用（注入合成链 v1→v2→v3）', async () => {
+  const { migrateState } = await import('../lib/store.js');
+  const applied = [];
+  const chain = {
+    1: (s) => { applied.push(1); return { ...s, addedInV2: 'a' }; },
+    2: (s) => { applied.push(2); return { ...s, addedInV3: 'b' }; },
+  };
+  const out = migrateState({ version: 1, rules: [], keep: 'me' }, { warn() {}, info() {} }, chain, 3);
+  assert.deepEqual(applied, [1, 2], '两步都执行且顺序正确');
+  assert.equal(out.version, 3, '版本推进到 target');
+  assert.equal(out.addedInV2, 'a', 'v1→v2 的产物保留');
+  assert.equal(out.addedInV3, 'b', 'v2→v3 的产物保留');
+  assert.equal(out.keep, 'me', '原有字段不丢（迁移只做结构变换）');
+  assert.equal(out.rules.length, 0, '既有字段保留');
+});
+
+test('v1.0 #2: migrateState——缺步骤/版本过高/迁移抛错 均安全拒绝', async () => {
+  const warns = [];
+  const log = { warn: (m) => warns.push(String(m)), info() {} };
+  const { migrateState } = await import('../lib/store.js');
+
+  // 缺步骤：v1 → v3 但只登记了 v1
+  assert.equal(migrateState({ version: 1, rules: [] }, log, { 1: (s) => s }, 3), null, '缺 v2 步骤 → 拒绝');
+  assert.ok(warns.some((w) => w.includes('缺少 v2')), 'warn 指出缺哪一步');
+
+  // 版本过高（不支持降级）
+  warns.length = 0;
+  assert.equal(migrateState({ version: 9, rules: [] }, log), null, '版本过高 → 拒绝');
+  assert.ok(warns.some((w) => w.includes('不支持降级')), 'warn 说明原因');
+
+  // 迁移抛错
+  warns.length = 0;
+  const boom = { 1: () => { throw new Error('boom'); } };
+  assert.equal(migrateState({ version: 1, rules: [] }, log, boom, 2), null, '迁移抛错 → 拒绝（不崩）');
+  assert.ok(warns.some((w) => w.includes('迁移失败')), 'warn 带上原始错误');
+
+  // 迁移返回非对象
+  warns.length = 0;
+  assert.equal(migrateState({ version: 1, rules: [] }, log, { 1: () => null }, 2), null, '返回非对象 → 拒绝');
+
+  // 非对象入参
+  assert.equal(migrateState(null, log), null);
+  assert.equal(migrateState([], log), null, '数组也算非法');
+});
+
+test('v1.0 #2: loadState——迁移后校验（version 对但 rules 非数组仍拒绝）', async () => {
+  const { loadState } = await import('../lib/store.js');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'store-mig-'));
+  const p = join(dir, 'state.json');
+  const log = { warn() {}, info() {}, error() {} };
+  try {
+    // version 合法但 rules 非法 → 仍拒绝（迁移只管结构，校验归 loadState）
+    writeFileSync(p, JSON.stringify({ version: 1, rules: 'not-an-array' }));
+    assert.equal(loadState(p, log), null, 'rules 非数组 → 拒绝');
+    // 正常
+    writeFileSync(p, JSON.stringify({ version: 1, rules: [], timeZone: 'Asia/Shanghai', mode: 'fast' }));
+    const ok = loadState(p, log);
+    assert.ok(ok, '合法 store 读回成功');
+    assert.equal(ok.timeZone, 'Asia/Shanghai', 'timeZone 持久化');
+    assert.equal(ok.mode, 'fast', 'mode 持久化');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v1.0 #2: saveState 写入 STORE_VERSION（与 loadState 的判据同源）', async () => {
+  const { saveState, STORE_VERSION } = await import('../lib/store.js');
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'store-ver-'));
+  const p = join(dir, 'state.json');
+  try {
+    assert.equal(saveState(p, { rules: [] }, { info() {}, warn() {}, error() {} }), true);
+    const written = JSON.parse(readFileSync(p, 'utf8'));
+    assert.equal(written.version, STORE_VERSION, '写入的 version = STORE_VERSION（非硬编码 1）');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v1.0 #2: saveState/migrateState 的版本判据同源于 STORE_VERSION（源码断言）', () => {
+  // 为什么需要源码断言：STORE_VERSION 当前 === 1，故「硬编码 1」与「引用常量」
+  // 在**行为上不可区分**（等价突变，突变测试抓不到）。但二者在**未来**分叉：
+  // 若有人把 STORE_VERSION 递增到 2 却漏改 saveState 的字面量 1，
+  // 写入的 version 与迁移链的 target 会不一致 → 迁移链静默失效。
+  // 故此处用源码断言守住「同源」这一结构性质。
+  const src = readFileSync(new URL('../lib/store.js', import.meta.url), 'utf8');
+  assert.ok(/export const STORE_VERSION = \d+;/.test(src), 'STORE_VERSION 已导出');
+  assert.ok(src.includes('version: STORE_VERSION'), 'saveState 用 STORE_VERSION（非字面量）');
+  assert.ok(src.includes('target = STORE_VERSION'), 'migrateState 默认 target 同源');
+  assert.ok(src.includes('export const MIGRATIONS'), '迁移链已导出（供后续登记）');
+  assert.equal(/version: 1,/.test(src), false, '不应出现硬编码的 version: 1');
+});
