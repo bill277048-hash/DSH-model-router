@@ -291,3 +291,63 @@ test('契约·E2E: 跑批落盘失败不阻塞（旁路语义）—— reportDir
   assert.ok(report.runId, '报告仍返回（落盘是旁路）');
   assert.ok(warns.some((w) => w.includes('档案目录不可用')), '有 warn 提示（不静默）');
 });
+
+// ============================================================
+// v1.0.0 复核补测：/status 键集与契约文档一致（防文档漂移）
+// ============================================================
+// 背景：v1.0.0 复核时发现契约文档 §1.2 把 /status 的结构写错了三处：
+//   ① 写成顶层 `wrapperStats` —— 真实键名是 `wrapper`
+//   ② 写成顶层 `modelTest`   —— 真实 /status 无此键（走 /model-test 端点）
+//   ③ 写成顶层 `timeWindows` —— 真实在 `config.timeWindows` 内
+// 文档与实现的漂移**没有测试守住**。此用例把真实键集钉死。
+
+test('契约: /status 顶层键集与契约文档 §1.2 一致（15 个）', async () => {
+  const routes = makeStatusRoutes(mkDeps());
+  const config = normalizeConfig({ rules: [] });
+  const res = await call(routes, 'GET', config.statusPath);
+  assert.equal(res.status, 200);
+
+  const EXPECTED = [
+    'checkedAt', 'config', 'cooldown', 'metrics', 'ok', 'plugin', 'probe',
+    'quota', 'quotaWindows', 'registry', 'reports', 'router', 'uptimeSec',
+    'version', 'wrapper',
+  ].sort();
+  const actual = Object.keys(res.json).sort();
+
+  assert.deepEqual(actual, EXPECTED, '/status 顶层键集须与文档 §1.2 一致');
+
+  // 反向：文档的**键表**不应把这三个键列为 /status 的顶层键。
+  // ⚠ 注意：修正说明里会**合法地提到**这些名字（如「没有 `modelTest`」），
+  //   故必须匹配「表格行」`| \`key\` |` 而非裸字符串（否则误报——初版即踩此坑）。
+  const docSection = DOC.slice(DOC.indexOf('### 1. `/status`'), DOC.indexOf('### 2. `/state`'));
+  const rowOf = (k) => new RegExp('\\|\\s*`' + k + '`\\s*\\|');
+  assert.equal(rowOf('wrapperStats').test(docSection), false,
+    '文档键表不应把 wrapper 写成 wrapperStats');
+  assert.equal(rowOf('modelTest').test(docSection), false,
+    '文档键表不应声称 /status 有 modelTest');
+  assert.ok(rowOf('wrapper').test(docSection), '文档键表应含真实的 `wrapper` 键');
+  assert.ok(docSection.includes('没有 `modelTest`'), '文档应显式声明没有 modelTest');
+});
+
+test('契约: /status.config 子键集与契约文档一致（15 个）', async () => {
+  const routes = makeStatusRoutes(mkDeps());
+  const config = normalizeConfig({ rules: [] });
+  const res = await call(routes, 'GET', config.statusPath);
+
+  const EXPECTED = [
+    'adapterRegistered', 'allowLegacyMatch', 'exhaustionWindowSec', 'failoverBudgetMs',
+    'fallbackPolicy', 'firstTokenTimeoutMs', 'mode', 'probe', 'propose', 'providerMeta',
+    'rules', 'sessionsDir', 'storePath', 'timeWindows', 'timeZone',
+  ].sort();
+  const actual = Object.keys(res.json.config).sort();
+  assert.deepEqual(actual, EXPECTED, 'config 子键集须与文档一致');
+
+  // reports 是顶层键，不在 config 内（复核时确认的真实结构）
+  assert.equal(actual.includes('reports'), false, 'config 内不应有 reports（它是顶层键）');
+  assert.ok(res.json.reports, '/status 顶层应有 reports');
+  // timeWindows 在 config 内（非顶层）
+  assert.equal(Object.prototype.hasOwnProperty.call(res.json, 'timeWindows'), false,
+    'timeWindows 不应出现在顶层（它在 config 内）');
+  assert.ok(Object.prototype.hasOwnProperty.call(res.json.config, 'timeWindows'),
+    'timeWindows 应在 config 内');
+});
