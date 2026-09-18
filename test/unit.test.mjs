@@ -5859,3 +5859,242 @@ test('v1.0 #2: saveState/migrateState 的版本判据同源于 STORE_VERSION（�
   assert.ok(src.includes('export const MIGRATIONS'), '迁移链已导出（供后续登记）');
   assert.equal(/version: 1,/.test(src), false, '不应出现硬编码的 version: 1');
 });
+
+// ============================================================
+// v1.0.1 修复（Critical · 数据丢失）：/state 保存须「合并」而非「整体替换」
+// ============================================================
+// **缺陷**：saveStateFn 直接把「本次请求派生的 state」写盘。normalizeState 对未提交
+// 字段返回 undefined，JSON.stringify 丢弃 undefined → **磁盘已有值被静默擦除**。
+//
+// **真实触发（面板 4 个保存点全部命中）**：
+//   「一键启用每日报告」只发 {reports} → rules/providerMeta/timeZone 全丢
+//   「保存规则」只发 {rules}          → providerMeta/reports/timeZone/mode 全丢
+// 且返回 200「已保存并即时生效」—— 静默。
+//
+// **本组测试即 Prove-It**：修复前必红（见下方「突变验证」注释）。
+
+test('v1.0.1 mergeState: undefined = 未提交 → 保留旧值', async () => {
+  const { mergeState } = await import('../lib/store.js');
+  const prev = { rules: [{ name: 'p' }], timeZone: 'Asia/Shanghai', mode: 'fast' };
+  const patch = { rules: undefined, timeZone: undefined, reports: { enabled: true } };
+  const out = mergeState(prev, patch);
+  assert.deepEqual(out.rules, [{ name: 'p' }], 'rules 未提交 → 保留');
+  assert.equal(out.timeZone, 'Asia/Shanghai', 'timeZone 未提交 → 保留');
+  assert.equal(out.mode, 'fast', 'mode 未在 patch 中 → 保留');
+  assert.deepEqual(out.reports, { enabled: true }, 'reports 提交了 → 覆盖');
+});
+
+test('v1.0.1 mergeState: null = 显式清空 → 覆盖（区别于 undefined）', async () => {
+  const { mergeState } = await import('../lib/store.js');
+  const prev = { timeZone: 'Asia/Shanghai', mode: 'fast' };
+  const out = mergeState(prev, { timeZone: null });
+  assert.equal(out.timeZone, null, 'null 是显式清空（= 系统时区），须覆盖');
+  assert.equal(out.mode, 'fast', '未提及的字段仍保留');
+});
+
+test('v1.0.1 mergeState: 剥离 loadState 的内部字段 storePath', async () => {
+  const { mergeState } = await import('../lib/store.js');
+  const prev = { storePath: '/x/y.json', rules: [] };
+  const out = mergeState(prev, {});
+  assert.equal('storePath' in out, false, 'storePath 不应落盘');
+  assert.deepEqual(out.rules, [], '其余字段保留');
+});
+
+test('v1.0.1 mergeState: prev 为 null（无 state.json）时不抛', async () => {
+  const { mergeState } = await import('../lib/store.js');
+  const out = mergeState(null, { rules: [], mode: 'fast' });
+  assert.deepEqual(out, { rules: [], mode: 'fast' });
+});
+
+test('v1.0.1 端到端: 「一键启用每日报告」不再擦除 rules/providerMeta/timeZone', async () => {
+  // 复现 index.js 注入点的真实代码路径：
+  //   saveState(path, mergeState(loadState(path), normalizeState(patch)), log)
+  const { loadState, saveState, mergeState } = await import('../lib/store.js');
+  const { normalizeState } = await import('../lib/config.js');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'merge-e2e-'));
+  const p = join(dir, 'state.json');
+  const log = { warn() {}, info() {}, error() {} };
+  // ★ 镜像 index.js 注入点的**真实代码路径**：
+  //   saveState(path, mergeState(loadState(path), normalizeState(body), Object.keys(body)), log)
+  //   关键是第三参 `Object.keys(body)` —— 原始请求体的键集（normalizeState 会给未提交
+  //   字段填默认值，故必须依据「客户端实际提交了哪些键」判断覆盖范围）。
+  const saveFn = (body) => saveState(
+    p,
+    mergeState(loadState(p, log), normalizeState(body, false, { log }), Object.keys(body)),
+    log,
+  );
+
+  try {
+    // ① 建立「有内容」的状态
+    assert.equal(saveFn({
+      rules: [{ name: 'my-pack', route: [{ provider: 'p1', model: 'm1' }] }],
+      providerMeta: { p1: { notes: '重要备注' } },
+      timeZone: 'Asia/Shanghai',
+    }), true);
+
+    let d = JSON.parse(readFileSync(p, 'utf8'));
+    assert.equal(d.rules.length, 1, '① 规则已落盘');
+    assert.equal(d.providerMeta.p1.notes, '重要备注', '① providerMeta 已落盘');
+    assert.equal(d.timeZone, 'Asia/Shanghai', '① timeZone 已落盘');
+
+    // ② 模拟面板 L677「一键启用每日报告」——**只发 reports**
+    assert.equal(saveFn({ reports: { enabled: true, hour: '01:00' } }), true);
+
+    d = JSON.parse(readFileSync(p, 'utf8'));
+    assert.equal(d.rules.length, 1, '② 规则**未**被擦除（修复前此处为 0 → 数据丢失）');
+    assert.equal(d.providerMeta?.p1?.notes, '重要备注', '② providerMeta **未**被擦除');
+    assert.equal(d.timeZone, 'Asia/Shanghai', '② timeZone **未**被擦除');
+    assert.deepEqual(d.reports, { enabled: true, hour: '01:00' }, '② reports 已更新');
+
+    // ③ 模拟「保存规则」——只发 rules
+    assert.equal(saveFn({
+      rules: [{ name: 'p2', route: [{ provider: 'p2', model: 'm2' }] }],
+    }), true);
+    d = JSON.parse(readFileSync(p, 'utf8'));
+    assert.equal(d.rules[0].name, 'p2', '③ 规则已更新');
+    assert.equal(d.providerMeta?.p1?.notes, '重要备注', '③ providerMeta 仍保留');
+    assert.equal(d.timeZone, 'Asia/Shanghai', '③ timeZone 仍保留');
+    assert.deepEqual(d.reports, { enabled: true, hour: '01:00' }, '③ reports 仍保留');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================
+// v1.0.1 接线测试：确保「合并保存」在**真实调用链**上生效
+// ============================================================
+// 背景：首版 E2E 测试**自己实现了 saveFn**，因此**测不到** index.js / routes.js 的接线
+// —— 实测「回退 index.js 到整体替换」「routes.js 不传 submittedKeys」两个突变都**未变红**。
+// 本组补齐三层：
+//   ① makeSaveStateFn 工厂（行为）—— 覆盖「读-合并-写」逻辑
+//   ② /state 端点把「原始 body 键集」传给 saveStateFn（行为）—— 覆盖 routes.js 接线
+//   ③ index.js 确实用工厂而非内联（源码断言）—— 覆盖 index.js 接线
+//      （index.js 的闭包在插件工厂内，单元测试无法驱动，故用源码断言；这是**有意识的取舍**，
+//        已在断言失败信息里写明。）
+
+test('v1.0.1 接线①: makeSaveStateFn 是「读-合并-写」（部分保存不擦旧值）', async () => {
+  const { makeSaveStateFn, loadState } = await import('../lib/store.js');
+  const { normalizeState } = await import('../lib/config.js');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'wire-fn-'));
+  const p = join(dir, 'state.json');
+  const log = { warn() {}, info() {}, error() {} };
+  const save = makeSaveStateFn(p, log);
+
+  try {
+    // 建立有内容的状态
+    save(normalizeState({
+      rules: [{ name: 'pack-1', route: [{ provider: 'p1', model: 'm1' }] }],
+      providerMeta: { p1: { notes: '备注' } },
+      timeZone: 'Asia/Shanghai',
+    }, false, { log }), ['rules', 'providerMeta', 'timeZone']);
+    assert.equal(JSON.parse(readFileSync(p, 'utf8')).rules.length, 1, '初始规则已落盘');
+
+    // 只提交 reports（模拟面板「一键启用每日报告」）
+    save(normalizeState({ reports: { enabled: true, hour: '01:00' } }, false, { log }), ['reports']);
+
+    const d = JSON.parse(readFileSync(p, 'utf8'));
+    assert.equal(d.rules.length, 1, '规则未被擦除');
+    assert.equal(d.providerMeta.p1.notes, '备注', 'providerMeta 未被擦除');
+    assert.equal(d.timeZone, 'Asia/Shanghai', 'timeZone 未被擦除');
+    assert.deepEqual(d.reports, { enabled: true, hour: '01:00' }, 'reports 已更新');
+    assert.equal(loadState(p, log).rules.length, 1, 'loadState 可读回');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v1.0.1 接线②: /state 把「原始请求体的键集」作为第二参传给 saveStateFn', async () => {
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const config = normalizeConfig({ rules: [] });
+  const calls = [];
+  const routes = makeStatusRoutes({
+    config,
+    router: { snapshot: () => ({}), recordExhausted() {}, applyRuntime() {} },
+    cooldown: { snapshot: () => ({}), applyPolicy() {} },
+    metrics: { snapshot: () => ({ recent: [], byRoute: {}, sessionIds: [], sessions: [] }) },
+    quota: { snapshot: () => ({}) },
+    registry: null, probe: null, llm: {}, wrapperStats: {},
+    startedAt: Date.now(),
+    saveStateFn: (state, submittedKeys) => { calls.push({ state, submittedKeys }); return true; },
+    log: { warn() {}, info() {}, error() {} },
+  });
+  const route = routes.find((r) => r.path === '/api/model-router/state');
+  const post = async (payload) => {
+    const res = { writeHead(c) { res.status = c; }, setHeader() {}, end(b) { res.body = b; } };
+    await route.handler({
+      method: 'POST', url: '/api/model-router/state',
+      socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:3081' },
+      [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(payload)); },
+    }, res);
+    return res;
+  };
+
+  // 只提交 reports → 第二参须恰为 ['reports']
+  const r1 = await post({ reports: { enabled: true, hour: '01:00' } });
+  assert.equal(r1.status, 200, '200');
+  assert.equal(calls.length, 1, 'saveStateFn 被调用一次');
+  assert.deepEqual(calls[0].submittedKeys, ['reports'],
+    '第二参须为**原始 body 的键集**（而非 normalizeState 的输出键集——后者会多出默认的 rules）');
+
+  // 提交 rules + providerMeta → 第二参须恰为这两键
+  await post({ rules: [], providerMeta: { p1: {} } });
+  assert.deepEqual(calls[1].submittedKeys, ['rules', 'providerMeta'], '第二参随 body 变化');
+
+  // 空 body → 第二参为空数组（不覆盖任何字段）
+  await post({});
+  assert.deepEqual(calls[2].submittedKeys, [], '空 body → 空键集');
+});
+
+test('v1.0.1 接线③: index.js 用 makeSaveStateFn 工厂而非内联（源码断言）', () => {
+  // 为什么用源码断言：该 saveStateFn 是插件工厂内的闭包，单元测试无法驱动；
+  // 若内联实现写错（漏 mergeState / 漏 submittedKeys），行为测试覆盖不到。
+  // 断言「用了工厂」可保证逻辑集中在 store.js（那里有行为测试覆盖）。
+  const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8');
+  assert.ok(/saveStateFn:\s*makeSaveStateFn\(/.test(src),
+    'index.js 须用 makeSaveStateFn 工厂（而非内联 saveState 调用）');
+  assert.ok(/import \{[^}]*makeSaveStateFn[^}]*\} from '\.\/store\.js'/.test(src),
+    'makeSaveStateFn 须从 store.js 导入');
+  assert.equal(/saveStateFn:\s*\(state[^)]*\)\s*=>/.test(src), false,
+    '不应存在内联的 saveStateFn 箭头函数（会把逻辑移出可测范围）');
+});
+
+test('v1.0.1 接线④: /quota/sync 也把「提交键集」传给 saveStateFn（同一条数据丢失路径）', async () => {
+  // /quota/sync 只提交 { rules, providerMeta } —— 若不传键集，timeZone/mode/reports
+  // 会被整体替换擦除（与 /state 同一缺陷）。
+  const { makeStatusRoutes } = await import('../lib/routes.js');
+  const config = normalizeConfig({ rules: [], providerMeta: { 'p-x': {} } });
+  const calls = [];
+  const routes = makeStatusRoutes({
+    config,
+    router: { snapshot: () => ({}), recordExhausted() {}, applyRuntime() {} },
+    cooldown: { snapshot: () => ({}), applyPolicy() {} },
+    metrics: { snapshot: () => ({ recent: [], byRoute: {}, sessionIds: [], sessions: [] }) },
+    quota: { snapshot: () => ({}), syncWindows() {} },
+    registry: null, probe: null, llm: {}, wrapperStats: {},
+    startedAt: Date.now(),
+    saveStateFn: (state, submittedKeys) => { calls.push({ state, submittedKeys }); return true; },
+    log: { warn() {}, info() {}, error() {} },
+  });
+  const route = routes.find((r) => r.path === '/api/model-router/quota/sync');
+  const res = { writeHead(c) { res.status = c; }, setHeader() {}, end(b) { res.body = b; } };
+  await route.handler({
+    method: 'POST', url: '/api/model-router/quota/sync',
+    socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:3081' },
+    [Symbol.asyncIterator]: async function* () {
+      yield Buffer.from(JSON.stringify({ provider: 'p-x', windows: { fiveHour: { limit: 100 } } }));
+    },
+  }, res);
+
+  assert.equal(res.status, 200, '200');
+  assert.equal(calls.length, 1, 'saveStateFn 被调用');
+  assert.deepEqual(calls[0].submittedKeys, ['rules', 'providerMeta'],
+    '/quota/sync 提交的是 rules + providerMeta 两键；不传则 timeZone/mode/reports 会被擦除');
+});

@@ -1,5 +1,94 @@
 # Changelog
 
+## 1.0.1 (2026-09-19)
+
+> 🔴 **Critical 修复：`/state` 保存会静默擦除未提交的配置字段（数据丢失）**。
+> 由「人工测试用例集」的自动化部分（用例 **X-01**）在实机跑出，端到端证实并修复。
+
+### 缺陷
+
+`/state` 端点保存时**整体替换**磁盘状态，而非**合并**。
+
+```
+saveStateFn: (state) => saveState(cfg.storePath, state, log)   // ← 原实现
+```
+
+`normalizeState` 会给**未提交**的字段填默认值（如 body 无 `rules` 时仍返回 `rules: []`），
+而 `JSON.stringify` 会**丢弃 `undefined`** → **磁盘上已有的值被静默擦除**。
+
+### 真实触发（面板 **4 个保存点全部命中**）
+
+| 面板操作 | 请求体 | 被擦除的字段 |
+| --- | --- | --- |
+| **「一键启用每日报告」** | `{reports}` | **rules / providerMeta / timeZone** |
+| 「保存规则」 | `{rules}` | providerMeta / reports / timeZone / mode |
+| 「可切换模型 → exclude」 | `{rules, providerMeta}` | reports / timeZone / mode |
+| 「渠道限额声明」 | `{rules, providerMeta}` | reports / timeZone / mode |
+
+**端到端实测**（修复前）：
+```
+① POST {rules:[1条], providerMeta, timeZone} → 磁盘 ✓ 三者都在
+② 点击「一键启用每日报告」（只发 {reports}）  → 磁盘 ✗ rules=0 / providerMeta={} / timeZone=undefined
+③ 响应：200「已保存并即时生效」              → 静默，用户无从察觉
+④ 重启后：配置永久丢失
+```
+
+> 代码注释（`client.js:2189`）写的是「**timeZone/mode 保持服务端现值**」——
+> **注释与行为直接矛盾**，故判定为缺陷而非设计。
+
+### 修复
+
+**磁盘侧语义对齐到内存侧**（`routes.js` 对 providerMeta/reports/timeWindows 一律
+`!== undefined` 才覆盖，否则保留）：
+
+```js
+// lib/store.js —— 新增两个可测单元
+export function mergeState(prev, patch, submittedKeys) { … }   // undefined = 未提交 → 保留旧值
+export function makeSaveStateFn(storePath, log) { … }          // 读-合并-写
+```
+
+- `index.js` 改为 `saveStateFn: makeSaveStateFn(cfg.storePath, log)`
+- `routes.js` 的 `/state` 与 `/quota/sync` 均传入**原始请求体的键集**（`submittedKeys`）
+  —— 因为 `normalizeState` 会填默认值，**必须**依据「客户端实际提交了哪些键」判断覆盖范围
+- `null` 仍表示**显式清空**（如 `timeZone: null` = 系统时区），与 `undefined`（未提交）区分
+
+### 为什么修复放在 `store.js` 而非内联
+
+抽成 `mergeState` + `makeSaveStateFn` 是**为了可测**。首版修复内联在 `index.js` 的闭包里，
+实测「回退该接线」的突变**未被任何测试捕获**（`fail=0`）—— 闭包在插件工厂内，单测驱动不到。
+抽出后：逻辑有行为测试、接线有接线测试、`index.js` 用源码断言守住。
+
+### 测试
+
+单测 281 → **290**（+9）：
+
+| 组 | 条数 | 内容 |
+| --- | --- | --- |
+| `mergeState` 纯函数 | 4 | undefined 保留 / null 覆盖 / 剥离 storePath / prev=null 不抛 |
+| 端到端（镜像真实路径） | 1 | 「一键启用每日报告」不再擦除 rules/providerMeta/timeZone |
+| 接线① | 1 | `makeSaveStateFn` 是读-合并-写 |
+| 接线② | 1 | `/state` 传「原始 body 键集」（含空 body → 空键集） |
+| 接线③ | 1 | `index.js` 用工厂而非内联（源码断言） |
+| 接线④ | 1 | `/quota/sync` 同样传键集 |
+
+**Prove-It 突变验证（4/4 全被捕获）**：
+
+| 突变 | 红数 |
+| --- | --- |
+| `index.js` 回退到内联整体替换 | 1 |
+| `routes.js` 不传 `submittedKeys` | 1 |
+| `mergeState` 忽略 `submittedKeys` | 2 |
+| `/quota/sync` 不传键集 | 1 |
+
+**实机验证**（version=1.0.1）：复现原缺陷场景 → 规则 / providerMeta / timeZone **全部保留** ✓
+
+### 同时新增 · `test/manual-suite-automated.mjs`
+
+46 例人工用例中 **13 例可自动化**（A-02 / A-06 / B-09 / B-10 / C-01~C-08 / D-08 / X-01），
+本脚本在**真实实例**上执行（对照 `docs/v1.0-人工测试用例.md`）。
+实测 **14/14 全过**（含 X-01 安全复核）。
+其余 33 例（页签交互 / 配置改动 / 启停回滚）仍须人工。
+
 ## 1.0.0 (2026-09-18)
 
 > **v1.0 命名点 = 阶段 B「契约冻结与交付收口」完成**。
