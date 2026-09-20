@@ -3896,10 +3896,14 @@ test('v0.9.9.4: assertSafeRunId——合法通过；路径穿越/非法字符被
 
 test('v0.9.9.4: safeArchivePath——合法在目录内；越界/穿越被拒（双校验）', async () => {
   const { safeArchivePath } = await import('../lib/archive.js');
+  // ★ v1.0.2：用 path 工具构造期望值，**不要硬编码 `/`**。
+  //   safeArchivePath 返回 `resolve()` 结果（平台分隔符：Windows 是 `\`），
+  //   此前用 `${dir}/run-1...` 断言 → Windows 上必然不等（实测 windows-latest 失败）。
+  const { resolve, sep } = await import('node:path');
   const dir = '/tmp/archive-test-dir';
-  // 合法：拼接在目录内
-  assert.equal(safeArchivePath(dir, 'model-test', 'run-1'), `${dir}/run-1.model-test.json`);
-  assert.equal(safeArchivePath(dir, 'probe', 'run-2'), `${dir}/run-2.probe.json`);
+  // 合法：拼接在目录内（与实现同构：resolve(base, name)）
+  assert.equal(safeArchivePath(dir, 'model-test', 'run-1'), resolve(dir, 'run-1.model-test.json'));
+  assert.equal(safeArchivePath(dir, 'probe', 'run-2'), resolve(dir, 'run-2.probe.json'));
   // 非法 kind → archiveName 抛错
   assert.throws(() => safeArchivePath(dir, 'bogus', 'run-1'), /kind 须为/);
   // 路径穿越（第一道防线拦截）
@@ -3908,9 +3912,8 @@ test('v0.9.9.4: safeArchivePath——合法在目录内；越界/穿越被拒（
   // 绝对路径（含 / 被第一道拦截）
   assert.throws(() => safeArchivePath(dir, 'model-test', '/etc/passwd'), /非法字符/);
   // 第二道防线：即使第一道被绕过（模拟放宽正则），路径前缀确认仍拦
-  // —— 这里直接验证 resolve 归一化后的边界逻辑
-  const { resolve } = await import('node:path');
-  assert.ok(safeArchivePath(dir, 'model-test', 'x').startsWith(resolve(dir) + '/'));
+  // —— 这里直接验证 resolve 归一化后的边界逻辑（用 sep，不用 '/'）
+  assert.ok(safeArchivePath(dir, 'model-test', 'x').startsWith(resolve(dir) + sep));
 });
 
 test('v0.9.9.4: listArchives——三类识别 + 忽略其他后缀 + 按时间倒序 + 空目录', async () => {
