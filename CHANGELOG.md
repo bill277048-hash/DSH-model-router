@@ -59,6 +59,15 @@ assert.ok(thrown, '只读目录写入应抛错');      // 期望 EACCES
 
 > 测试数 290 → **291**（拆分后新增 1 条）。
 
+### 同时：CI 失败可诊断化
+
+job 日志需仓库 **admin** 权限才能通过 API 下载
+（`GET .../actions/jobs/{id}/logs` → `403 Must have admin rights`），
+在无权限环境下无法定位失败。现改为：测试失败时把「测试名 + 错误详情」
+发成 **GitHub annotation**（`::error::`），公共仓库的 check-run annotations
+可**匿名读取**（`GET .../check-runs/{id}/annotations`）。
+
+
 ### 同时：CI 增强
 
 - `concurrency` —— 同分支新推送取消旧运行（tag 运行不取消），省 CI 分钟
