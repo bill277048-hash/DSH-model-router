@@ -34,6 +34,23 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      # ⚠ 必需步骤：本插件的 lib/probe.js 与 lib/wrapper/index.js 在**模块顶层**
+      # import 宿主的 `@deepseek-ai/dsh-llm`（peerDependency）。该包不在公共 npm 源上，
+      # 上面的 `npm install` 装不到 → 测试文件**加载即崩**
+      # （ERR_MODULE_NOT_FOUND）。实测 `test` workflow 自 2026-09-08 起从未通过。
+      #
+      # 这里把 test/stubs/dsh-llm/ 拷进 node_modules 作为**测试替身**。
+      # 刻意不走 devDependencies：那会让开发机的 pnpm 用替身顶掉真实的包。
+      # 替身只实现本插件用到的 3 个符号，忠实度与局限见该目录的 index.js 头注释。
+      - name: Provide host package test double
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST=node_modules/@deepseek-ai/dsh-llm
+          mkdir -p "$DEST"
+          cp test/stubs/dsh-llm/package.json test/stubs/dsh-llm/index.js "$DEST/"
+          node -e "import('@deepseek-ai/dsh-llm').then(m => console.log('✓ stub 可解析，导出:', Object.keys(m).join(', ')))"
+
       # 覆盖：单测（含 client.js 真实渲染）+ 契约测试（端点/配置/落盘/E2E）
       # 命名约定：只有 `*.test.mjs` 进 CI；`manual-suite-automated.mjs` 需实机实例，
       # 由文件名自然排除（见 package.json 的 test 脚本 glob）。
