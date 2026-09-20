@@ -59,6 +59,69 @@ assert.ok(thrown, '只读目录写入应抛错');      // 期望 EACCES
 
 > 测试数 290 → **291**（拆分后新增 1 条）。
 
+### 新增 · v1.0.2 安装包（`assets/DSH-model-router-v1.0.2.zip`）
+
+打 tag 发 Release 时由 `release.yml` 上传。**904.6 KB / 34 文件**，顶层单一目录
+`DSH-model-router-v1.0.2/`（避免解压时文件散落）。
+
+内容（**自包含**，下载即可用）：
+
+```
+package.json  client.js  cordis.patch.yml  screenshots.json
+README.md  README.zh.md  CHANGELOG.md  LICENSE
+lib/（19 个 js，含 lib/wrapper/）
+scripts/（deploy/undeploy .sh/.ps1 + diag-session.mjs）
+assets/（2 张面板截图，screenshots.json 引用）
+```
+
+**排除**：`node_modules` / `.git` / `test/` / `docs/` / `SUBMISSION.md` /
+`.github/` / 其他 `*.zip` / `.DS_Store` / `*.bak`。
+
+**为什么含 `scripts/`**（与 §「部署包」标准不同）：README 的「方式二」安装依赖
+`scripts/deploy.sh`（它取 `scripts/..` 作包根）。Release 资产是**独立下载**的，
+不含脚本则该安装路径不可用。而 skill 里那份「部署包」标准是给「直接拷进
+node_modules」用的，那里不需要 scripts。
+
+**为什么排除 `docs/`**：其文件名含中文（如 `DSH模型路由+...md`），
+Apple 版 Info-ZIP 会写出**乱码条目** —— 实测 v0.8.0 的包即有此缺陷
+（`docs/DSH????+?v0.8????????????-?+???????.md`）。排除后包内**全 ASCII 文件名**，
+从根上规避。
+
+**验证**（解压后实测，非只看列表）：
+- `package.json` version = `1.0.2`；README/CHANGELOG 标注一致
+- 34 个文件与仓库当前状态**逐字节一致**
+- `deploy.sh` 的结构前提齐备（`scripts/` 与 `lib/` 同层，`lib/index.js` 在）
+- 无 `node_modules` / `.git` / `test/` / `docs/` / `*.zip` / `.DS_Store` / `*.bak`
+- 20 个 js 文件语法检查通过
+- 打包后无 `zi??????` / `XX??????` 临时文件残留（仓库与工作目录均为 0）
+
+### 修复 · `release.yml` 按 tag **精确**选包（原为 `assets/*.zip`）
+
+原逻辑上传 `assets/` 下**所有** zip。现在该目录长期存有历史版本的包
+（v0.8.0 + v1.0.2），打 v1.0.2 tag 会把 **v0.8.0 的包也附上** —— 用户可能下错版本。
+
+```yaml
+files: assets/DSH-model-router-${{ steps.tag.outputs.value }}.zip
+```
+
+tag `v1.0.2` → 只上传 `assets/DSH-model-router-v1.0.2.zip` ✓
+缺包时不失败（`fail_on_unmatched_files: false`），仅告警 —— 便于先发版后补包。
+
+### 更新 · `lib/index.js` 顶部能力注释（滞后于实现）
+
+原注释写「能力（**v0.2.0**）」且有多处与实际不符：
+
+| 原注释 | 实际 |
+| --- | --- |
+| 能力（v0.2.0） | v1.0.2 |
+| `rules/propose` 支持面板热更新 | `propose` 已是 **v0.9.1 前的遗留兼容字段**，新客户端不再提交、不参与路由 |
+| `commit-on-first-chunk` | v0.6.0 已改为 **commit-on-substantive** |
+| 详见 `lib/wrapper.js` | 实现已迁至 `lib/wrapper/index.js`（wrapper.js 仅 20 行 re-export 薄桥） |
+
+补齐 v0.9/v1.0 的能力：纯选择驱动、每日报告、模型测试与档案、峰谷段场景、
+窗口限额与重置规则、free-tier 节流、8 页签面板。
+「四种候选扩展策略」经核实**仍成立**，保留。
+
 ### 同时：CI 失败可诊断化
 
 job 日志需仓库 **admin** 权限才能通过 API 下载

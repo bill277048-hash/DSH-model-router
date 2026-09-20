@@ -53,6 +53,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         env:
           TAG: ${{ steps.tag.outputs.value }}
+      # 上传与本 tag **精确匹配**的安装包（不是 `assets/*.zip`）。
+      # 理由：`assets/` 下会长期存有历史版本的包（如 v0.8.0 / v1.0.2）。
+      # 若用通配符，打 v1.0.2 tag 时会把 v0.8.0 的包也一并附上 —— 用户可能下错版本。
+      # 例：tag `v1.0.2` → 只上传 `assets/DSH-model-router-v1.0.2.zip`。
+      # 缺包时不失败（fail_on_unmatched_files: false），仅告警 —— 便于先发版后补包。
       - name: Create GitHub Release with assets
         uses: softprops/action-gh-release@v2
         with:
@@ -60,4 +65,4 @@ jobs:
           name: ${{ steps.tag.outputs.value }}
           body: ${{ steps.changelog.outputs.body }}
           fail_on_unmatched_files: false
-          files: assets/*.zip
+          files: assets/DSH-model-router-${{ steps.tag.outputs.value }}.zip
