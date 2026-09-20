@@ -89,7 +89,7 @@ description:
 | `package.json` `repository` 指回本仓库 | ✅ 已替换 | `git+https://github.com/bill277048-hash/DSH-model-router.git`（npm 自动关联靠它）。 |
 | `package.json` `homepage` / `bugs` | ✅ 已替换 | `https://github.com/bill277048-hash/DSH-model-router#readme`。 |
 | GitHub 仓库加 `dsh-plugin` topic | ❌ 需你手动 | 在仓库 Settings → Topics 添加 `dsh-plugin`。 |
-| 真实可运行代码 | ✅ 有 | 非占位/纯 README 仓库；`npm test` 返回 **290/290 通过**（单测 277 + 契约 13，约 25s）。 |
+| 真实可运行代码 | ✅ 有 | 非占位/纯 README 仓库；`npm test` 返回 **291/291 通过**（单测 278 + 契约 13）。 |
 | `screenshots.json` + `assets/` 截图 | ⚠️ 模板已建 | 已声明 `assets/model-router-status.png` 与 `assets/model-router-settings.png`，**请把两张真实截图放进 `assets/`**（状态接口输出、设置面板各一张）。缺图也不致命——商店会从 README 抽图，但声明能控制顺序。 |
 | README 安装说明含 `dsh plugin add` | ✅ 已加 | 中英 README 均补「方式一：插件市场」。 |
 | 版本漂移 | ✅ 已修 | README×2 / package.json / CHANGELOG / client.js / lib/index.js 统一为 **v1.0.2**（含「范围声明」「阶段交付速览」「页签数」等 7 处历史残留）；CI 新增 `changelog-guard` job 在 PR 阶段校验「package.json 版本须在 CHANGELOG 有对应段落」，防止再次漂移。 |

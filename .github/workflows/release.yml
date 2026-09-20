@@ -58,6 +58,49 @@ jobs:
       # 若用通配符，打 v1.0.2 tag 时会把 v0.8.0 的包也一并附上 —— 用户可能下错版本。
       # 例：tag `v1.0.2` → 只上传 `assets/DSH-model-router-v1.0.2.zip`。
       # 缺包时不失败（fail_on_unmatched_files: false），仅告警 —— 便于先发版后补包。
+      # 🔒 产物 ↔ 源码 一致性硬门禁（v1.0.2 教训 VER-02 的根治）。
+      #
+      # 背景：此前 `files:` 只校验「assets/ 里的包**存在**」，不校验「**内容来自本 tag 的源码**」，
+      # 且 `fail_on_unmatched_files: false` 让「包缺失」也只告警不失败 —— 于是
+      # 「包是旧的」（如 v1.0.2 曾出现：包内 CHANGELOG 自述 904.6 KB/34 文件/含 scripts/，
+      # 实际 251.0 KB/29 条目/扁平/不含）会**静默通过发布**，用户下载到自相矛盾的产物。
+      #
+      # 本步骤：用**当次 tag 的源码**重建包 → 与 assets/ 里那个逐文件比对，不一致即 fail。
+      # 原则：`assets/` 只作留档，**Release 资产必须来自当次源码**。
+      # 打包逻辑收在 scripts/pack.sh（人工与 CI 共用，避免两处标准分叉）。
+      - name: Verify committed asset matches a rebuild from this tag's source
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.value }}"
+          ASSET="assets/DSH-model-router-${TAG}.zip"
+          if [ ! -f "$ASSET" ]; then
+            echo "::warning::$ASSET 不存在——本次 Release 将不含安装包（fail_on_unmatched_files=false）"
+            exit 0
+          fi
+
+          # ① 用当次源码重建（pack.sh 内部已断言 package.json 版本 == tag）
+          bash scripts/pack.sh "${TAG#v}" /tmp/rebuilt.zip
+
+          # ② 条目级比对：名称 + 未压缩大小 + CRC（解压后的字节由 ③ 兜底）
+          unzip -l "$ASSET"    | awk 'NR>3 && NF>=4 {print $1, $2, $4}' | grep -v '^$' > /tmp/asset.txt   || true
+          unzip -l /tmp/rebuilt.zip | awk 'NR>3 && NF>=4 {print $1, $2, $4}' | grep -v '^$' > /tmp/rebuilt.txt || true
+          if ! diff -u /tmp/asset.txt /tmp/rebuilt.txt; then
+            echo "::error::$ASSET 的条目清单与「当次源码重建结果」不一致——请重打并提交"
+            exit 1
+          fi
+
+          # ③ 内容级比对：解压后逐文件比字节（条目级相同仍可能内容不同）
+          rm -rf /tmp/va /tmp/vb && mkdir -p /tmp/va /tmp/vb
+          unzip -q "$ASSET" -d /tmp/va
+          unzip -q /tmp/rebuilt.zip -d /tmp/vb
+          if ! diff -r /tmp/va /tmp/vb >/dev/null; then
+            echo "::error::$ASSET 的内容与「当次源码重建结果」不一致——请重打并提交"
+            diff -r /tmp/va /tmp/vb | head -20
+            exit 1
+          fi
+          echo "✓ $ASSET 与当次源码重建结果一致（条目级 + 内容级）"
+
       - name: Create GitHub Release with assets
         uses: softprops/action-gh-release@v2
         with:
