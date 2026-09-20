@@ -5207,7 +5207,7 @@ test('v0.9.20 P0: runReport——未传 reportDir 且 daily=null → 不落盘�
 
 test('v0.9.20 P1: writeAtomic 失败路径也清理 tmp（补齐「tmp 不残留」的承诺）', async () => {
   const { writeAtomic } = await import('../lib/archive.js');
-  const { mkdtempSync, readdirSync, rmSync, mkdirSync, chmodSync } = await import('node:fs');
+  const { mkdtempSync, readdirSync, rmSync, mkdirSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const dir = mkdtempSync(join(tmpdir(), 'dsh-atomic-fail-'));
@@ -5225,25 +5225,45 @@ test('v0.9.20 P1: writeAtomic 失败路径也清理 tmp（补齐「tmp 不残留
     assert.throws(() => writeAtomic(missing, 'x', {}), '写入失败应抛错');
     leftovers = readdirSync(dir).filter((n) => n.includes('.tmp-'));
     assert.deepEqual(leftovers, [], '写入阶段失败也不残留 .tmp');
-
-    // 场景 3：**清理错误不得掩盖原始错误**（判别式断言）
-    // 只读目录：writeFileSync 失败于 EACCES，而 unlinkSync 因文件不存在失败于 ENOENT。
-    // 若清理未包 try/catch，抛出的会是 ENOENT（掩盖了真正的 EACCES）——此断言即可捕获。
-    const roDir = join(dir, 'readonly');
-    mkdirSync(roDir);
-    chmodSync(roDir, 0o555);
-    try {
-      let thrown = null;
-      try { writeAtomic(join(roDir, 'x.json'), 'x', {}); } catch (e) { thrown = e; }
-      assert.ok(thrown, '只读目录写入应抛错');
-      assert.equal(thrown.code, 'EACCES', '抛出的是**原始**写入错误（未被清理的 ENOENT 掩盖）');
-    } finally {
-      chmodSync(roDir, 0o755); // 恢复可写，否则 rmSync 清不掉
-    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// 场景 3 独立成测并**在 Windows 上跳过**：
+// 它依赖 `chmod 0o555` 造只读目录、期望写入失败于 `EACCES`。
+// 但 **Windows 的 chmod 是空操作**（无 Unix 权限位语义）——目录仍可写，
+// `writeAtomic` 会成功、断言 `assert.ok(thrown)` 崩。
+// 实测：`windows-latest` 上 2 个 job（Node 22/24）即因此失败，其余 4 个 job 全绿。
+// 权限语义只在类 Unix 上可测，故显式跳过而非改成假断言（保 coverage 诚实）。
+test(
+  'v0.9.20 P1: 清理错误不得掩盖原始错误（仅类 Unix——依赖 chmod 权限位）',
+  { skip: process.platform === 'win32' ? 'Windows 的 chmod 是空操作，无法构造 EACCES' : false },
+  async () => {
+    const { writeAtomic } = await import('../lib/archive.js');
+    const { mkdtempSync, rmSync, mkdirSync, chmodSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-atomic-eacces-'));
+    try {
+      // 只读目录：writeFileSync 失败于 EACCES，而 unlinkSync 因文件不存在失败于 ENOENT。
+      // 若清理未包 try/catch，抛出的会是 ENOENT（掩盖了真正的 EACCES）——此断言即可捕获。
+      const roDir = join(dir, 'readonly');
+      mkdirSync(roDir);
+      chmodSync(roDir, 0o555);
+      try {
+        let thrown = null;
+        try { writeAtomic(join(roDir, 'x.json'), 'x', {}); } catch (e) { thrown = e; }
+        assert.ok(thrown, '只读目录写入应抛错');
+        assert.equal(thrown.code, 'EACCES', '抛出的是**原始**写入错误（未被清理的 ENOENT 掩盖）');
+      } finally {
+        chmodSync(roDir, 0o755); // 恢复可写，否则 rmSync 清不掉
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test('v0.9.20 P1: writeAtomic 成功路径仍正常（无回归）', async () => {
   const { writeAtomic } = await import('../lib/archive.js');

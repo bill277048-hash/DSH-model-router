@@ -29,16 +29,35 @@ assert.deepEqual(router.candidates(...), [{ provider: 'q-off', model: 'n-off' }]
 3. CI 的测试步骤显式声明 `env: TZ: UTC` —— 把「跨时区可复现」钉成**持续约束**，
    而非依赖 runner 镜像的默认时区
 
-**多时区实测**（6 个时区全部 290/290）：
+**多时区实测**（6 个时区全部通过）：
 
 | TZ | 结果 |
 | --- | --- |
-| `UTC` | 290/290 ✓ |
-| `Asia/Shanghai` | 290/290 ✓ |
-| `Asia/Tokyo` | 290/290 ✓ |
-| `America/New_York` | 290/290 ✓ |
-| `Europe/London` | 290/290 ✓ |
-| `Pacific/Auckland` | 290/290 ✓ |
+| `UTC` | ✓ |
+| `Asia/Shanghai` | ✓ |
+| `Asia/Tokyo` | ✓ |
+| `America/New_York` | ✓ |
+| `Europe/London` | ✓ |
+| `Pacific/Auckland` | ✓ |
+
+### 同时修复：1 条用例在 Windows 上必然失败
+
+修完时区后 CI 变为 **5 绿 2 红** —— 仅剩 `windows-latest`（Node 22/24）。
+根因是同一测试里的**场景 3**：
+
+```js
+chmodSync(roDir, 0o555);                    // 造只读目录
+assert.ok(thrown, '只读目录写入应抛错');      // 期望 EACCES
+```
+
+**Windows 的 `chmod` 是空操作**（无 Unix 权限位语义）→ 目录仍可写 →
+`writeAtomic` 成功 → 断言崩。
+
+**修复**：把场景 3 拆成**独立测试**并加 `{ skip: process.platform === 'win32' }`，
+场景 1/2（跨平台）留在原测试中继续在 Windows 上跑。
+**刻意跳过而非改成假断言** —— 权限语义只在类 Unix 上可测，保 coverage 诚实。
+
+> 测试数 290 → **291**（拆分后新增 1 条）。
 
 ### 同时：CI 增强
 
