@@ -151,7 +151,17 @@ function makeRegistry(pairs) {
 
 function makeRouter(rules, registry, opts = {}) {
   // v0.9.4 收口：默认显式延用 v0.8 匹配语义（match 构造可用）；验证纯选择驱动时传 { legacyMatch: false }
-  const config = normalizeConfig({ allowLegacyMatch: opts.legacyMatch !== false, rules });
+  //
+  // v1.0.2：新增可选 `opts.timeZone`。
+  // 背景：`timeZone` 缺省为 `null`（= 系统时区），凡「用硬编码时刻断言时段命中」的用例
+  // 都会**随运行机器的时区变化**——CI 跑在 UTC，本地跑在 +8，同一断言结果相反。
+  // 实测 `test` workflow 自 2026-09-08 起 6/6 全失败即因此（当时误判为依赖缺失）。
+  // 需要确定性时区的用例**必须**显式传本参数，勿依赖运行环境。
+  const config = normalizeConfig({
+    allowLegacyMatch: opts.legacyMatch !== false,
+    rules,
+    ...(opts.timeZone !== undefined ? { timeZone: opts.timeZone } : {}),
+  });
   return new Router(config, registry ?? null);
 }
 
@@ -842,10 +852,12 @@ test('router v0.5.0: localHHMM/inTimeWindow——时区确定性换算与跨零�
 });
 
 test('router v0.5.0: matchRule 时间窗门控——双 default 按窗口择一', () => {
+  // ★ v1.0.2：必须显式指定 timeZone。此前依赖**运行机器的系统时区**——
+  //   注释写的「上海 00:30」只在 +8 成立，CI（UTC）下同一时刻是 16:30 → 断言反向。
   const router = makeRouter([
     { match: { default: true, hours: { start: '00:30', end: '08:30' } }, route: [{ provider: 'q-off', model: 'n-off' }] },
     { match: { default: true }, route: [{ provider: 'q-peak', model: 'n-peak' }] },
-  ]);
+  ], null, { timeZone: 'Asia/Shanghai' });
   // 谷时（上海 00:30）→ 第一条 default（谷价路由）
   router._now = new Date('2026-09-04T16:30:00Z');
   assert.deepEqual(router.candidates({ provider: 'p', model: 'm' }), [{ provider: 'q-off', model: 'n-off' }]);
@@ -5353,8 +5365,12 @@ test('v0.9.21 I3: 端点语义差异被固化——t=valleyStart 时规则窗命
   assert.equal(inTimeWindow({ start: '09:00', end: '22:00' }, 'Asia/Shanghai', atValleyStart), true,
     'inTimeWindow 含结束端点（<=）');
   // 段判定半开 [09:00, 22:00) → 22:00 已属 valley
+  // ★ v1.0.2：必须显式 timeZone。上面 `new Date('...+08:00')` 是**绝对时刻**
+  //   （= 14:00 UTC）；若不指定 timeZone，segmentOfNow 会用**系统时区**去算本地 HH:MM
+  //   → +8 机器得 22:00（valley ✓），UTC 机器得 14:00（peak ✗）。CI 即因此常年失败。
   const r = new Router({
     rules: [],
+    timeZone: 'Asia/Shanghai',
     timeWindows: { enabled: true, peakStart: '09:00', valleyStart: '22:00', peak: { route: [] }, valley: { route: [] } },
   });
   assert.equal(r.segmentOfNow(atValleyStart), 'valley', 'segmentOf 半开（<），22:00 已切 valley');

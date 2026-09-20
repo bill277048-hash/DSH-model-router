@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.0.2 (2026-09-20)
+
+> **CI 修复：2 条用例依赖运行机器时区** —— `test` workflow 自 2026-09-08 起
+> **6/6 次全失败**，根因即此。**无生产代码改动**（仅测试与 CI）。
+
+### 缺陷
+
+2 条用例用**硬编码时刻**断言时段命中，却**没给 `Router` 指定 `timeZone`**
+（缺省 `null` = 系统时区）：
+
+```js
+// unit.test.mjs —— 注释写「上海 00:30」，但 config.timeZone 是 null
+router._now = new Date('2026-09-04T16:30:00Z');
+assert.deepEqual(router.candidates(...), [{ provider: 'q-off', model: 'n-off' }]);
+```
+
+`2026-09-04T16:30:00Z` 在 **+8 机器**上是本地 00:30（命中谷时窗 ✓），
+在 **UTC 机器**上是本地 16:30（不命中 ✗）→ 同一断言结果相反。
+
+**症状极具误导性**：本地（+8）**全绿**，CI（UTC）**全红**，
+且 6 个矩阵 job 全失败（含与本地配置相同的 `macos-latest, 22`）。
+
+### 修复
+
+1. `makeRouter()` 新增可选 `opts.timeZone`（不传则维持原行为 `null`）
+2. 2 条用例显式传入 `timeZone: 'Asia/Shanghai'`（或 `new Router({ timeZone })`）
+3. CI 的测试步骤显式声明 `env: TZ: UTC` —— 把「跨时区可复现」钉成**持续约束**，
+   而非依赖 runner 镜像的默认时区
+
+**多时区实测**（6 个时区全部 290/290）：
+
+| TZ | 结果 |
+| --- | --- |
+| `UTC` | 290/290 ✓ |
+| `Asia/Shanghai` | 290/290 ✓ |
+| `Asia/Tokyo` | 290/290 ✓ |
+| `America/New_York` | 290/290 ✓ |
+| `Europe/London` | 290/290 ✓ |
+| `Pacific/Auckland` | 290/290 ✓ |
+
+### 同时：CI 增强
+
+- `concurrency` —— 同分支新推送取消旧运行（tag 运行不取消），省 CI 分钟
+- `timeout-minutes` —— 防挂死任务烧分钟
+- `workflow_dispatch` —— 手动触发便于排查
+- **`changelog-guard` job** —— 校验「package.json 版本须在 CHANGELOG 有对应段落」。
+  `release.yml` 依赖 CHANGELOG 段落，缺段会在**打完 tag 后**才失败；提前到 PR 阶段拦截。
+- `npm test` 由**硬编码文件名**改为 glob `test/*.test.mjs`
+  —— 此前新增测试文件会**静默漏跑**；`manual-suite-automated.mjs`（需实机实例）
+  由命名约定自然排除。
+
+### 排查过程中的弯路（如实记录）
+
+首轮误判为「CI 缺 `@deepseek-ai/dsh-llm`（peerDependency 不在公共源）」，
+据此加了 `test/stubs/dsh-llm/` 测试替身 + CI 安装步骤。
+
+**该诊断是错的**：我的复现脚本**跳过了 CI 的 `npm install` 步骤**，
+所以复现出的是个**假故障**。实际 `npm install` 能正常从公共 npm 源装上
+`@deepseek-ai/dsh-llm@0.0.1-rc.1`（38 个导出）。
+
+**教训**：复现 CI 失败时，**必须完整复现 CI 的每一步**（含依赖安装），
+否则会对着假故障修出真复杂度。替身已删除。
+
 ## 1.0.1 (2026-09-19)
 
 > 🔴 **Critical 修复：`/state` 保存会静默擦除未提交的配置字段（数据丢失）**。
