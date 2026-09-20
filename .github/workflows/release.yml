@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to release (e.g. v0.8.0). If empty, the tag that triggered the run is used.'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cannot resolve tag from event '${{ github.event_name }}'; provide inputs.tag" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.value }}
+          fetch-depth: 0
+      - name: Extract changelog section for this version
+        id: changelog
+        run: |
+          BODY=$(node -e '
+            const fs = require("fs");
+            const tag = process.env.TAG;
+            const text = fs.readFileSync("CHANGELOG.md", "utf8");
+            const lines = text.split("\n");
+            const header = "## " + tag.replace(/^v/, "") + " ";
+            const start = lines.findIndex(l => l.startsWith(header));
+            if (start < 0) { console.error("No CHANGELOG section for " + tag); process.exit(1); }
+            let end = lines.length;
+            for (let i = start + 1; i < lines.length; i++) { if (lines[i].startsWith("## ")) { end = i; break; } }
+            process.stdout.write(lines.slice(start, end).join("\n").trim());
+          ')
+          {
+            echo "body<<EOF"
+            echo "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+      - name: Create GitHub Release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: ${{ steps.tag.outputs.value }}
+          body: ${{ steps.changelog.outputs.body }}
+          fail_on_unmatched_files: false
+          files: assets/*.zip

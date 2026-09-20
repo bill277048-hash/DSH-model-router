@@ -3,7 +3,14 @@ name: test
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+
+# 同一分支/PR 的新推送取消旧运行（省 CI 分钟；tag 运行不取消）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   unit:
@@ -13,12 +20,44 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [22, 24]
     runs-on: ${{ matrix.os }}
+    # 测试约 30s；留足余量并防挂死任务烧分钟
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+
+      # 本项目**无运行时 dependencies**（仅 peerDependencies，由宿主提供），
+      # 故不做 npm 缓存——装的东西极少，缓存反而添乱。
       - name: Install dependencies
         run: npm install --no-audit --no-fund
-      - name: Run unit tests
+
+      # 覆盖：单测（含 client.js 真实渲染）+ 契约测试（端点/配置/落盘/E2E）
+      # 命名约定：只有 `*.test.mjs` 进 CI；`manual-suite-automated.mjs` 需实机实例，
+      # 由文件名自然排除（见 package.json 的 test 脚本 glob）。
+      - name: Run tests
         run: npm test
+
+  # release.yml 依赖 CHANGELOG 有对应版本的段落。这里提前在 PR 阶段校验，
+  # 避免打完 tag 才发现 CHANGELOG 缺段（那时 release workflow 会失败）。
+  changelog-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: package.json 版本须在 CHANGELOG 中有对应段落
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          echo "package.json version = $VERSION"
+          if ! grep -qE "^## ${VERSION} " CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::CHANGELOG.md 缺少 '## ${VERSION} ' 段落"
+            echo "---- CHANGELOG 现有版本标题 ----"
+            grep -E '^## ' CHANGELOG.md | head -10
+            exit 1
+          fi
+          echo "✓ CHANGELOG 含 ${VERSION} 段落"

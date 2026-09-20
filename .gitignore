@@ -14,6 +14,13 @@ npm-debug.log*
 # 构建产物（可由源码重新打包；发布包存 NAS 归档）
 DSH-model-router-v*.zip
 
+# 例外：`assets/` 下的 zip 是 **Release 资产**（.github/workflows/release.yml
+# 的 `files: assets/*.zip` 会在打 v* tag 时上传它们），必须入库。
+# 注：上面那条规则本意只针对**根目录**的本地部署包，但无斜杠的模式会匹配任意层级，
+# 故此处显式放开 assets/。2026-09-20 发现：远端 main（v0.8.1 时期）确实跟踪了
+# assets/DSH-model-router-v0.8.0.zip —— 当时靠 `git add -f` 绕过，未记录原因。
+!assets/*.zip
+
 # 本机 Info-ZIP（Apple 版）在目标文件名含非 ASCII 时（如「…部署包.zip」）
 # 会创建 ziXXXXXX 形式的临时文件且不自动清理。打包后请随手 rm，勿入库。
 zi??????
