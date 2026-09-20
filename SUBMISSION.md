@@ -5,17 +5,17 @@
 
 > **仓库状态（2026-09-20 更新）**：`https://github.com/bill277048-hash/DSH-model-router`
 > 已就绪——**仓库年龄门槛早已满足**（注册于 2026-09-03，CI 要求满 1 天）。
-> 本机目录**已是 git 仓库并已关联远端**，`main` 已推送至 **v1.0.1**（commit `8775a3b`）。
+> 本机目录**已是 git 仓库并已关联远端**，`main` 已推送至 **v1.0.2**（commit `3ebd7d6`，CI 全绿）。
 >
 > ```
 > origin  git@github.com:bill277048-hash/DSH-model-router.git
-> main              8775a3b  fix(v1.0.1): Critical——/state 保存静默擦除未提交配置字段（数据丢失）
+> main              3ebd7d6  feat(release): 提交 v1.0.2 安装包 + release.yml 按 tag 精确选包 + 更新 index.js 注释
 > legacy-v0.8.1     2076c26  v0.8.1: providerMeta 持久化链路修复（生产同步）
 > ```
 >
 > > ⚠ 本地 git 历史与远端**原本无共同祖先**（本地是重新 init 的独立历史）。
 > > 2026-09-20 同步时采用「**强推 + 旧历史存 `legacy-v0.8.1` 分支**」——
-> > 远端旧历史完整保留在该分支，`main` 指向 v1.0.1。已逐文件比对确认
+> > 远端旧历史完整保留在该分支，`main` 指向 v1.0.2。已逐文件比对确认
 > > **无内容丢失**（并补回了 `.github/workflows/release.yml` /
 > > `assets/DSH-model-router-v0.8.0.zip` / `docs/RELEASE_NOTES_0.8.0.md`）。
 
@@ -54,10 +54,9 @@ description:
 - `category` 取值固定集合：`agi ui usage theme model identity session memory tools wsl browser vision voice docs skill workflow git notify dev security remote market fun`。
   本插件核心是「跨供应商/模型路由 + 故障切换」，首选 **`model`**；若你更想突出配额/用量维度，可选 `usage`。
 - `description.en` **必填且必须以句号结尾**；`zh` 可省略（维护者会补），但建议带上。
-- 描述**必须属实、不带营销词**，会被拿去对照代码核实。上面这句与 `README.zh.md` 开头的 v1.0.1 能力列表一致
+- 描述**必须属实、不带营销词**，会被拿去对照代码核实。上面这句与 `README.md` / `README.zh.md` 开头的 v1.0.2 能力列表一致
   （每日 API 报告 → `lib/daily.js`；模型全自动测试 → `lib/model-test.js`；WebUI 面板 → `client.js` + `lib/routes.js`）。
-  > ⚠ `lib/index.js` 顶部注释仍写「能力（v0.2.0）」且只列 4 项，**已滞后**（未随 v0.9/v1.0 更新）——
-  > 对照核实请以 README 为准，该注释待后续统一。
+  > ✅ `lib/index.js` 顶部注释已于 v1.0.2 更新（原写「能力（v0.2.0）」且只列 4 项，现已补全 v0.9/v1.0 能力并修正 4 处与实现不符的表述）。
 - 描述里若出现 `: `（冒号加空格）必须加引号，否则 YAML 解析失败。
 - 一个 PR **最多 3 条**；超过 CI 直接拒。本插件只占 1 条。
 - 可选 `tarball:` 字段：把预构建包挂到 GitHub Release 后指向它，商店会优先展示而非源码构建。
@@ -93,10 +92,10 @@ description:
 | 真实可运行代码 | ✅ 有 | 非占位/纯 README 仓库；`npm test` 返回 **290/290 通过**（单测 277 + 契约 13，约 25s）。 |
 | `screenshots.json` + `assets/` 截图 | ⚠️ 模板已建 | 已声明 `assets/model-router-status.png` 与 `assets/model-router-settings.png`，**请把两张真实截图放进 `assets/`**（状态接口输出、设置面板各一张）。缺图也不致命——商店会从 README 抽图，但声明能控制顺序。 |
 | README 安装说明含 `dsh plugin add` | ✅ 已加 | 中英 README 均补「方式一：插件市场」。 |
-| 版本漂移 | ✅ 已修 | README/package.json/CHANGELOG 三处统一为 **v1.0.1**；CI 新增 `changelog-guard` job 在 PR 阶段校验「package.json 版本须在 CHANGELOG 有对应段落」，防止再次漂移。 |
-| CHANGELOG 跟进 | ✅ 已补 | 共 **37 个版本节点**（v0.1.0 → v1.0.1）。 |
+| 版本漂移 | ✅ 已修 | README×2 / package.json / CHANGELOG / client.js / lib/index.js 统一为 **v1.0.2**（含「范围声明」「阶段交付速览」「页签数」等 7 处历史残留）；CI 新增 `changelog-guard` job 在 PR 阶段校验「package.json 版本须在 CHANGELOG 有对应段落」，防止再次漂移。 |
+| CHANGELOG 跟进 | ✅ 已补 | 共 **37 个版本节点**（v0.1.0 → v1.0.2）。 |
 | CI 工作流 | ✅ 已增强 | `.github/workflows/test.yml`：3 OS × Node 22/24 矩阵跑 `npm test`；新增 `concurrency`（取消被取代的运行）、`timeout-minutes`、`workflow_dispatch`、`changelog-guard`。 |
-| `release.yml` 自动发 Release | ✅ 已恢复 | 打 `v*` tag 时自动建 GitHub Release 并从 CHANGELOG 抽取该版本段落作正文，上传 `assets/*.zip`。**（2026-09-20 同步时曾意外丢失，已从 `legacy-v0.8.1` 补回）** |
+| `release.yml` 自动发 Release | ✅ 已恢复 | 打 `v*` tag 时自动建 GitHub Release 并从 CHANGELOG 抽取该版本段落作正文，上传 `assets/DSH-model-router-<tag>.zip`（**按 tag 精确匹配**，避免历史版本包串版）。**（2026-09-20 同步时曾意外丢失，已从 `legacy-v0.8.1` 补回）** |
 | README 配置表 vs 代码默认一致性 | ✅ 已修 | 复核时发现 `firstTokenTimeoutMs`/`failoverSignals` 数量等 4 项不一致，已与 `lib/config.js DEFAULT_CONFIG` 对齐；中英 README 均更新。 |
 | README v0.7 范围声明 | ✅ 已扩 | 补 mode 三档参数 + v0.6.1 配额感知 + v0.6.0 标题三级解析。 |
 | `peerDependencies` 预发布版本匹配（README 第 7 条警告） | ✅ 已修 | 原 `"@deepseek-ai/dsh-llm": "*"` 实际是「匹配一切但默默排除 prerelease」——用户装 dsh 0.1.1-rc.x 会 ERESOLVE。已改为 `">=0.0.1-rc.1 <0.1.0 \|\| >=0.1.1-rc.1 <0.2.0-0"`（0.1.1-rc.2 + 0.1.0-rc.7 均通过，0.2.0 拒绝）。 |

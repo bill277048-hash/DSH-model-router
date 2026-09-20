@@ -5,12 +5,15 @@ DSH 多供应商模型路由插件（v1.0.2）：规则路由 + 首 token 前无
 - 兼容：dsh ≥ 0.1.1-rc.1，Node ≥ 22.19，零第三方运行时依赖
 - 许可证：Apache-2.0
 
-## 阶段交付速览（v0.9.10–v0.9.21）
+## 阶段交付速览（v0.9.10–v1.0.2）
 
 | 阶段 | 版本链 | 主题 |
 | --- | --- | --- |
 | v0.9.10 A | v0.9.10 → v0.9.16 + v0.9.17 收口 | 渠道档案 schema + 声明通道扩能（限额/重置/TPM/来源/备注）+ UI 编辑器 |
 | v0.9.10 A 续 | v0.9.18 → v0.9.19 | TPM 节流激活 + hop 内联声明 UI |
+| v0.9.9 审核收口 | v0.9.20 → v0.9.21 | 审核修复（1 Critical + 2 Important + I3/S1–S4）：model-test 落盘解耦、`writeAtomic` tmp 清理、档案按 `mtime` 排序、`hourCycle:'h23'` |
+| v0.9.9 审核续 | v0.9.22 → v0.9.23 | 节流数据源修复（`Metrics.snapshot` 不再截断到 50）+ 真实数据驱动分析 + 档案重访阈值告警 |
+| **v1.0 阶段 B** | **v1.0.0 → v1.0.2** | **契约冻结与交付收口**：三类契约文档 / 配置 `schema` 版本化 + 迁移链 / 集成测试层（13 条契约）/ 人工测试用例集（46 例）/ **数据丢失 Critical 修复**（`/state` 改部分更新）/ CI 首次全绿（3 平台 × Node 22/24）/ v1.0.2 安装包 |
 
 **重要审查**：`docs/v0.9.9-审核摘要.md`（30 行 TL;DR）+ [`v0.9.9-代码审核报告.md`](docs/v0.9.9-代码审核报告.md)（完整 331 行）—— 审核了 v0.9.9 阶段的 1 Critical + 3 Important + 4 Suggestion，全部于 v0.9.20/v0.9.21 处理完毕（含等价性穷举 960 组 0 差异、import 图零环、实测推翻原判断 3 项回归审核）。
 
@@ -75,7 +78,7 @@ scripts\undeploy.ps1
 状态接口（只读，仅限本机回环访问）：
 
 ```bash
-curl --noproxy '*' -s http://127.0.0.1:3080/api/model-router/status
+curl --noproxy '*' -s http://127.0.0.1:3081/api/model-router/status
 ```
 
 返回：规则与策略快照、cooldown 状态表、最近 50 次尝试（含每次 attemptIndex/TTFT/错误码/outcome）、按路由聚合统计、用量记账（滚动 5h/1w 窗口）、包装层计数器（wraps/failovers/timeouts/forced/exhaustions）。
@@ -252,20 +255,23 @@ route:
 | `reports` | `{enabled:false, hour:'01:00'}` | v0.8.0 G1 每日报告开关；`enabled:true` 后日账本记账 + 每日 `hour` 生成昨日报告（v0.9.5 起为 **`.report.md`**，默认目录 `~/Documents/dsh-model-router-reports/`）；v0.9.4 起面板「每日报告」页签可一键开启（`POST /state`），`/status` 回显 `reports.enabled/reportDir/hour`。可选 `modelTestThreshold: {primary, backup}`（v0.9.5，默认 `{0.7, 0.4}`）控制模型测试 verdict 的 primary/backup 评分阈值，须满足 `0<=backup<primary<=1` |
 | `statusPath` | `/api/model-router/status` | 状态接口路径 |
 
-## v0.8 范围声明
+## v1.0.2 范围声明
 
-已实现：v0.7 全部能力 + v0.8.0 调改（详见 [CHANGELOG.md](CHANGELOG.md)）：
+已实现（逐版本履历见 [CHANGELOG.md](CHANGELOG.md)）：
 
-- **G1 每日 API 报告**：日账本 NDJSON 按天追加、稳定性评级 S/A/B/C/D/N/A、按供应商×模型聚合、每日凌晨 1 点调度、三渠道交付（文件 + 面板 + API）
-- **G2 面板信息分级**：五页签三级结构（概览摘要卡 → 明细页签 → 工具折叠区）+ 轮询分级（概览 5s 轮 `?l1=1`）
-- **G3 Windows 适配**：`deploy.ps1`/`undeploy.ps1`（PS5.1 兼容、幂等）+ CI 三平台（Ubuntu/macOS/Windows × Node 22/24）
-- **A-1** `INVALID_REQUEST` 加入 failoverSignals（11 项）；**A-2** `providerMeta` 配置域；**A-3** `maxRetries` 自动调优
-- **B-1/B-2** 按需负载测试（4-phase 编排层复用 probe 原语，PROBE_MARK 直透零污染，默认只测 free）
-- **C-1** quotaGroup 去重；**C-2** registry 元数据（quotaGroup/tier）
-- 附带修复：sessionId 未赋值 bug、透传路径兜底记账、status `version` 去硬编码
-- **86 项单元测试全过**（基线 61 + 新增 25）
+- **规则路由**：`rules` 声明候选链，四种候选扩展策略（explicit / same-model / same-provider / exclude-current，源自 dsh 模型注册表）。**v0.9.1 起为「纯选择驱动」**——规则 = 命名「规则包」，在对话框模型选择器选中即完整接管；不选任何包 = 透传直连、插件不介入。`rules` 支持面板热更新（store JSON 持久化，免改 patch 免重启）
+- **无感故障切换**：finish 分片驱动 + **commit-on-substantive**（v0.6.0 修订）+ TTFT 看门狗 + cooldown 熔断 + 候选耗尽合成 error finish（不 throw）
+- **用量记账与限额**：滚动 5h/1w 窗口；`providerMeta` 声明窗口限额（5h / 1周 / 自定义）与重置规则；free-tier 跨请求节流（**RPM 与 TPM 各自独立判定**，v0.9.18/0.9.22）
+- **每日 API 报告**：日账本 NDJSON + 稳定性评级 S/A/B/C/D/N/A + 结构化 / Markdown 双视图；面板一键启用与生成
+- **模型全自动测试与档案**：独立 phase + 退避 + 短路；三类档案（`model-test` / `loadtest` / `probe`）统一列表与详情
+- **峰谷段场景**：`timeWindows` 按 `timeZone` 分段，peak / valley 各自候选链（段判定与显示统一 `hourCycle:'h23'`）
+- **WebUI 面板**：**8 页签**（概览 / 切换规则 / 切换日志 / 诊断 / 可切换模型 / 每日报告 / 模型测试 / 测试档案）+ 信息分级 + 轮询分级（概览 5s 轮 `?l1=1`）
+- **Windows 适配**：`deploy.ps1` / `undeploy.ps1`（PS5.1 兼容、幂等）
+- **安全边界**：回环围栏（含伪造 `Host` 拒绝）、`runId` 格式白名单 + 路径前缀双校验、`notes` 长度上限；`/status` 不含任何凭据材料
+- **配置持久化**：`state.json` 版本化 + 迁移链（v1.0 起）；`/state` 为**部分更新**（只覆盖请求体出现的键，v1.0.1 修复了原「整体替换导致静默擦除」缺陷）
+- **测试**：**291 项全过**（单测 278 + 契约 13），CI 跨 3 平台 × Node 22/24
 
-未实现（后续分期）：配额剩余预算参与路由排序/排除（P3）、SQLite 聚合与评分卡（P4）、多 key 池轮换（P5）、浏览器看板（P4 可选）、F 段（自命名规则 / mode 单一体系 / 注册新 adapter / 选包路由 UI 集成，计划 v0.9.0）。
+未实现（后续分期）：配额剩余预算参与路由排序/排除（P3）、SQLite 聚合与评分卡（P4）、多 key 池轮换（P5）、浏览器看板（P4 可选）、**前端模块化拆分**（`client.js` 仍为单文件，v1.0 验收项 #6）、**升级/回滚脚本**（#3）、**多 provider 段场景实机验证**（#5）。
 
 ## 许可证
 

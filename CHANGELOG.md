@@ -61,39 +61,49 @@ assert.ok(thrown, '只读目录写入应抛错');      // 期望 EACCES
 
 ### 新增 · v1.0.2 安装包（`assets/DSH-model-router-v1.0.2.zip`）
 
-打 tag 发 Release 时由 `release.yml` 上传。**904.6 KB / 34 文件**，顶层单一目录
-`DSH-model-router-v1.0.2/`（避免解压时文件散落）。
-
-内容（**自包含**，下载即可用）：
+打 tag 发 Release 时由 `release.yml` 上传。**251.0 KB / 29 条目**，
+按项目既有打包标准（**扁平布局**，无顶层目录前缀）。
 
 ```
 package.json  client.js  cordis.patch.yml  screenshots.json
 README.md  README.zh.md  CHANGELOG.md  LICENSE
 lib/（19 个 js，含 lib/wrapper/）
-scripts/（deploy/undeploy .sh/.ps1 + diag-session.mjs）
-assets/（2 张面板截图，screenshots.json 引用）
 ```
 
-**排除**：`node_modules` / `.git` / `test/` / `docs/` / `SUBMISSION.md` /
-`.github/` / 其他 `*.zip` / `.DS_Store` / `*.bak`。
-
-**为什么含 `scripts/`**（与 §「部署包」标准不同）：README 的「方式二」安装依赖
-`scripts/deploy.sh`（它取 `scripts/..` 作包根）。Release 资产是**独立下载**的，
-不含脚本则该安装路径不可用。而 skill 里那份「部署包」标准是给「直接拷进
-node_modules」用的，那里不需要 scripts。
-
-**为什么排除 `docs/`**：其文件名含中文（如 `DSH模型路由+...md`），
-Apple 版 Info-ZIP 会写出**乱码条目** —— 实测 v0.8.0 的包即有此缺陷
-（`docs/DSH????+?v0.8????????????-?+???????.md`）。排除后包内**全 ASCII 文件名**，
-从根上规避。
+**排除**：`node_modules` / `.git` / `test/` / `docs/` / `scripts/` / `assets/` /
+`SUBMISSION.md` / `.github/` / 其他 `*.zip` / `.DS_Store` / `*.bak`。
 
 **验证**（解压后实测，非只看列表）：
-- `package.json` version = `1.0.2`；README/CHANGELOG 标注一致
-- 34 个文件与仓库当前状态**逐字节一致**
-- `deploy.sh` 的结构前提齐备（`scripts/` 与 `lib/` 同层，`lib/index.js` 在）
-- 无 `node_modules` / `.git` / `test/` / `docs/` / `*.zip` / `.DS_Store` / `*.bak`
+- `package.json` version = `1.0.2`
+- **27 个文件与仓库当前状态逐字节一致**
+- 不含 `node_modules|test/|docs/|scripts/|assets/`（计数 = 0）
 - 20 个 js 文件语法检查通过
-- 打包后无 `zi??????` / `XX??????` 临时文件残留（仓库与工作目录均为 0）
+- 无 `zi??????` / `XX??????` 临时文件残留
+
+> **说明（第一版走了弯路）**：本版首次打包时按「自包含」思路**加入了
+> `scripts/` + `assets/`**（904.6 KB / 34 文件），理由是 README「方式二」的
+> `deploy.sh` 需要 scripts。但用户指出应**沿用既有标准** —— 该标准面向
+> 「拷贝进 `node_modules`」的场景，脚本与截图均不需要。已改回标准形态。
+> 「方式二」的脚本按 README 原文取自**本仓库**，不由 Release 资产提供。
+
+### 修复 · 仓库内版本声明不统一（7 处）
+
+统一前，同一仓库并存 0.8 / 0.9.5 / 1.0.2 三种版本口径：
+
+| 位置 | 原状 | 现状 |
+| --- | --- | --- |
+| `README.md` / `README.zh.md` | `## v0.8 范围声明`（含「86 项测试」「五页签」「F 段计划 v0.9.0」）| `## v1.0.2 范围声明`（291 项测试 / 8 页签 / F 段已实现）|
+| `README.md` / `README.zh.md` | `## 阶段交付速览（v0.9.10–v0.9.21）` | `（v0.9.10–v1.0.2）`，补 v0.9.20–v1.0.2 三行 |
+| `client.js` 头注释 | `插件浏览器半（client）v0.8.0` + 「五页签」 | `v1.0.2` + 「8 页签」（L1/L2/L3 结构按实际重写）|
+| `client.js` 页签定义注释 | 「七页签」 | 「八页签」（+ 测试档案）|
+| `README.zh.md` 状态接口示例 | 端口 `3080` | `3081`（与 `README.md` 及实机一致）|
+| `SUBMISSION.md` | 多处 `v1.0.1` / `8775a3b` / 「`lib/index.js` 注释已滞后」 | `v1.0.2` / `3ebd7d6` / 「已更新」|
+| `assets/` | 部署包仅 v0.8.0 | 补 v1.0.2 |
+
+> ⚠ **未改动**：根 commit `43460d6`「v0.9.5 实机状态基线锚点」的**提交说明**。
+> 那是**历史事实记录**（记录仓库建立时的实机状态），不是版本声明；
+> 改写它需要重写 git 历史，风险远大于收益。
+> 同理 `CHANGELOG.md` 中历史版本条目里的「五页签」等表述**保持原样**。
 
 ### 修复 · `release.yml` 按 tag **精确**选包（原为 `assets/*.zip`）
 
