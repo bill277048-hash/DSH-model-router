@@ -82,16 +82,22 @@ jobs:
           # ① 用当次源码重建（pack.sh 内部已断言 package.json 版本 == tag）
           bash scripts/pack.sh "${TAG#v}" /tmp/rebuilt.zip
 
-          # ② 条目级比对：**只比 未压缩大小 + 条目名**。
-          #    ⚠ 刻意**不比日期列**（`unzip -l` 的第 2 列）——它是源文件的 mtime，
-          #    CI 检出时全部变成检出时刻，而本地打包用的是编辑时刻 → 必然假阳性。
-          #    （2026-09-21 实测踩到：首次上线本门禁即在 tag v1.0.2 上误报「条目清单不一致」，
-          #      而同包的「Length+Name」与「内容级 diff -r」两口径均一致。）
-          #    真实内容差异由 ③ 的内容级比对兜底。
-          unzip -l "$ASSET"         | awk 'NR>3 && NF>=4 {print $1, $4}' | grep -v '^$' > /tmp/asset.txt   || true
-          unzip -l /tmp/rebuilt.zip | awk 'NR>3 && NF>=4 {print $1, $4}' | grep -v '^$' > /tmp/rebuilt.txt || true
+          # ② 条目级比对：**只比 未压缩大小 + 条目名，且先排序**。
+          #    ⚠ 两个刻意的取舍（2026-09-21 首次上线即踩到，两次假阳性）：
+          #    (a) **不比日期列** —— 它是源文件 mtime，CI 检出时全变成检出时刻，
+          #        本地打包用编辑时刻 → 必然不一致。
+          #    (b) **比对前必须 sort** —— `zip -r lib` 按**文件系统顺序**写入条目
+          #        （macOS/APFS 与 Linux/ext4 顺序不同），不排序则必然不一致。
+          #    真实内容差异由 ③ 的内容级 diff -r 兜底（它本身与顺序无关）。
+          unzip -l "$ASSET"         | awk 'NR>3 && NF>=4 {print $1, $4}' | grep -v '^$' | sort > /tmp/asset.txt   || true
+          unzip -l /tmp/rebuilt.zip | awk 'NR>3 && NF>=4 {print $1, $4}' | grep -v '^$' | sort > /tmp/rebuilt.txt || true
           if ! diff -u /tmp/asset.txt /tmp/rebuilt.txt; then
             echo "::error::$ASSET 的条目清单（大小+名称）与「当次源码重建结果」不一致——请重打并提交"
+            # 把差异逐行发成 annotation（job 日志需 admin 权限才能通过 API 下载，
+            # annotation 对公共仓库可匿名读 —— 见 test.yml 同款做法）
+            diff /tmp/asset.txt /tmp/rebuilt.txt | head -20 | while IFS= read -r line; do
+              echo "::error::清单差异: ${line}"
+            done
             exit 1
           fi
 
