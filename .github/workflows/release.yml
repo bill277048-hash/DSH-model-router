@@ -63,54 +63,17 @@ jobs:
       # 背景：此前 `files:` 只校验「assets/ 里的包**存在**」，不校验「**内容来自本 tag 的源码**」，
       # 且 `fail_on_unmatched_files: false` 让「包缺失」也只告警不失败 —— 于是
       # 「包是旧的」（如 v1.0.2 曾出现：包内 CHANGELOG 自述 904.6 KB/34 文件/含 scripts/，
-      # 实际 251.0 KB/29 条目/扁平/不含）会**静默通过发布**，用户下载到自相矛盾的产物。
+      # 实际扁平/29 条目/不含）会**静默通过发布**，用户下载到自相矛盾的产物。
       #
-      # 本步骤：用**当次 tag 的源码**重建包 → 与 assets/ 里那个逐文件比对，不一致即 fail。
-      # 原则：`assets/` 只作留档，**Release 资产必须来自当次源码**。
-      # 打包逻辑收在 scripts/pack.sh（人工与 CI 共用，避免两处标准分叉）。
+      # 比对逻辑收在 `scripts/verify-asset.sh`（**单一来源**）—— 本 workflow 与
+      # test.yml 的 `asset-guard` job、以及人工本地校验**共用同一份**。
+      # 若在此处再抄一遍判据，就回到「两处独立维护」，而那正是 VER-02 的根因。
+      # （该脚本内含两处刻意取舍：不比 mtime 列、比对前 sort —— 详见脚本头注释。）
       - name: Verify committed asset matches a rebuild from this tag's source
         shell: bash
         run: |
-          set -euo pipefail
           TAG="${{ steps.tag.outputs.value }}"
-          ASSET="assets/DSH-model-router-${TAG}.zip"
-          if [ ! -f "$ASSET" ]; then
-            echo "::warning::$ASSET 不存在——本次 Release 将不含安装包（fail_on_unmatched_files=false）"
-            exit 0
-          fi
-
-          # ① 用当次源码重建（pack.sh 内部已断言 package.json 版本 == tag）
-          bash scripts/pack.sh "${TAG#v}" /tmp/rebuilt.zip
-
-          # ② 条目级比对：**只比 未压缩大小 + 条目名，且先排序**。
-          #    ⚠ 两个刻意的取舍（2026-09-21 首次上线即踩到，两次假阳性）：
-          #    (a) **不比日期列** —— 它是源文件 mtime，CI 检出时全变成检出时刻，
-          #        本地打包用编辑时刻 → 必然不一致。
-          #    (b) **比对前必须 sort** —— `zip -r lib` 按**文件系统顺序**写入条目
-          #        （macOS/APFS 与 Linux/ext4 顺序不同），不排序则必然不一致。
-          #    真实内容差异由 ③ 的内容级 diff -r 兜底（它本身与顺序无关）。
-          unzip -l "$ASSET"         | awk 'NR>3 && NF>=4 {print $1, $4}' | grep -v '^$' | sort > /tmp/asset.txt   || true
-          unzip -l /tmp/rebuilt.zip | awk 'NR>3 && NF>=4 {print $1, $4}' | grep -v '^$' | sort > /tmp/rebuilt.txt || true
-          if ! diff -u /tmp/asset.txt /tmp/rebuilt.txt; then
-            echo "::error::$ASSET 的条目清单（大小+名称）与「当次源码重建结果」不一致——请重打并提交"
-            # 把差异逐行发成 annotation（job 日志需 admin 权限才能通过 API 下载，
-            # annotation 对公共仓库可匿名读 —— 见 test.yml 同款做法）
-            diff /tmp/asset.txt /tmp/rebuilt.txt | head -20 | while IFS= read -r line; do
-              echo "::error::清单差异: ${line}"
-            done
-            exit 1
-          fi
-
-          # ③ 内容级比对：解压后逐文件比字节（条目级相同仍可能内容不同）
-          rm -rf /tmp/va /tmp/vb && mkdir -p /tmp/va /tmp/vb
-          unzip -q "$ASSET" -d /tmp/va
-          unzip -q /tmp/rebuilt.zip -d /tmp/vb
-          if ! diff -r /tmp/va /tmp/vb >/dev/null; then
-            echo "::error::$ASSET 的内容与「当次源码重建结果」不一致——请重打并提交"
-            diff -r /tmp/va /tmp/vb | head -20
-            exit 1
-          fi
-          echo "✓ $ASSET 与当次源码重建结果一致（条目级 + 内容级）"
+          bash scripts/verify-asset.sh "${TAG#v}"
 
       - name: Create GitHub Release with assets
         uses: softprops/action-gh-release@v2

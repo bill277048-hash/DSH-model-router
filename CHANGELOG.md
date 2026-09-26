@@ -67,8 +67,8 @@ assert.ok(thrown, '只读目录写入应抛错');      // 期望 EACCES
 
 ### 新增 · v1.0.2 安装包（`assets/DSH-model-router-v1.0.2.zip`）
 
-打 tag 发 Release 时由 `release.yml` 上传。**251.0 KB / 29 条目**，
-按项目既有打包标准（**扁平布局**，无顶层目录前缀）。
+打 tag 发 Release 时由 `release.yml` 上传。按项目既有打包标准
+（**扁平布局**，无顶层目录前缀）：
 
 ```
 package.json  client.js  cordis.patch.yml  screenshots.json
@@ -78,6 +78,15 @@ lib/（19 个 js，含 lib/wrapper/）
 
 **排除**：`node_modules` / `.git` / `test/` / `docs/` / `scripts/` / `assets/` /
 `SUBMISSION.md` / `.github/` / 其他 `*.zip` / `.DS_Store` / `*.bak`。
+
+> **刻意不写体积与条目数**（2026-09-26 修订，原写「251.0 KB / 29 条目」）：
+> - **体积**随内容必然变化，且 `CHANGELOG.md` **本身在包内** —— 写体积会形成
+>   「改文档 → 改体积 → 数字又过期」的**自指循环**（实测：把该数字改 2 个字符，
+>   包体积即变 9 字节）。因此它**无法被自动填准**，只能靠人工同步，注定漂移。
+> - **条目数**只需增删一个文件就变（如将来把 `SECURITY.md` 打进包）。
+>
+> 二者都是**测量值**，不是契约；上面那份「包含什么 / 不含什么」的清单才是契约。
+> 需要体积请以 **Release 页面**（GitHub 自动显示）或 `pack.sh` 输出为准。
 
 **验证**（解压后实测，非只看列表）：
 - `package.json` version = `1.0.2`

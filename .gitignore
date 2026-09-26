@@ -1,6 +1,12 @@
 # 依赖
 node_modules/
 
+# npm 锁文件：本项目用 **pnpm**（pnpm-lock.yaml 已入库），但 CI 的 test.yml
+# 跑的是 `npm install`（为了贴近宿主安装方式）。任何人在本地复现 CI 都会生成
+# package-lock.json —— 它既未被跟踪、原先也未被忽略，导致工作区持续 1 条脏状态，
+# 容易被 `git add -A` 误提交。（2026-09-26 核实 ENG-02 时踩到）
+package-lock.json
+
 # 调试产物
 *.log
 npm-debug.log*

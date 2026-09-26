@@ -89,3 +89,26 @@ jobs:
             exit 1
           fi
           echo "✓ CHANGELOG 含 ${VERSION} 段落"
+
+  # 产物 ↔ 源码 一致性（把 release.yml 的门禁**前移**到每次 push）。
+  #
+  # 为什么需要（2026-09-21 复审报告 §6.1 观察项 1）：
+  #   原先该门禁**只在 release.yml 跑**（`push: tags`），意味着
+  #   **过期产物在打 tag 前不可见** —— v1.0.2 就是这样「先发布、后审核、再重打」的。
+  #   前移后，任何 push 都会在 ~10 秒内拦住「改了源码/文档但忘了重打包」。
+  #
+  # 逻辑与 release.yml 共用 `scripts/verify-asset.sh`（**单一来源**），
+  # 不在此处重写判据 —— 两处独立维护正是 VER-02 的根因。
+  #
+  # 平台：只在 ubuntu 跑。该门禁要拦的是「忘记重打」，与平台无关；
+  # 跨平台字节差异（zip 版本/文件系统顺序）已由脚本内的「排序 + 只比大小名称」
+  # 刻意规避，故无需三平台矩阵。
+  asset-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: assets/ 里的包须等于「当次源码重建结果」
+        shell: bash
+        run: bash scripts/verify-asset.sh
